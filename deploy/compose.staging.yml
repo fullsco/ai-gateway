@@ -1,0 +1,51 @@
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: ai-gateway:0.1.0-staging
+    restart: unless-stopped
+    init: true
+    env_file:
+      - ../.env
+    environment:
+      GATEWAY_ENVIRONMENT: staging
+      GATEWAY_HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:8320:8320"
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+
+  tunnel:
+    image: cloudflare/cloudflared:2026.8.1
+    restart: unless-stopped
+    init: true
+    depends_on:
+      gateway:
+        condition: service_healthy
+        restart: true
+    command:
+      - tunnel
+      - --no-autoupdate
+      - run
+      - --token-file
+      - /run/secrets/tunnel_token
+    secrets:
+      - tunnel_token
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+
+secrets:
+  tunnel_token:
+    file: /root/.cloudflared-ai-gateway.token
