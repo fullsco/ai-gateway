@@ -167,6 +167,12 @@ async def test_snapshot_decodes_provider_model_pricing_json() -> None:
             "weight": 1,
             "max_concurrency": 8,
             "pricing": '{"input_per_million":1,"output_per_million":2,"currency":"USD"}',
+            "allow_model_fallback": True,
+            "pool_id": "pool-1",
+            "pool_enabled": True,
+            "active_pool_credential_ids": ["credential-active"],
+            "active_pool_members": {"credential-active": {"priority": 1, "weight": 2}},
+            "pool_strategy": "priority",
             "enabled": True,
             "routing_policy": None,
         }],
@@ -175,6 +181,83 @@ async def test_snapshot_decodes_provider_model_pricing_json() -> None:
     payload = await _snapshot_payload(pool)
 
     assert payload["provider_models"][0]["pricing"]["currency"] == "USD"
+    assert payload["provider_models"][0]["allow_model_fallback"] is True
+    assert payload["provider_models"][0]["allowed_credential_ids"] == ["credential-active"]
+    assert payload["provider_models"][0]["pool_members"] == {
+        "credential-active": {"priority": 1, "weight": 2}
+    }
+    provider_model_query = pool.fetch_queries[-1]
+    assert "ppm.enabled and not ppm.draining" in provider_model_query
+    assert "left join public.provider_pools" in provider_model_query
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pool_enabled", [False, None])
+async def test_snapshot_disabled_or_missing_pool_fails_closed(pool_enabled: bool | None) -> None:
+    pool = SnapshotPool()
+    pool.fetch_results = [
+        [], [], [], [], [], [],
+        [{
+            "id": "mapping-1",
+            "route_id": "route-1",
+            "canonical_model_id": "model-1",
+            "provider_id": "provider-1",
+            "upstream_model_id": "upstream-1",
+            "protocol": "anthropic_messages",
+            "capabilities": [],
+            "priority": 1,
+            "weight": 1,
+            "max_concurrency": 8,
+            "pricing": {},
+            "allow_model_fallback": False,
+            "pool_id": "pool-1",
+            "pool_enabled": pool_enabled,
+            "active_pool_credential_ids": ["credential-must-not-leak"],
+            "active_pool_members": {"credential-must-not-leak": {}},
+            "pool_strategy": None,
+            "enabled": True,
+            "routing_policy": None,
+        }],
+    ]
+
+    payload = await _snapshot_payload(pool)
+
+    route = payload["provider_models"][0]
+    assert route["allowed_credential_ids"] == []
+    assert route["pool_members"] == {}
+
+
+@pytest.mark.asyncio
+async def test_snapshot_enabled_empty_pool_has_no_eligible_credentials() -> None:
+    pool = SnapshotPool()
+    pool.fetch_results = [
+        [], [], [], [], [], [],
+        [{
+            "id": "mapping-1",
+            "route_id": "route-1",
+            "canonical_model_id": "model-1",
+            "provider_id": "provider-1",
+            "upstream_model_id": "upstream-1",
+            "protocol": "anthropic_messages",
+            "capabilities": [],
+            "priority": 1,
+            "weight": 1,
+            "max_concurrency": 8,
+            "pricing": {},
+            "allow_model_fallback": False,
+            "pool_id": "pool-1",
+            "pool_enabled": True,
+            "active_pool_credential_ids": [],
+            "active_pool_members": {},
+            "pool_strategy": "priority",
+            "enabled": True,
+            "routing_policy": None,
+        }],
+    ]
+
+    payload = await _snapshot_payload(pool)
+
+    assert payload["provider_models"][0]["allowed_credential_ids"] == []
 
 
 def test_analytics_separates_currency_and_uses_immutable_attribution() -> None:
@@ -233,6 +316,37 @@ def test_control_plane_mutations_require_authentication() -> None:
 
     assert response.status_code == 401
     assert pool.fetchrow_calls == []
+
+
+def test_pool_members_must_share_a_provider() -> None:
+    pool = FakePool()
+    pool.fetchrow_result = {
+        "id": "00000000-0000-0000-0000-000000000010",
+        "name": "Restricted",
+    }
+    pool.fetchval_result = None
+
+    with TestClient(
+        create_app(settings(), admin_verifier=AdminVerifier(), db_pool=pool),
+        raise_server_exceptions=False,
+    ) as test_client:
+        response = test_client.post(
+            "/api/admin/v1/provider-pools",
+            headers=auth(),
+            json={
+                "name": "Restricted",
+                "members": [
+                    {
+                        "provider_model_id": "00000000-0000-0000-0000-000000000011",
+                        "credential_id": "00000000-0000-0000-0000-000000000012",
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 422
+    assert "share a provider" in response.json()["detail"]
+    assert pool.transactions[-1].outcome == "rolled_back"
 
 
 def test_mutation_and_audit_commit_in_one_transaction() -> None:

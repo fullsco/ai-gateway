@@ -3,6 +3,7 @@ import logging
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from gateway import __version__
@@ -10,6 +11,7 @@ from gateway.admin.api import router as admin_router
 from gateway.admin.auth import SupabaseJWTVerifier
 from gateway.admin.control_plane import router as control_plane_router
 from gateway.admin.operations import router as operations_router
+from gateway.admin.reconcile import router as reconcile_router
 from gateway.api.messages import router as messages_router
 from gateway.api.models import router as models_router
 from gateway.api.openai import router as openai_router
@@ -156,6 +158,20 @@ def create_app(
     app.state.ready = False
     app.add_middleware(RequestContextMiddleware, settings=app_settings)
 
+    @app.exception_handler(RequestValidationError)
+    async def sanitized_validation_error(
+        _request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        details = []
+        for error in exc.errors():
+            detail = {key: value for key, value in error.items() if key != "input"}
+            if "ctx" in detail:
+                detail["ctx"] = {
+                    key: str(value) for key, value in detail["ctx"].items()
+                }
+            details.append(detail)
+        return JSONResponse({"detail": details}, status_code=422)
+
     @app.middleware("http")
     async def control_plane_mutation_transaction(request: Request, call_next):
         is_mutation = request.method in {"POST", "PUT", "PATCH", "DELETE"}
@@ -188,6 +204,7 @@ def create_app(
     app.include_router(models_router)
     app.include_router(openai_router)
     app.include_router(admin_router)
+    app.include_router(reconcile_router)
     app.include_router(control_plane_router)
     app.include_router(operations_router)
 

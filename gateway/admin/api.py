@@ -126,9 +126,10 @@ async def models(request: Request) -> JSONResponse:
         """
          select m.id, m.display_name, m.enabled, m.capabilities, m.context_window,
                 m.created_at, m.updated_at,
-               coalesce(
-                 array_agg(distinct a.alias) filter (where a.alias is not null), '{}'
-               ) as aliases,
+                coalesce(
+                  array_agg(distinct a.alias order by a.alias)
+                    filter (where a.alias is not null), '{}'
+                ) as aliases,
                count(distinct pm.id) as provider_route_count
         from public.models m
         left join public.model_aliases a on a.model_id = m.id
@@ -180,13 +181,38 @@ async def routes(request: Request) -> JSONResponse:
         """
         select r.id, r.model_id, r.provider_model_id, pm.provider_id, p.name as provider_name,
                pm.upstream_model_id, pm.protocol, r.priority, r.enabled,
-               r.allow_model_fallback, r.policy_id, rp.name as policy_name, r.created_at
+               r.allow_model_fallback, r.policy_id, r.pool_id, rp.name as policy_name, r.created_at
         from public.model_routes r
         join public.provider_models pm on pm.id = r.provider_model_id
         join public.providers p on p.id = pm.provider_id
         left join public.routing_policies rp on rp.id = r.policy_id
         order by r.model_id, r.priority
         """,
+    )
+
+
+@router.get("/providers/{provider_id}/workspace")
+async def provider_workspace(provider_id: str, request: Request) -> JSONResponse:
+    return await _list_query(
+        request,
+        """
+        select p.id,p.name,p.enabled,p.health,p.base_url,p.priority,
+               count(distinct c.id) as credential_count,
+               count(distinct c.id) filter (where c.enabled and c.health='healthy')
+                 as healthy_credentials,
+               count(distinct c.id) filter (where c.cooldown_until > now())
+                 as cooling_credentials,
+               count(distinct pm.id) as mapping_count,
+               count(distinct pm.model_id) as model_count,
+               coalesce(array_agg(distinct pm.protocol order by pm.protocol)
+                 filter (where pm.protocol is not null), '{}') as protocols
+        from public.providers p
+        left join public.provider_credentials c on c.provider_id=p.id
+        left join public.provider_models pm on pm.provider_id=p.id and pm.enabled
+        where p.id=$1
+        group by p.id
+        """,
+        provider_id,
     )
 
 

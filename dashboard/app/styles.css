@@ -121,6 +121,39 @@ td .value { display: block; overflow: hidden; text-overflow: ellipsis; white-spa
 .secret-dialog code { display: block; padding: 14px; margin-block: 18px; background: #11120f; border: 1px solid var(--line); color: var(--amber); overflow-wrap: anywhere; user-select: all; }
 .key-manager { width: min(980px, 100%); }
 
+.provider-setup { width: min(1120px, 100%); }
+.provider-setup form { display: block; }
+.provider-setup fieldset { min-width: 0; margin: 0 0 18px; padding: 18px; border: 1px solid var(--line); }
+.provider-setup fieldset:disabled { opacity: .7; }
+.provider-setup legend { padding: 0 7px; color: var(--amber); font: 600 16px "Barlow Condensed", sans-serif; }
+.provider-grid, .pricing-grid, .pool-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; align-items: end; }
+.provider-setup .field.full { grid-column: 1 / -1; }
+.provider-setup textarea { min-height: 96px; }
+.subsection-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-block-end: 14px; }
+.subsection-head p, .metadata-note { color: var(--muted); font-size: 12px; line-height: 1.5; }
+.subsection-head button, .provider-setup details + button { min-height: 38px; border: 1px solid var(--line); background: var(--panel-raised); color: var(--paper); padding: 0 12px; display: inline-flex; align-items: center; gap: 7px; flex: none; }
+.repeater-list, .mapping-list { display: grid; gap: 12px; }
+.repeater { display: grid; grid-template-columns: repeat(5, minmax(110px, 1fr)) 38px; gap: 11px; align-items: end; padding: 14px; background: #191a17; border-inline-start: 2px solid var(--line); }
+.remove-control { grid-column: 6; grid-row: 1; }
+.check-control { min-height: 44px; display: flex; align-items: center; gap: 9px; color: var(--paper); font-size: 12px; }
+.check-control input { width: 17px; height: 17px; accent-color: var(--amber); flex: none; }
+.mapping-card { padding: 16px; border: 1px solid var(--line); background: #1a1b18; }
+.mapping-card-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-block-end: 14px; }
+.mapping-card-head strong { font: 600 16px "Barlow Condensed", sans-serif; overflow-wrap: anywhere; }
+.capability-fieldset { margin-block: 14px !important; padding: 12px !important; }
+.capability-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px 14px; }
+.capability-grid label { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+.capability-grid input { accent-color: var(--amber); }
+.provider-setup details { margin-block: 14px; border-block: 1px solid var(--line-soft); padding: 11px 0; }
+.provider-setup summary { color: var(--muted); font-size: 12px; cursor: pointer; }
+.provider-setup details .field { margin-block-start: 12px; }
+.pricing-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.route-controls { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; align-items: end; margin-block-start: 14px; padding-block-start: 14px; border-block-start: 1px solid var(--line-soft); }
+.pool-controls { grid-template-columns: minmax(220px, 1fr) 1fr; }
+.metadata-note { margin-block-start: 12px; }
+.provider-setup > form > .loading-state { min-height: 320px; }
+.provider-setup .form-error { margin-block-end: 12px; }
+
 .login { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
 .login form { width: min(390px, 100%); border-block: 1px solid var(--line); padding: 28px 0; display: grid; gap: 16px; }
 .login .mark { padding: 0; }
@@ -136,6 +169,8 @@ td .value { display: block; overflow: hidden; text-overflow: ellipsis; white-spa
   .exposure { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .exposure div:nth-child(2) { border-inline-end: 0; }
   .exposure div:nth-child(-n+2) { border-block-end: 1px solid var(--line); }
+  .repeater { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .remove-control { grid-column: auto; grid-row: auto; justify-self: end; }
 }
 
 @media (max-width: 760px) {
@@ -186,6 +221,15 @@ td .value { display: block; overflow: hidden; text-overflow: ellipsis; white-spa
   .form-actions { position: sticky; inset-block-end: 0; background: var(--panel); padding-block: 12px 0; }
   .form-actions button { flex: 1; min-height: 46px; }
   .secret-dialog dl { grid-template-columns: 1fr; }
+  .provider-setup fieldset { padding: 14px 12px; }
+  .provider-grid, .pricing-grid, .pool-controls, .route-controls { grid-template-columns: 1fr; }
+  .provider-setup .field.full { grid-column: auto; }
+  .subsection-head { align-items: stretch; flex-direction: column; }
+  .subsection-head button { min-height: 44px; justify-content: center; }
+  .repeater { grid-template-columns: 1fr; }
+  .remove-control { grid-column: auto; grid-row: auto; justify-self: end; }
+  .capability-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .mapping-card { padding: 14px 12px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

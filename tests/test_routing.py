@@ -234,3 +234,40 @@ def test_least_loaded_pool_prefers_available_concurrency_headroom() -> None:
     )
 
     assert decision.credential.credential_id == "available"
+
+
+def test_empty_pool_allowlist_fails_closed() -> None:
+    capabilities = frozenset({Capability.STREAMING})
+    engine = RoutingEngine(
+        ModelRegistry(
+            [CanonicalModel("model-x", frozenset({"latest-x"}), capabilities)],
+            [
+                ProviderModel(
+                    id="pool-route",
+                    canonical_model_id="model-x",
+                    provider_id="provider-a",
+                    upstream_model_id="upstream-x",
+                    protocol=ClientProtocol.ANTHROPIC_MESSAGES,
+                    capabilities=capabilities,
+                    allowed_credential_ids=frozenset(),
+                )
+            ],
+        )
+    )
+
+    with pytest.raises(NoRouteAvailable):
+        engine.select(
+            make_request(),
+            [ProviderState("provider-a")],
+            [CredentialState("credential", "provider-a")],
+        )
+
+
+def test_route_without_pool_allows_provider_credentials() -> None:
+    decision = make_engine().select(
+        make_request(),
+        [ProviderState("provider-a")],
+        [CredentialState("credential", "provider-a")],
+    )
+
+    assert decision.credential.credential_id == "credential"

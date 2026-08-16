@@ -2,6 +2,7 @@
 
 import { Activity, Cable, Clipboard, Coins, KeyRound, Menu, Network, Pencil, Plus, RefreshCw, Route, ScrollText, Settings2, ShieldCheck, Trash2, Users, X } from "lucide-react";
 import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
+import ProviderSetup, { gatewayApi } from "./provider-setup";
 
 type Row = Record<string, unknown>;
 type View = "overview" | "providers" | "credentials" | "clients" | "models" | "provider-models" | "routing" | "routing-policies" | "requests" | "health" | "usage" | "analytics" | "audit" | "events" | "configuration" | "pools" | "budgets" | "alerts" | "alert-rules";
@@ -152,24 +153,7 @@ const resources: Record<ResourceView, { endpoint: string; title: string; mutable
   },
 };
 
-async function api(path: string, init?: RequestInit) {
-  const response = await fetch(`/api/gateway/${path}`, {
-    ...init,
-    cache: "no-store",
-    headers: { "content-type": "application/json", ...init?.headers },
-  });
-  const data = await response.json().catch(() => ({}));
-  if (response.status === 401) {
-    window.location.assign("/login");
-    throw new Error("Session expired");
-  }
-  if (!response.ok) {
-    const detail = Array.isArray(data.details) ? data.details.map((item: Row) => `${item.location}: ${item.message}`).join(". ") : "";
-    const validation = Array.isArray(data.detail) ? data.detail.map((item: Row) => `${(item.loc as unknown[]).slice(-1)[0]}: ${item.msg}`).join(". ") : "";
-    throw new Error(detail || validation || readable(data.error) || "Control-plane request failed");
-  }
-  return data;
-}
+const api = gatewayApi;
 
 function display(value: unknown, key: string, row?: Row) {
   if (key.includes("cost") && (value === null || value === undefined || value === "")) return "Pricing unavailable";
@@ -429,6 +413,7 @@ function Resource({ view, rows, loading, reload, notify }: { view: ResourceView;
   } | null>(null);
   const [keys, setKeys] = useState<{ client: Row; rows: Row[] } | null>(null);
   const [publishState, setPublishState] = useState<Row | null>(null);
+  const [providerSetup, setProviderSetup] = useState<Row | null | undefined>(null);
   useEffect(() => {
     if (view === "configuration")
       void api("config/status")
@@ -529,6 +514,7 @@ function Resource({ view, rows, loading, reload, notify }: { view: ResourceView;
         </>
       )}
       {view === "credentials" && <button onClick={() => setEditor({ row: { ...row, __rotate: true } })}>Rotate</button>}
+      {view === "providers" && <button onClick={() => setProviderSetup(row)}>Configure</button>}
       {view === "clients" && (
         <>
           <button onClick={() => void issueKey(row)} disabled={!!busy}>
@@ -570,6 +556,7 @@ function Resource({ view, rows, loading, reload, notify }: { view: ResourceView;
               Add record
             </button>
           )}
+          {view === "providers" && <button className="primary" onClick={() => setProviderSetup(undefined)}><Plus size={15} />Guided setup</button>}
           {view === "configuration" && (
             <button className="primary" disabled={!!busy || publishState?.has_unpublished_changes === false} onClick={() => void publish()}>
               {busy ? "Publishing..." : "Review and publish"}
@@ -619,6 +606,7 @@ function Resource({ view, rows, loading, reload, notify }: { view: ResourceView;
           onRotate={rotateKey}
         />
       )}
+      {providerSetup !== null && <ProviderSetup provider={providerSetup ?? undefined} onClose={() => setProviderSetup(null)} onSaved={async () => { setProviderSetup(null); await reload(); notify({ kind: "success", message: "Provider configuration reconciled. Review and publish when ready." }); }} />}
     </section>
   );
 }

@@ -997,7 +997,9 @@ async def _snapshot_payload(pool: Any) -> dict[str, Any]:
         pool,
         "select id,enabled,capabilities from public.models",
     )
-    aliases = await pool.fetch("select alias,model_id from public.model_aliases")
+    aliases = await pool.fetch(
+        "select alias,model_id from public.model_aliases order by model_id,alias"
+    )
     provider_models = await _rows(
         pool,
         """select pm.id::text,r.id::text as route_id,
@@ -1012,30 +1014,31 @@ async def _snapshot_payload(pool: Any) -> dict[str, Any]:
                           then pm.settings->>'auth_scheme' end as auth_scheme,
                      case when pm.settings ? 'endpoint_query'
                      then pm.settings->'endpoint_query' end as endpoint_query,
-                     pm.pricing,
+                    pm.pricing,r.allow_model_fallback,r.pool_id::text as pool_id,
+                     coalesce(pp.enabled,false) as pool_enabled,
                      case when r.pool_id is null then null else array(
                        select ppm.credential_id::text
                        from public.provider_pool_members ppm
                        where ppm.pool_id=r.pool_id and ppm.provider_model_id=pm.id
                          and ppm.enabled and not ppm.draining
                        order by ppm.priority,ppm.credential_id
-                      ) end as allowed_credential_ids,
-                      case when r.pool_id is null then null else (
+                      ) end as active_pool_credential_ids,
+                     case when r.pool_id is null then null else coalesce((
                         select jsonb_object_agg(ppm.credential_id::text,
                           jsonb_build_object('priority',ppm.priority,'weight',ppm.weight))
                         from public.provider_pool_members ppm
                         where ppm.pool_id=r.pool_id and ppm.provider_model_id=pm.id
                           and ppm.enabled and not ppm.draining
-                       ) end as pool_members,
-                      (select pp.strategy from public.provider_pools pp where pp.id=r.pool_id)
-                        as pool_strategy,
+                       ),'{}'::jsonb) end as active_pool_members,
+                     case when pp.enabled then pp.strategy end as pool_strategy,
                      (pm.enabled and r.enabled) as enabled,
                      case when rp.enabled then rp.policy else null end as routing_policy
            from public.provider_models pm
-           join public.model_routes r
-             on r.provider_model_id = pm.id and r.model_id = pm.model_id
-           left join public.routing_policies rp on rp.id = r.policy_id
-           where pm.enabled and r.enabled""",
+            join public.model_routes r
+              on r.provider_model_id = pm.id and r.model_id = pm.model_id
+            left join public.routing_policies rp on rp.id = r.policy_id
+            left join public.provider_pools pp on pp.id = r.pool_id
+            where pm.enabled and r.enabled""",
     )
     alias_map: dict[str, list[str]] = {}
     for row in aliases:
@@ -1055,6 +1058,16 @@ async def _snapshot_payload(pool: Any) -> dict[str, Any]:
                 capability.strip() for capability in row.get("capabilities") or []
             ]
     for row in provider_models:
+        pool_id = row.pop("pool_id", None)
+        pool_enabled = row.pop("pool_enabled", False)
+        active_credentials = row.pop("active_pool_credential_ids", None)
+        active_members = row.pop("active_pool_members", None)
+        row["allowed_credential_ids"] = (
+            None if pool_id is None else active_credentials if pool_enabled else []
+        )
+        row["pool_members"] = (
+            None if pool_id is None else active_members if pool_enabled else {}
+        )
         if isinstance(row.get("routing_policy"), str):
             row["routing_policy"] = json.loads(row["routing_policy"])
         if isinstance(row.get("pricing"), str):

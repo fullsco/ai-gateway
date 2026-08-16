@@ -20,6 +20,15 @@ async def check_http(client: httpx.AsyncClient, base_url: str) -> dict[str, obje
     }
 
 
+def http_check_passed(result: dict[str, object]) -> bool:
+    return (
+        result["health"] == 200
+        and result["ready"] == 200
+        and result["version"] == 200
+        and result["request_id"] is True
+    )
+
+
 def check_tls(hostname: str) -> dict[str, object]:
     context = ssl.create_default_context()
     with socket.create_connection((hostname, 443), timeout=10) as raw, context.wrap_socket(
@@ -72,9 +81,11 @@ async def main() -> None:
         "duration_ms": round((time.monotonic() - started) * 1000, 3),
     }
     print(json.dumps(result, indent=2))
-    if local["ready"] != 200:
+    if not http_check_passed(local):
         raise SystemExit(1)
-    if not args.skip_public and (public["ready"] != 200 or tls["status"] != 200):
+    if any(status != 200 for status in concurrent):
+        raise SystemExit(1)
+    if not args.skip_public and (not http_check_passed(public) or tls["status"] != 200):
         raise SystemExit(1)
 
 

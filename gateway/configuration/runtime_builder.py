@@ -140,6 +140,8 @@ class SnapshotProviderModel(BaseModel):
     allowed_credential_ids: frozenset[str] | None = None
     pool_members: dict[str, Any] | None = None
     pool_strategy: str | None = None
+    # Snapshots published before route fallback was compiled retain historical behavior.
+    allow_model_fallback: bool = True
 
     @field_validator("default_headers")
     @classmethod
@@ -254,6 +256,7 @@ class RuntimeBuilder:
                 allowed_credential_ids=model.allowed_credential_ids,
                 pool_members=model.pool_members,
                 pool_strategy=model.pool_strategy,
+                allow_model_fallback=model.allow_model_fallback,
             )
             for model in snapshot.provider_models
         ]

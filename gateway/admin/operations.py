@@ -2,7 +2,7 @@ import json
 from typing import Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -12,17 +12,26 @@ from gateway.admin.api import _authorize, _pool
 router = APIRouter(prefix="/api/admin/v1", tags=["admin-operations"])
 
 
+class PoolMemberInput(BaseModel):
+    provider_model_id: UUID
+    credential_id: UUID
+    enabled: bool = True
+    draining: bool = False
+    priority: int = Field(default=100, ge=0)
+    weight: float = Field(default=1, gt=0)
+
+
 class PoolInput(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     model_id: str | None = None
     enabled: bool = True
     strategy: Literal["priority", "weighted", "least_loaded"] = "priority"
     settings: dict[str, Any] = Field(default_factory=dict)
-    members: list[dict[str, Any]] = Field(default_factory=list)
+    members: list[PoolMemberInput] | None = None
 
 
 class PoolMembersInput(BaseModel):
-    members: list[dict[str, Any]]
+    members: list[PoolMemberInput]
 
 
 class BudgetInput(BaseModel):
@@ -93,7 +102,7 @@ async def create_pool(request: Request, body: PoolInput) -> JSONResponse:
         body.strategy,
         json.dumps(body.settings),
     )
-    await _insert_pool_members(pool, row["id"], body.members)
+    await _insert_pool_members(pool, row["id"], body.members or [])
     await pool.execute(
         """insert into public.audit_logs(actor_id,action,resource_type,resource_id,metadata)
            values($1,'provider_pool_created','provider_pool',$2,$3::jsonb)""",
@@ -122,8 +131,9 @@ async def update_pool(pool_id: UUID, request: Request, body: PoolInput) -> JSONR
     )
     if row is None:
         return JSONResponse({"error": "provider_pool_not_found"}, status_code=404)
-    await pool.execute("delete from public.provider_pool_members where pool_id=$1", pool_id)
-    await _insert_pool_members(pool, pool_id, body.members)
+    if body.members is not None:
+        await pool.execute("delete from public.provider_pool_members where pool_id=$1", pool_id)
+        await _insert_pool_members(pool, pool_id, body.members)
     await pool.execute(
         """insert into public.audit_logs(actor_id,action,resource_type,resource_id)
            values($1,'provider_pool_updated','provider_pool',$2)""",
@@ -133,19 +143,33 @@ async def update_pool(pool_id: UUID, request: Request, body: PoolInput) -> JSONR
     return JSONResponse(jsonable_encoder(dict(row)))
 
 
-async def _insert_pool_members(pool: Any, pool_id: UUID, members: list[dict[str, Any]]) -> None:
+async def _insert_pool_members(
+    pool: Any, pool_id: UUID, members: list[PoolMemberInput]
+) -> None:
     for member in members:
+        valid = await pool.fetchval(
+            """select 1 from public.provider_models pm
+               join public.provider_credentials c on c.id=$2
+               where pm.id=$1 and pm.provider_id=c.provider_id""",
+            member.provider_model_id,
+            member.credential_id,
+        )
+        if valid is None:
+            raise HTTPException(
+                status_code=422,
+                detail="pool member mapping and credential must share a provider",
+            )
         await pool.execute(
             """insert into public.provider_pool_members(
               pool_id,provider_model_id,credential_id,enabled,draining,priority,weight)
               values($1,$2,$3,$4,$5,$6,$7)""",
             pool_id,
-            member["provider_model_id"],
-            member["credential_id"],
-            member.get("enabled", True),
-            member.get("draining", False),
-            member.get("priority", 100),
-            member.get("weight", 1),
+            member.provider_model_id,
+            member.credential_id,
+            member.enabled,
+            member.draining,
+            member.priority,
+            member.weight,
         )
 
 
@@ -178,19 +202,7 @@ async def replace_pool_members(
     if await pool.fetchval("select 1 from public.provider_pools where id=$1", pool_id) is None:
         return JSONResponse({"error": "provider_pool_not_found"}, status_code=404)
     await pool.execute("delete from public.provider_pool_members where pool_id=$1", pool_id)
-    for member in body.members:
-        await pool.execute(
-            """insert into public.provider_pool_members(
-              pool_id,provider_model_id,credential_id,enabled,draining,priority,weight)
-              values($1,$2,$3,$4,$5,$6,$7)""",
-            pool_id,
-            member["provider_model_id"],
-            member["credential_id"],
-            member.get("enabled", True),
-            member.get("draining", False),
-            member.get("priority", 100),
-            member.get("weight", 1),
-        )
+    await _insert_pool_members(pool, pool_id, body.members)
     await pool.execute(
         """insert into public.audit_logs(actor_id,action,resource_type,resource_id,metadata)
            values($1,'provider_pool_members_replaced','provider_pool',$2,$3::jsonb)""",

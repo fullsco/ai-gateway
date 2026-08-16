@@ -31,6 +31,7 @@ class ProviderModel:
     allowed_credential_ids: frozenset[str] | None = None
     pool_members: Mapping[str, object] | None = None
     pool_strategy: str | None = None
+    allow_model_fallback: bool = True
 
 
 class ModelRegistry:

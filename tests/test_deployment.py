@@ -59,6 +59,21 @@ def test_active_deployment_qualification_has_bounded_failure_budget() -> None:
     assert 'raise SystemExit(1)' in script
 
 
+def test_qualification_requires_health_readiness_version_and_request_id() -> None:
+    from deploy.qualify import http_check_passed
+
+    passing = {"health": 200, "ready": 200, "version": 200, "request_id": True}
+    assert http_check_passed(passing)
+    for key, value in (
+        ("health", 503),
+        ("ready", 503),
+        ("version", 500),
+        ("request_id", False),
+    ):
+        failed = {**passing, key: value}
+        assert not http_check_passed(failed)
+
+
 def test_qualification_script_reports_local_mock_host(tmp_path: Path) -> None:
     server = subprocess.Popen(
         [

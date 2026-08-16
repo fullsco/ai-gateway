@@ -118,6 +118,12 @@ async def execute_request(
             )
         except (LookupError, NoRouteAvailable):
             break
+        if not route.provider_model.allow_model_fallback:
+            excluded_routes = excluded_routes | {
+                candidate.id
+                for candidate in runtime.model_registry.eligible_provider_models(normalized)
+                if candidate.id != route.provider_model.id
+            }
         if not await runtime.route_controls.allow(route.provider_model.id):
             excluded_routes = excluded_routes | {route.provider_model.id}
             continue

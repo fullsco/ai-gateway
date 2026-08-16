@@ -3,8 +3,9 @@ import base64
 import pytest
 
 from gateway.configuration import RuntimeBuilder
-from gateway.protocols import ClientProtocol, NormalizedRequest
+from gateway.protocols import ClientProtocol, NormalizedRequest, normalize_request
 from gateway.providers import Credential
+from gateway.routing.engine import NoRouteAvailable
 from gateway.security import CredentialCipher
 
 
@@ -88,6 +89,7 @@ def test_runtime_builder_decrypts_credentials_and_builds_routes() -> None:
     assert client.spending_limit == 5
     assert runtime.model_registry.resolve("latest").id == "model-1"
     assert runtime.credential_states[0].quota_headroom == 0.8
+    assert runtime.model_registry.list_provider_models()[0].allow_model_fallback is True
     provider = runtime.provider_model_adapters["provider-model-1"]
     assert provider.config.protocol is ClientProtocol.ANTHROPIC_MESSAGES
     request = provider.create_request(
@@ -102,6 +104,21 @@ def test_runtime_builder_decrypts_credentials_and_builds_routes() -> None:
     assert request.headers["authorization"] == "Bearer provider-secret"
     assert "x-api-key" not in request.headers
     assert request.headers["user-agent"] == "claude-cli/test"
+
+
+def test_runtime_builder_preserves_route_fallback_and_provider_operational_state() -> None:
+    builder, payload = make_payload()
+    payload["providers"][0].update(
+        {"circuit_open": True, "latency_ms": 125.5, "failure_rate": 0.25}
+    )
+    payload["provider_models"][0]["allow_model_fallback"] = True
+
+    runtime = builder.build(payload)
+
+    assert runtime.model_registry.list_provider_models()[0].allow_model_fallback is True
+    assert runtime.provider_states[0].circuit_open is True
+    assert runtime.provider_states[0].latency_ms == 125.5
+    assert runtime.provider_states[0].failure_rate == 0.25
 
 
 def test_runtime_builder_rejects_unknown_snapshot_fields() -> None:
@@ -232,3 +249,78 @@ def test_empty_mapping_query_does_not_inherit_provider_query() -> None:
         Credential(id="credential-1", secret="provider-secret"),
     )
     assert "?beta=true" not in request.url
+
+
+@pytest.mark.parametrize(
+    ("allowed_credential_ids", "route_available"),
+    [(["credential-1"], True), ([], False)],
+    ids=["enabled-pool", "disabled-or-empty-pool"],
+)
+def test_snapshot_pool_state_flows_through_runtime_builder_and_routing_engine(
+    allowed_credential_ids: list[str], route_available: bool
+) -> None:
+    builder, payload = make_payload()
+    payload["provider_models"][0].update(
+        {
+            "allowed_credential_ids": allowed_credential_ids,
+            "pool_members": {
+                credential_id: {"priority": 1, "weight": 1}
+                for credential_id in allowed_credential_ids
+            },
+            "pool_strategy": "priority" if allowed_credential_ids else None,
+        }
+    )
+    runtime = builder.build(payload)
+    request = normalize_request(
+        ClientProtocol.ANTHROPIC_MESSAGES,
+        {"model": "latest", "stream": True, "messages": []},
+    )
+
+    if not route_available:
+        with pytest.raises(NoRouteAvailable):
+            runtime.routing_engine.select(
+                request,
+                list(runtime.provider_states),
+                list(runtime.credential_states),
+            )
+        return
+
+    decision = runtime.routing_engine.select(
+        request,
+        list(runtime.provider_states),
+        list(runtime.credential_states),
+    )
+    assert decision.credential.credential_id == "credential-1"
+    assert decision.provider_model.protocol is ClientProtocol.ANTHROPIC_MESSAGES
+
+
+def test_runtime_routing_requires_exact_protocol_and_mapping_capabilities() -> None:
+    builder, payload = make_payload()
+    payload["models"][0]["capabilities"] = ["streaming", "reasoning"]
+    payload["provider_models"].append(
+        {
+            "id": "reasoning-openai",
+            "canonical_model_id": "model-1",
+            "provider_id": "provider-1",
+            "upstream_model_id": "reasoning-upstream",
+            "protocol": "openai_responses",
+            "capabilities": ["streaming", "reasoning"],
+        }
+    )
+    runtime = builder.build(payload)
+    request = normalize_request(
+        ClientProtocol.ANTHROPIC_MESSAGES,
+        {
+            "model": "latest",
+            "stream": True,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "messages": [],
+        },
+    )
+
+    with pytest.raises(NoRouteAvailable):
+        runtime.routing_engine.select(
+            request,
+            list(runtime.provider_states),
+            list(runtime.credential_states),
+        )
