@@ -62,6 +62,7 @@ class SnapshotProvider(BaseModel):
     circuit_open: bool = False
     latency_ms: float = Field(default=0, ge=0)
     failure_rate: float = Field(default=0, ge=0, le=1)
+    priority: int = Field(default=100, ge=0)
     default_headers: dict[str, str] = Field(default_factory=dict)
     required_betas: frozenset[str] = frozenset()
     auth_scheme: Literal["default", "bearer", "x-api-key", "both"] = "default"
@@ -69,7 +70,11 @@ class SnapshotProvider(BaseModel):
 
     @field_validator("default_headers")
     @classmethod
-    def reject_credential_headers(cls, headers: dict[str, str]) -> dict[str, str]:
+    def reject_credential_headers(
+        cls, headers: dict[str, str] | None
+    ) -> dict[str, str] | None:
+        if headers is None:
+            return None
         forbidden = {"authorization", "cookie", "proxy-authorization", "x-api-key"}
         rejected = sorted(name for name in headers if name.lower() in forbidden)
         if rejected:
@@ -99,6 +104,8 @@ class SnapshotCredential(BaseModel):
     latency_ms: float = Field(default=0, ge=0)
     cooldown_until: datetime | None = None
     supported_provider_model_ids: frozenset[str] = frozenset()
+    requests_per_minute: int | None = Field(default=None, gt=0)
+    tokens_per_minute: int | None = Field(default=None, gt=0)
 
 
 class SnapshotModel(BaseModel):
@@ -122,8 +129,33 @@ class SnapshotProviderModel(BaseModel):
     priority: int = 100
     weight: float = Field(default=1, gt=0)
     enabled: bool = True
-    routing_policy: dict[str, float] | None = None
+    routing_policy: dict[str, Any] | None = None
     max_concurrency: int = Field(default=8, gt=0)
+    default_headers: dict[str, str] | None = None
+    required_betas: frozenset[str] | None = None
+    auth_scheme: Literal["default", "bearer", "x-api-key", "both"] | None = None
+    endpoint_query: dict[str, str] | None = None
+    pricing: dict[str, Any] = Field(default_factory=dict)
+    route_id: str | None = None
+    allowed_credential_ids: frozenset[str] | None = None
+    pool_members: dict[str, Any] | None = None
+    pool_strategy: str | None = None
+
+    @field_validator("default_headers")
+    @classmethod
+    def reject_credential_headers(
+        cls, headers: dict[str, str] | None
+    ) -> dict[str, str] | None:
+        if headers is None:
+            return None
+        forbidden = {"authorization", "cookie", "proxy-authorization", "x-api-key"}
+        rejected = sorted(name for name in headers if name.lower() in forbidden)
+        if rejected:
+            raise ValueError(
+                "provider-model default_headers may not contain credential headers: "
+                f"{', '.join(rejected)}"
+            )
+        return headers
 
 
 class RuntimeSnapshot(BaseModel):
@@ -212,12 +244,22 @@ class RuntimeBuilder:
                 enabled=model.enabled,
                 routing_policy=model.routing_policy,
                 max_concurrency=model.max_concurrency,
+                pricing=model.pricing,
+                route_id=model.route_id,
+                provider_name=next(
+                    provider.name
+                    for provider in snapshot.providers
+                    if provider.id == model.provider_id
+                ),
+                allowed_credential_ids=model.allowed_credential_ids,
+                pool_members=model.pool_members,
+                pool_strategy=model.pool_strategy,
             )
             for model in snapshot.provider_models
         ]
         registry = ModelRegistry(models, provider_models)
         adapters = {
-            model.id: self._build_adapter(provider, model.protocol, model.capabilities)
+            model.id: self._build_adapter(provider, model)
             for model in snapshot.provider_models
             if model.enabled
             for provider in snapshot.providers
@@ -232,6 +274,7 @@ class RuntimeBuilder:
                 circuit_open=provider.circuit_open,
                 latency_ms=provider.latency_ms,
                 failure_rate=provider.failure_rate,
+                priority=provider.priority,
             )
             for provider in snapshot.providers
         )
@@ -253,9 +296,10 @@ class RuntimeBuilder:
     def _build_adapter(
         self,
         provider: SnapshotProvider,
-        protocol: ClientProtocol,
-        capabilities: frozenset[Capability],
+        model: SnapshotProviderModel,
     ):
+        protocol = model.protocol
+        capabilities = model.capabilities
         config = ProviderConfig(
             id=provider.id,
             name=provider.name,
@@ -267,10 +311,24 @@ class RuntimeBuilder:
         if protocol is ClientProtocol.ANTHROPIC_MESSAGES:
             return AnthropicCompatibleAdapter(
                 config,
-                default_headers=provider.default_headers,
-                required_betas=provider.required_betas,
-                auth_scheme=provider.auth_scheme,
-                endpoint_query=provider.endpoint_query,
+                default_headers=(
+                    model.default_headers
+                    if model.default_headers is not None
+                    else provider.default_headers
+                ),
+                required_betas=(
+                    model.required_betas
+                    if model.required_betas is not None
+                    else provider.required_betas
+                ),
+                auth_scheme=(
+                    model.auth_scheme if model.auth_scheme is not None else provider.auth_scheme
+                ),
+                endpoint_query=(
+                    model.endpoint_query
+                    if model.endpoint_query is not None
+                    else provider.endpoint_query
+                ),
             )
         if protocol not in {
             ClientProtocol.OPENAI_CHAT_COMPLETIONS,
@@ -279,8 +337,16 @@ class RuntimeBuilder:
             raise ValueError(f"Unsupported provider-model protocol: {protocol.value}")
         return OpenAICompatibleAdapter(
             config,
-            default_headers=provider.default_headers,
-            endpoint_query=provider.endpoint_query,
+            default_headers=(
+                model.default_headers
+                if model.default_headers is not None
+                else provider.default_headers
+            ),
+            endpoint_query=(
+                model.endpoint_query
+                if model.endpoint_query is not None
+                else provider.endpoint_query
+            ),
         )
 
     def _build_credentials(
@@ -315,6 +381,8 @@ class RuntimeBuilder:
                     latency_ms=item.latency_ms,
                     cooldown_until=item.cooldown_until,
                     supported_provider_model_ids=item.supported_provider_model_ids,
+                    requests_per_minute=item.requests_per_minute,
+                    tokens_per_minute=item.tokens_per_minute,
                 )
             )
         return credentials, tuple(states)

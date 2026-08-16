@@ -1,6 +1,7 @@
 import asyncio
 import json
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -8,13 +9,16 @@ from fastapi.testclient import TestClient
 
 from gateway.api.executor import _stream_response, _StreamFinalizer
 from gateway.app import create_app
+from gateway.auth import GatewayClient
 from gateway.config import Settings
 from gateway.observability import (
     PassiveHealthEvent,
     PassiveHealthRecorder,
     RequestRecorder,
     StreamUsageAccumulator,
+    UsageAttribution,
     _passive_health,
+    estimate_cost,
     extract_usage,
 )
 from gateway.protocols import ClientProtocol
@@ -67,6 +71,33 @@ def test_extracts_anthropic_and_openai_usage_without_content() -> None:
     assert openai == (10, 5, 2)
 
 
+def test_estimate_cost_requires_pricing_and_accounts_for_cached_input() -> None:
+    assert estimate_cost((1_000_000, 500_000, 200_000), None) == (None, None)
+    cost, currency = estimate_cost(
+        (1_000_000, 500_000, 200_000),
+        {
+            "input_per_million": 1,
+            "output_per_million": 2,
+            "cached_input_per_million": 0.5,
+            "currency": "usd",
+        },
+    )
+    assert cost == Decimal("1.90000000")
+    assert currency == "USD"
+
+
+@pytest.mark.parametrize(
+    "pricing",
+    [
+        {"input_per_million": -1, "output_per_million": 1, "currency": "USD"},
+        {"input_per_million": 1, "output_per_million": 1, "currency": "US"},
+        {"input_per_million": 1, "output_per_million": 1},
+    ],
+)
+def test_estimate_cost_rejects_invalid_pricing(pricing: dict[str, object]) -> None:
+    assert estimate_cost((10, 5, None), pricing) == (None, None)
+
+
 def test_stream_usage_accumulator_reads_split_sse_metadata() -> None:
     accumulator = StreamUsageAccumulator(ClientProtocol.ANTHROPIC_MESSAGES)
 
@@ -82,6 +113,7 @@ def test_stream_usage_accumulator_reads_split_sse_metadata() -> None:
     [
         (None, "healthy"),
         ("upstream_authentication_error", "auth_failed"),
+        ("upstream_waf_rejection", "degraded"),
         ("quota_exhausted", "quota_exhausted"),
         ("rate_limit", "rate_limited"),
         ("timeout", "degraded"),
@@ -178,7 +210,71 @@ def test_request_attempt_and_usage_are_persisted_without_payload_content() -> No
     assert "sensitive generated content" not in arguments
     assert "secret" not in arguments
     usage_args = next(args for query, args in pool.execute_calls if "usage_records" in query)
-    assert usage_args[-3:] == (3, 2, None)
+    assert usage_args[2:7] == (3, 2, None, None, None)
+    assert usage_args[7:15] == (
+        "provider-a",
+        None,
+        "provider-model",
+        None,
+        "model-x",
+        "upstream-x",
+        "anthropic_messages",
+        "succeeded",
+    )
+    assert usage_args[15:] == (None, None)
+
+
+def test_quota_rejection_finishes_request_without_creating_attempt() -> None:
+    class QuotaRejectingPool(TelemetryPool):
+        async def fetchval(self, query: str, *args: object) -> str:
+            self.execute_calls.append((query, args))
+            return "rate limit"
+
+    pool = QuotaRejectingPool()
+    runtime, key = make_runtime(lambda _: httpx.Response(500))
+    runtime.key_store._clients["client"] = GatewayClient(
+        id="client",
+        name="Claude Code",
+        permissions=runtime.key_store._clients["client"].permissions,
+        requests_per_minute=1,
+    )
+    app = create_app(Settings(environment="test", _env_file=None), runtime, db_pool=pool)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": key},
+            json={"model": "model-x", "messages": []},
+        )
+
+    assert response.status_code == 429
+    queries = "\n".join(query for query, _ in pool.execute_calls)
+    assert "insert into public.request_logs" in queries
+    assert "update public.request_logs" in queries
+    assert "insert into public.request_attempts" not in queries
+
+
+def test_circuit_rejection_finishes_request_without_creating_attempt() -> None:
+    pool = TelemetryPool()
+    runtime, key = make_runtime(lambda _: httpx.Response(500))
+
+    async def reject_route(_: str) -> bool:
+        return False
+
+    runtime.route_controls.allow = reject_route
+    app = create_app(Settings(environment="test", _env_file=None), runtime, db_pool=pool)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": key},
+            json={"model": "model-x", "messages": []},
+        )
+
+    assert response.status_code == 503
+    queries = "\n".join(query for query, _ in pool.execute_calls)
+    assert "update public.request_logs" in queries
+    assert "insert into public.request_attempts" not in queries
 
 
 def test_telemetry_failure_does_not_fail_inference() -> None:
@@ -264,7 +360,86 @@ def test_completed_stream_persists_committed_attempt_and_usage() -> None:
     assert attempt_update[1] == "succeeded"
     assert attempt_update[4] is True
     usage_args = next(args for query, args in pool.execute_calls if "usage_records" in query)
-    assert usage_args[-3:] == (7, 4, None)
+    assert usage_args[2:7] == (7, 4, None, None, None)
+    assert usage_args[14] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_repeated_usage_persistence_is_database_idempotent() -> None:
+    pool = TelemetryPool()
+    recorder = RequestRecorder(pool, "request-1")
+    attribution = UsageAttribution(
+        provider_id="provider-1",
+        provider_name="Provider One",
+        provider_model_id="mapping-1",
+        route_id="route-1",
+        canonical_model="model-1",
+        upstream_model="upstream-1",
+        protocol=ClientProtocol.ANTHROPIC_MESSAGES,
+        pricing={"input_per_million": 1, "output_per_million": 2, "currency": "EUR"},
+    )
+
+    await recorder.record_usage_values(
+        41, (10, 5, None), attribution, attempt_status="succeeded"
+    )
+    await recorder.record_usage_values(
+        41, (10, 5, None), attribution, attempt_status="succeeded"
+    )
+
+    inserts = [(query, args) for query, args in pool.execute_calls if "usage_records" in query]
+    assert len(inserts) == 2
+    assert all("on conflict (attempt_id) do nothing" in query for query, _ in inserts)
+    assert all(args[6] == "EUR" for _, args in inserts)
+    assert all(args[15] is not None and args[16] is not None for _, args in inserts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("usage", [(-1, 1, None), (1, -1, None), (1, 1, -1), (1, 1, 2)])
+async def test_malformed_usage_is_not_persisted(
+    usage: tuple[int | None, int | None, int | None],
+) -> None:
+    pool = TelemetryPool()
+    recorder = RequestRecorder(pool, "request-1")
+    attribution = UsageAttribution(
+        provider_id="provider-1",
+        provider_name="Provider One",
+        provider_model_id="mapping-1",
+        route_id="route-1",
+        canonical_model="model-1",
+        upstream_model="upstream-1",
+        protocol=ClientProtocol.ANTHROPIC_MESSAGES,
+        pricing=None,
+    )
+
+    await recorder.record_usage_values(41, usage, attribution, attempt_status="failed")
+
+    assert not any("usage_records" in query for query, _ in pool.execute_calls)
+
+
+def test_failed_upstream_response_persists_usage_with_failed_attribution() -> None:
+    pool = TelemetryPool()
+    runtime, key = make_runtime(
+        lambda _: httpx.Response(
+            429,
+            json={
+                "error": {"message": "rate limited"},
+                "usage": {"input_tokens": 9, "output_tokens": 1},
+            },
+        )
+    )
+    app = create_app(Settings(environment="test", _env_file=None), runtime, db_pool=pool)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": key},
+            json={"model": "model-x", "messages": []},
+        )
+
+    assert response.status_code == 429
+    usage_args = next(args for query, args in pool.execute_calls if "usage_records" in query)
+    assert usage_args[2:5] == (9, 1, None)
+    assert usage_args[14] == "failed"
 
 
 async def _delayed_stream():

@@ -1,0 +1,17 @@
+/.venv
+/dist
+/dashboard/node_modules
+/dashboard/.next
+/node_modules
+__pycache__
+/.pytest_cache
+/.ruff_cache
+/.git
+/.env
+/supabase/.temp
+/tests
+/deploy
+/migrations
+/gateway
+*.pyc
+*.tsbuildinfo

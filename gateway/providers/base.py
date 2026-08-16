@@ -11,6 +11,7 @@ from gateway.protocols import Capability, ClientProtocol, NormalizedRequest
 class ErrorCategory(StrEnum):
     AUTHENTICATION_ERROR = "authentication_error"
     UPSTREAM_AUTHENTICATION_ERROR = "upstream_authentication_error"
+    UPSTREAM_WAF_REJECTION = "upstream_waf_rejection"
     RATE_LIMIT = "rate_limit"
     QUOTA_EXHAUSTED = "quota_exhausted"
     MODEL_UNAVAILABLE = "model_unavailable"
@@ -77,5 +78,10 @@ class ProviderAdapter(ABC):
         """Translate an upstream HTTP error without exposing sensitive data."""
 
     @abstractmethod
-    def create_probe_request(self, credential: Credential) -> UpstreamRequest:
-        """Create an authenticated, payload-free reachability probe."""
+    def create_probe_request(
+        self,
+        credential: Credential,
+        *,
+        model: str | None = None,
+    ) -> UpstreamRequest:
+        """Create an authenticated, low-cost reachability probe."""

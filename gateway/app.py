@@ -9,6 +9,7 @@ from gateway import __version__
 from gateway.admin.api import router as admin_router
 from gateway.admin.auth import SupabaseJWTVerifier
 from gateway.admin.control_plane import router as control_plane_router
+from gateway.admin.operations import router as operations_router
 from gateway.api.messages import router as messages_router
 from gateway.api.models import router as models_router
 from gateway.api.openai import router as openai_router
@@ -154,11 +155,41 @@ def create_app(
     app.state.health_recorder = None
     app.state.ready = False
     app.add_middleware(RequestContextMiddleware, settings=app_settings)
+
+    @app.middleware("http")
+    async def control_plane_mutation_transaction(request: Request, call_next):
+        is_mutation = request.method in {"POST", "PUT", "PATCH", "DELETE"}
+        is_control_plane = request.url.path.startswith("/api/admin/v1/")
+        is_snapshot_operation = "/config/" in request.url.path
+        pool = getattr(request.app.state, "db_pool", None)
+        transactional = (
+            is_mutation
+            and is_control_plane
+            and not is_snapshot_operation
+            and pool is not None
+        )
+        if not transactional:
+            return await call_next(request)
+        async with pool.acquire() as connection:
+            transaction = connection.transaction()
+            await transaction.start()
+            request.state.control_plane_connection = connection
+            try:
+                response = await call_next(request)
+            except BaseException:
+                await transaction.rollback()
+                raise
+            if response.status_code >= 400:
+                await transaction.rollback()
+            else:
+                await transaction.commit()
+            return response
     app.include_router(messages_router)
     app.include_router(models_router)
     app.include_router(openai_router)
     app.include_router(admin_router)
     app.include_router(control_plane_router)
+    app.include_router(operations_router)
 
     @app.get("/health", include_in_schema=False)
     @app.head("/health", include_in_schema=False)

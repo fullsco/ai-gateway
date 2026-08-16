@@ -6,8 +6,10 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from gateway.admin.auth import AdminClaims
+from gateway.admin.control_plane import ClientKeyInput, ProviderModelInput, _snapshot_payload
 from gateway.app import create_app
 from gateway.auth import authenticate_key
 from gateway.config import Settings
@@ -20,6 +22,11 @@ from gateway.configuration import (
 from gateway.security import CredentialCipher, EncryptedCredential, GatewayKeyHasher
 
 
+def test_client_key_expiry_must_be_in_the_future() -> None:
+    with pytest.raises(ValidationError, match="expires_at must be in the future"):
+        ClientKeyInput(expires_at=datetime(2020, 1, 1, tzinfo=UTC))
+
+
 class AdminVerifier:
     async def verify(self, token: str) -> AdminClaims:
         assert token == "admin-session"
@@ -29,6 +36,16 @@ class AdminVerifier:
 class Transaction(AbstractAsyncContextManager[None]):
     def __init__(self, **options: Any) -> None:
         self.options = options
+        self.outcome: str | None = None
+
+    async def start(self) -> None:
+        self.outcome = "started"
+
+    async def commit(self) -> None:
+        self.outcome = "committed"
+
+    async def rollback(self) -> None:
+        self.outcome = "rolled_back"
 
     async def __aenter__(self) -> None:
         return None
@@ -57,6 +74,7 @@ class FakePool:
         self.fetchrow_calls: list[tuple[str, tuple[Any, ...]]] = []
         self.execute_calls: list[tuple[str, tuple[Any, ...]]] = []
         self.transaction_options: list[dict[str, Any]] = []
+        self.transactions: list[Transaction] = []
 
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
         self.fetchrow_calls.append((query, args))
@@ -80,7 +98,9 @@ class FakePool:
 
     def transaction(self, **options: Any) -> Transaction:
         self.transaction_options.append(options)
-        return Transaction(**options)
+        transaction = Transaction(**options)
+        self.transactions.append(transaction)
+        return transaction
 
 
 class SnapshotPool(FakePool):
@@ -110,6 +130,93 @@ def auth() -> dict[str, str]:
     return {"authorization": "Bearer admin-session"}
 
 
+def test_provider_model_pricing_is_normalized_and_validated() -> None:
+    body = ProviderModelInput(
+        provider_id="provider-1",
+        model_id="model-1",
+        upstream_model_id="upstream-1",
+        protocol="anthropic_messages",
+        pricing={"input_per_million": 1, "output_per_million": 2, "currency": "eur"},
+    )
+    assert body.pricing["currency"] == "EUR"
+
+    with pytest.raises(ValueError, match="nonnegative"):
+        ProviderModelInput(
+            provider_id="provider-1",
+            model_id="model-1",
+            upstream_model_id="upstream-1",
+            protocol="anthropic_messages",
+            pricing={"input_per_million": -1, "output_per_million": 2, "currency": "USD"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_snapshot_decodes_provider_model_pricing_json() -> None:
+    pool = SnapshotPool()
+    pool.fetch_results = [
+        [], [], [], [], [], [],
+        [{
+            "id": "mapping-1",
+            "route_id": "route-1",
+            "canonical_model_id": "model-1",
+            "provider_id": "provider-1",
+            "upstream_model_id": "upstream-1",
+            "protocol": "anthropic_messages",
+            "capabilities": [],
+            "priority": 1,
+            "weight": 1,
+            "max_concurrency": 8,
+            "pricing": '{"input_per_million":1,"output_per_million":2,"currency":"USD"}',
+            "enabled": True,
+            "routing_policy": None,
+        }],
+    ]
+
+    payload = await _snapshot_payload(pool)
+
+    assert payload["provider_models"][0]["pricing"]["currency"] == "USD"
+
+
+def test_analytics_separates_currency_and_uses_immutable_attribution() -> None:
+    pool = FakePool()
+    pool.fetchrow_result = {
+        "input_tokens": 12,
+        "output_tokens": 4,
+        "cached_tokens": 2,
+        "priced_records": 1,
+        "usage_records": 2,
+    }
+    pool.fetch_results = [
+        [{"day": "2026-08-16", "requests": 2, "succeeded": 1, "failed": 1}],
+        [{"model": "model-1", "requests": 2, "succeeded": 1, "failed": 1}],
+        [
+            {"currency": "EUR", "estimated_cost": 1.5},
+            {"currency": "USD", "estimated_cost": 2.5},
+        ],
+        [{"model": "model-1", "usage_records": 2}],
+        [{"provider": "Provider One", "usage_records": 2}],
+        [{"route": "route-1", "usage_records": 2}],
+    ]
+
+    with TestClient(
+        create_app(settings(), admin_verifier=AdminVerifier(), db_pool=pool),
+        raise_server_exceptions=False,
+    ) as test_client:
+        response = test_client.get("/api/admin/v1/analytics", headers=auth())
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["costs_by_currency"] == [
+        {"currency": "EUR", "estimated_cost": 1.5},
+        {"currency": "USD", "estimated_cost": 2.5},
+    ]
+    assert payload["usage_by_model"][0]["model"] == "model-1"
+    assert payload["usage_by_provider"][0]["provider"] == "Provider One"
+    assert payload["usage_by_route"][0]["route"] == "route-1"
+    attribution_queries = [query for query, _ in pool.fetchrow_calls]
+    assert all("sum(estimated_cost)" not in query for query in attribution_queries)
+
+
 def test_control_plane_mutations_require_authentication() -> None:
     pool = FakePool()
 
@@ -126,6 +233,74 @@ def test_control_plane_mutations_require_authentication() -> None:
 
     assert response.status_code == 401
     assert pool.fetchrow_calls == []
+
+
+def test_mutation_and_audit_commit_in_one_transaction() -> None:
+    pool = FakePool()
+    pool.fetchrow_result = {
+        "id": "provider-id",
+        "name": "Shared provider",
+        "provider_type": None,
+        "protocol": None,
+        "base_url": "https://provider.example",
+        "enabled": True,
+        "priority": 100,
+        "capabilities": [],
+        "timeout_seconds": 600,
+        "settings": {},
+        "health": "healthy",
+    }
+
+    with TestClient(
+        create_app(settings(), admin_verifier=AdminVerifier(), db_pool=pool),
+        raise_server_exceptions=False,
+    ) as test_client:
+        response = test_client.post(
+            "/api/admin/v1/providers",
+            headers=auth(),
+            json={"name": "Shared provider", "base_url": "https://provider.example"},
+        )
+
+    assert response.status_code == 201
+    assert pool.transactions[-1].outcome == "committed"
+    metadata = json.loads(pool.execute_calls[-1][1][4])
+    assert metadata["changed_fields"] == ["base_url", "name"]
+
+
+def test_audit_failure_rolls_back_mutation_transaction() -> None:
+    class AuditFailingPool(FakePool):
+        async def execute(self, query: str, *args: Any) -> None:
+            if "insert into public.audit_logs" in query:
+                raise RuntimeError("audit unavailable")
+            await super().execute(query, *args)
+
+    pool = AuditFailingPool()
+    pool.fetchrow_result = {
+        "id": "provider-id",
+        "name": "Shared provider",
+        "provider_type": None,
+        "protocol": None,
+        "base_url": "https://provider.example",
+        "enabled": True,
+        "priority": 100,
+        "capabilities": [],
+        "timeout_seconds": 600,
+        "settings": {},
+        "health": "healthy",
+    }
+
+    with TestClient(
+        create_app(settings(), admin_verifier=AdminVerifier(), db_pool=pool),
+        raise_server_exceptions=False,
+    ) as test_client:
+        response = test_client.post(
+            "/api/admin/v1/providers",
+            headers=auth(),
+            json={"name": "Shared provider", "base_url": "https://provider.example"},
+        )
+
+    assert response.status_code == 500
+    assert pool.transactions[-1].outcome == "rolled_back"
 
 
 def test_provider_creation_allows_shared_provider_without_protocol_metadata() -> None:
@@ -192,11 +367,44 @@ def test_credential_creation_encrypts_secret_and_returns_only_masked_hint() -> N
         context=f"provider-credential:{insert_args[0]}",
     )
     assert decrypted == secret
-    assert pool.execute_calls[-1][1][1:] == (
+    assert pool.execute_calls[-1][1][1:4] == (
         "credential_created",
         "credential",
         insert_args[0],
     )
+
+
+def test_credential_creation_persists_rate_limits_with_matching_parameters() -> None:
+    pool = FakePool()
+    pool.fetchrow_result = {
+        "id": "credential-id",
+        "provider_id": "provider-id",
+        "name": "primary",
+        "masked_hint": "sk-t...7890",
+        "enabled": True,
+        "priority": 100,
+        "health": "healthy",
+        "quota_limit": None,
+        "quota_used": 0,
+        "cooldown_until": None,
+    }
+    with client(pool) as test_client:
+        response = test_client.post(
+            "/api/admin/v1/credentials",
+            headers=auth(),
+            json={
+                "provider_id": "provider-id",
+                "name": "primary",
+                "secret": "secret-provider-key",
+                "requests_per_minute": 20,
+                "tokens_per_minute": 10000,
+            },
+        )
+    assert response.status_code == 201
+    query, args = pool.fetchrow_calls[0]
+    assert "$12" in query
+    assert len(args) == 12
+    assert args[-2:] == (20, 10000)
 
 
 def test_short_credential_secret_has_non_revealing_hint() -> None:
@@ -297,7 +505,7 @@ def test_publishing_empty_valid_snapshot_is_transactional_and_audited() -> None:
     assert "pg_advisory_xact_lock" in pool.execute_calls[0][0]
     assert "status='superseded'" in pool.execute_calls[1][0]
     assert "insert into public.config_versions" in pool.fetchrow_calls[0][0]
-    assert pool.execute_calls[-1][1][1:] == (
+    assert pool.execute_calls[-1][1][1:4] == (
         "config_published",
         "config_version",
         "7",
@@ -357,7 +565,7 @@ def test_rollback_publishes_new_monotonic_snapshot_and_audits_atomically() -> No
     assert not any(
         "set status='published'" in query for query, _ in pool.execute_calls
     )
-    assert pool.execute_calls[-1][1][1:] == (
+    assert pool.execute_calls[-1][1][1:4] == (
         "config_rolled_back",
         "config_version",
         "8",

@@ -8,6 +8,7 @@ import httpx
 from fastapi.responses import Response, StreamingResponse
 from starlette.background import BackgroundTask
 
+from gateway.alerts import AlertEvent, evaluate_alert_rules
 from gateway.api.errors import client_error, gateway_error
 from gateway.config import Settings
 from gateway.context import get_request_id
@@ -17,17 +18,23 @@ from gateway.observability import (
     PassiveHealthRecorder,
     RequestRecorder,
     StreamUsageAccumulator,
+    UsageAttribution,
+    estimate_cost,
 )
 from gateway.protocols import ClientProtocol, NormalizedRequest
 from gateway.providers import ErrorCategory, ProviderError
 from gateway.quotas import (
+    BudgetExceeded,
+    ProviderQuotaExceeded,
     QuotaExceeded,
     QuotaRequest,
     QuotaUnavailable,
     estimate_tokens,
+    reserve_budgets,
     reserve_client_quota,
+    reserve_provider_quota,
 )
-from gateway.routing import AttemptCoordinator
+from gateway.routing import AttemptCoordinator, AttemptPolicy
 from gateway.routing.controls import ConcurrencyLease
 from gateway.routing.engine import NoRouteAvailable
 from gateway.runtime import GatewayRuntime
@@ -42,12 +49,20 @@ async def execute_request(
     settings: Settings,
     *,
     client_id: str,
+    key_id: str | None = None,
     db_pool=None,
     health_recorder: PassiveHealthRecorder | None = None,
 ) -> Response:
     started_at = datetime.now(UTC)
     deadline = started_at + timedelta(seconds=settings.request_timeout_seconds)
     recorder = RequestRecorder(db_pool, get_request_id() or "unknown")
+    await recorder.start_request(
+        client_id=client_id,
+        key_id=key_id,
+        protocol=normalized.protocol,
+        requested_model=normalized.requested_model,
+        started_at=started_at,
+    )
     try:
         client = runtime.key_store.get_client(client_id)
         if client is not None:
@@ -61,16 +76,30 @@ async def execute_request(
                 ),
             )
     except QuotaExceeded as exc:
+        ended_at = datetime.now(UTC)
+        await recorder.finish_request(
+            status="failed", resolved_model=None, ended_at=ended_at,
+            latency_ms=_latency_ms(started_at, ended_at), retry_count=0,
+            fallback_count=0, error_category=ErrorCategory.RATE_LIMIT.value,
+        )
         return client_error(ErrorCategory.RATE_LIMIT, str(exc), 429)
     except QuotaUnavailable as exc:
+        ended_at = datetime.now(UTC)
+        await recorder.finish_request(
+            status="failed", resolved_model=None, ended_at=ended_at,
+            latency_ms=_latency_ms(started_at, ended_at), retry_count=0,
+            fallback_count=0, error_category=ErrorCategory.PROVIDER_UNAVAILABLE.value,
+        )
         return client_error(ErrorCategory.PROVIDER_UNAVAILABLE, str(exc), 503)
-    await recorder.start_request(
-        client_id=client_id,
-        protocol=normalized.protocol,
-        requested_model=normalized.requested_model,
-        started_at=started_at,
+    max_attempts = max(
+        (
+            int((model.routing_policy or {}).get("max_attempts", 3))
+            for model in runtime.model_registry.list_provider_models()
+        ),
+        default=3,
     )
-    coordinator = AttemptCoordinator()
+    coordinator = AttemptCoordinator(AttemptPolicy(max_attempts=max_attempts))
+    estimated_input_tokens = estimate_tokens(normalized.payload)
     attempts = 0
     fallback_count = 0
     previous_provider_id: str | None = None
@@ -79,7 +108,6 @@ async def execute_request(
     last_error: ProviderError | None = None
 
     while attempts < coordinator.policy.max_attempts:
-        attempts += 1
         try:
             route = runtime.routing_engine.select(
                 normalized,
@@ -90,31 +118,11 @@ async def execute_request(
             )
         except (LookupError, NoRouteAvailable):
             break
-        if (
-            previous_provider_id is not None
-            and previous_provider_id != route.provider_model.provider_id
-        ):
-            fallback_count += 1
-        previous_provider_id = route.provider_model.provider_id
         if not await runtime.route_controls.allow(route.provider_model.id):
             excluded_routes = excluded_routes | {route.provider_model.id}
             continue
-        attempt_started_at = datetime.now(UTC)
-        attempt_id = await recorder.start_attempt(
-            number=attempts,
-            provider_id=route.provider_model.provider_id,
-            credential_id=route.credential.credential_id,
-            provider_model_id=route.provider_model.id,
-            started_at=attempt_started_at,
-        )
         adapter = runtime.provider_model_adapters[route.provider_model.id]
         credential = runtime.credentials[route.credential.credential_id]
-        upstream = adapter.create_request(
-            _map_upstream_model(normalized, route.provider_model.upstream_model_id),
-            credential,
-            dict(incoming_headers),
-        )
-        response: httpx.Response | None = None
         lease = await runtime.route_controls.acquire(
             route.provider_model.id,
             timeout_seconds=min(
@@ -129,25 +137,89 @@ async def execute_request(
                 message="The selected provider route is at its concurrency limit.",
                 retryable=True,
             )
-            ended_at = datetime.now(UTC)
-            await recorder.finish_attempt(
-                attempt_id,
-                status="failed",
-                ended_at=ended_at,
-                latency_ms=_latency_ms(attempt_started_at, ended_at),
-                error_category=last_error.category.value,
-            )
             excluded_routes = excluded_routes | {route.provider_model.id}
-            if not settings.failover_enabled or not coordinator.should_retry(
-                error=last_error,
-                attempts_made=attempts,
-                response_committed=False,
-                now=ended_at,
-                deadline=deadline,
-            ):
+            if not settings.failover_enabled or datetime.now(UTC) >= deadline:
                 break
             continue
+        estimated_output_tokens = normalized.payload.get(
+            "max_tokens", normalized.payload.get("max_output_tokens")
+        )
+        output_tokens = (
+            estimated_output_tokens
+            if isinstance(estimated_output_tokens, int) and estimated_output_tokens >= 0
+            else 0
+        )
+        estimated_cost, currency = estimate_cost(
+            (estimated_input_tokens, output_tokens, None),
+            dict(route.provider_model.pricing or {}),
+        )
         try:
+            await reserve_provider_quota(
+                db_pool,
+                route.credential.credential_id,
+                QuotaRequest(
+                    route.credential.requests_per_minute,
+                    route.credential.tokens_per_minute,
+                    estimated_input_tokens + output_tokens,
+                ),
+            )
+            await reserve_budgets(
+                db_pool,
+                client_id=client_id,
+                provider_id=route.provider_model.provider_id,
+                credential_id=route.credential.credential_id,
+                model_id=route.canonical_model_id,
+                route_id=route.provider_model.route_id,
+                currency=currency,
+                estimated_cost=estimated_cost,
+            )
+        except (ProviderQuotaExceeded, BudgetExceeded) as exc:
+            lease.release()
+            event_type = "budget_exceeded" if isinstance(exc, BudgetExceeded) else "provider_quota"
+            await evaluate_alert_rules(
+                db_pool,
+                AlertEvent(
+                    event_type=event_type,
+                    title=str(exc),
+                    scopes={
+                        "client": client_id,
+                        "provider": route.provider_model.provider_id,
+                        "credential": route.credential.credential_id,
+                        "model": route.canonical_model_id,
+                        "route": route.provider_model.route_id or route.provider_model.id,
+                    },
+                    metadata={"reason": str(exc)},
+                ),
+            )
+            last_error = ProviderError(
+                category=ErrorCategory.QUOTA_EXHAUSTED,
+                message=str(exc),
+                retryable=True,
+            )
+            if isinstance(exc, BudgetExceeded):
+                excluded_routes = excluded_routes | {route.provider_model.id}
+            else:
+                excluded = excluded | {route.credential.credential_id}
+            continue
+        except QuotaUnavailable as exc:
+            lease.release()
+            ended_at = datetime.now(UTC)
+            await recorder.finish_request(
+                status="failed",
+                resolved_model=None,
+                ended_at=ended_at,
+                latency_ms=_latency_ms(started_at, ended_at),
+                retry_count=max(0, attempts - 1),
+                fallback_count=fallback_count,
+                error_category=ErrorCategory.PROVIDER_UNAVAILABLE.value,
+            )
+            return client_error(ErrorCategory.PROVIDER_UNAVAILABLE, str(exc), 503)
+        try:
+            upstream = adapter.create_request(
+                _map_upstream_model(normalized, route.provider_model.upstream_model_id),
+                credential,
+                dict(incoming_headers),
+            )
             if runtime.http_client is None:
                 raise RuntimeError("Gateway runtime has no HTTP client")
             built = runtime.http_client.build_request(
@@ -157,10 +229,70 @@ async def execute_request(
                 json=upstream.json_body,
                 timeout=upstream.timeout,
             )
+        except Exception as exc:
+            lease.release()
+            ended_at = datetime.now(UTC)
+            log_event(
+                logger,
+                logging.ERROR,
+                "upstream_request_build_failed",
+                provider_id=route.provider_model.provider_id,
+                provider_model_id=route.provider_model.id,
+                error_type=type(exc).__name__,
+            )
+            await recorder.finish_request(
+                status="failed",
+                resolved_model=None,
+                ended_at=ended_at,
+                latency_ms=_latency_ms(started_at, ended_at),
+                retry_count=max(0, attempts - 1),
+                fallback_count=fallback_count,
+                error_category=ErrorCategory.PROVIDER_UNAVAILABLE.value,
+            )
+            return client_error(
+                ErrorCategory.PROVIDER_UNAVAILABLE,
+                "The gateway could not prepare the upstream request.",
+                503,
+            )
+        response: httpx.Response | None = None
+        attempts += 1
+        if (
+            previous_provider_id is not None
+            and previous_provider_id != route.provider_model.provider_id
+        ):
+            fallback_count += 1
+        previous_provider_id = route.provider_model.provider_id
+        attempt_started_at = datetime.now(UTC)
+        pricing_snapshot = deepcopy(dict(route.provider_model.pricing or {}))
+        attribution = UsageAttribution(
+            provider_id=route.provider_model.provider_id,
+            provider_name=route.provider_model.provider_name,
+            provider_model_id=route.provider_model.id,
+            route_id=route.provider_model.route_id,
+            canonical_model=route.canonical_model_id,
+            upstream_model=route.provider_model.upstream_model_id,
+            protocol=route.provider_model.protocol,
+            pricing=pricing_snapshot,
+        )
+        attempt_id = await recorder.start_attempt(
+            number=attempts,
+            provider_id=route.provider_model.provider_id,
+            credential_id=route.credential.credential_id,
+            provider_model_id=route.provider_model.id,
+            started_at=attempt_started_at,
+        )
+        try:
             response = await runtime.http_client.send(built, stream=True)
             if response.status_code >= 400:
                 await response.aread()
                 last_error = adapter.normalize_error(response)
+                await recorder.record_usage(
+                    attempt_id,
+                    normalized.protocol,
+                    response.content,
+                    attribution,
+                    attempt_status="failed",
+                )
                 await response.aclose()
                 response = None
             elif normalized.stream:
@@ -196,6 +328,7 @@ async def execute_request(
                         credential_id=route.credential.credential_id,
                         provider_model_id=route.provider_model.id,
                         attempt_number=attempts,
+                        attribution=attribution,
                     )
                     return StreamingResponse(
                         _stream_response(
@@ -234,7 +367,13 @@ async def execute_request(
                     latency_ms=latency_ms,
                     upstream_status=status_code,
                 )
-                await recorder.record_usage(attempt_id, normalized.protocol, content)
+                await recorder.record_usage(
+                    attempt_id,
+                    normalized.protocol,
+                    content,
+                    attribution,
+                    attempt_status="succeeded",
+                )
                 await recorder.finish_request(
                     status="succeeded",
                     resolved_model=route.canonical_model_id,
@@ -263,8 +402,36 @@ async def execute_request(
         except asyncio.CancelledError:
             await _close_response(response)
             await runtime.route_controls.abandon(route.provider_model.id)
+            ended_at = datetime.now(UTC)
             lease.release()
+            await asyncio.shield(
+                _finish_cancelled_request(
+                    recorder,
+                    attempt_id=attempt_id,
+                    attempt_started_at=attempt_started_at,
+                    started_at=started_at,
+                    ended_at=ended_at,
+                    attempts=attempts,
+                    fallback_count=fallback_count,
+                )
+            )
             raise
+        except Exception as exc:
+            last_error = ProviderError(
+                category=ErrorCategory.PROVIDER_UNAVAILABLE,
+                message="The gateway failed while dispatching to the upstream provider.",
+                retryable=True,
+            )
+            log_event(
+                logger,
+                logging.ERROR,
+                "upstream_dispatch_failed",
+                provider_id=route.provider_model.provider_id,
+                provider_model_id=route.provider_model.id,
+                attempt_number=attempts,
+                error_type=type(exc).__name__,
+            )
+            await _close_response(response)
 
         if last_error is not None:
             ended_at = datetime.now(UTC)
@@ -395,6 +562,7 @@ class _StreamFinalizer:
         credential_id: str | None = None,
         provider_model_id: str | None = None,
         attempt_number: int = 1,
+        attribution: UsageAttribution | None = None,
     ) -> None:
         self.recorder = recorder
         self.response = response
@@ -412,6 +580,7 @@ class _StreamFinalizer:
         self.credential_id = credential_id
         self.provider_model_id = provider_model_id
         self.attempt_number = attempt_number
+        self.attribution = attribution
         self.usage = StreamUsageAccumulator(protocol)
         self._task: asyncio.Task[None] | None = None
 
@@ -440,6 +609,7 @@ class _StreamFinalizer:
                     credential_id=self.credential_id,
                     provider_model_id=self.provider_model_id,
                     attempt_number=self.attempt_number,
+                    attribution=self.attribution,
                 )
             )
         await asyncio.shield(self._task)
@@ -467,6 +637,7 @@ async def _finalize_stream(
     credential_id: str | None = None,
     provider_model_id: str | None = None,
     attempt_number: int = 1,
+    attribution: UsageAttribution | None = None,
 ) -> None:
     try:
         await response.aclose()
@@ -498,8 +669,13 @@ async def _finalize_stream(
         upstream_status=upstream_status,
         response_committed=True,
     )
-    if completed and usage.usage is not None:
-        await recorder.record_usage_values(attempt_id, usage.usage)
+    if completed and usage.usage is not None and attribution is not None:
+        await recorder.record_usage_values(
+            attempt_id,
+            usage.usage,
+            attribution,
+            attempt_status="succeeded",
+        )
     await recorder.finish_request(
         status="succeeded" if completed else "cancelled",
         resolved_model=resolved_model,
@@ -523,6 +699,33 @@ def _safe_response_headers(response: httpx.Response) -> dict[str, str]:
 
 def _latency_ms(started_at: datetime, ended_at: datetime) -> float:
     return round((ended_at - started_at).total_seconds() * 1000, 3)
+
+
+async def _finish_cancelled_request(
+    recorder: RequestRecorder,
+    *,
+    attempt_id: int | None,
+    attempt_started_at: datetime,
+    started_at: datetime,
+    ended_at: datetime,
+    attempts: int,
+    fallback_count: int,
+) -> None:
+    await recorder.finish_attempt(
+        attempt_id,
+        status="cancelled",
+        ended_at=ended_at,
+        latency_ms=_latency_ms(attempt_started_at, ended_at),
+    )
+    await recorder.finish_request(
+        status="cancelled",
+        resolved_model=None,
+        ended_at=ended_at,
+        latency_ms=_latency_ms(started_at, ended_at),
+        retry_count=max(0, attempts - 1),
+        fallback_count=fallback_count,
+        error_category=ErrorCategory.PROVIDER_UNAVAILABLE.value,
+    )
 
 
 def _affects_circuit(error: ProviderError) -> bool:

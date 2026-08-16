@@ -47,6 +47,7 @@ def test_create_request_preserves_payload_and_controls_authentication() -> None:
     assert request.url == "https://provider.example/api/v1/messages"
     assert request.json_body == payload
     assert request.headers["x-api-key"] == "upstream-secret"
+    assert request.headers["user-agent"] == "ai-gateway/0.1"
     assert "authorization" not in request.headers
     assert request.headers["anthropic-beta"] == "client-beta,required-beta"
     assert request.headers["anthropic-version"] == "2024-01-01"
@@ -78,16 +79,31 @@ def test_default_headers_cannot_override_runtime_credential() -> None:
     assert request.headers["x-api-key"] == "upstream-secret"
 
 
-def test_probe_request_is_authenticated_and_payload_free() -> None:
+def test_probe_request_uses_a_low_cost_messages_request() -> None:
     request = make_adapter().create_probe_request(
-        Credential(id="credential", secret="upstream-secret")
+        Credential(id="credential", secret="upstream-secret"),
+        model="claude-example",
     )
 
-    assert request.method == "HEAD"
+    assert request.method == "POST"
     assert request.url == "https://provider.example/api/v1/messages"
-    assert request.json_body is None
+    assert request.json_body == {
+        "model": "claude-example",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
     assert request.headers["x-api-key"] == "upstream-secret"
+    assert request.headers["user-agent"] == "ai-gateway/0.1"
+    assert request.headers["anthropic-version"] == "2023-06-01"
+    assert request.headers["content-type"] == "application/json"
     assert request.timeout.read == 10
+
+
+def test_probe_requires_an_upstream_model() -> None:
+    with pytest.raises(ValueError, match="upstream model"):
+        make_adapter().create_probe_request(
+            Credential(id="credential", secret="upstream-secret")
+        )
 
 
 @pytest.mark.parametrize(
@@ -96,6 +112,24 @@ def test_probe_request_is_authenticated_and_payload_free() -> None:
         (
             401,
             {"error": {"message": "bad key"}},
+            ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR,
+            False,
+        ),
+        (
+            403,
+            "<!doctype html><html><title>Cloudflare</title></html>",
+            ErrorCategory.UPSTREAM_WAF_REJECTION,
+            True,
+        ),
+        (
+            403,
+            "",
+            ErrorCategory.UPSTREAM_WAF_REJECTION,
+            True,
+        ),
+        (
+            403,
+            {"error": {"message": "credential rejected"}},
             ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR,
             False,
         ),
@@ -113,13 +147,21 @@ def test_probe_request_is_authenticated_and_payload_free() -> None:
     ],
 )
 def test_error_normalization(status, payload, category, retryable) -> None:
-    response = httpx.Response(status, json=payload, headers={"retry-after": "2"})
+    response = (
+        httpx.Response(
+            status,
+            text=payload,
+            headers={"content-type": "text/html", "server": "cloudflare"},
+        )
+        if isinstance(payload, str)
+        else httpx.Response(status, json=payload, headers={"retry-after": "2"})
+    )
 
     error = make_adapter().normalize_error(response)
 
     assert error.category is category
     assert error.retryable is retryable
-    assert error.retry_after_seconds == 2
+    assert error.retry_after_seconds == (None if isinstance(payload, str) else 2)
 
 
 def test_non_json_error_does_not_reflect_upstream_body() -> None:

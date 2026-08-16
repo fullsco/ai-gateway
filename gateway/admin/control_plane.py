@@ -1,5 +1,6 @@
-import hashlib
 import json
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -10,6 +11,12 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from gateway.admin.api import _authorize
 from gateway.admin.auth import AdminClaims
+from gateway.configuration import (
+    configuration_checksum,
+    configuration_projection,
+    legacy_checksum,
+    legacy_configuration_checksum,
+)
 from gateway.configuration.runtime_builder import RuntimeSnapshot
 from gateway.protocols import ClientProtocol
 from gateway.security import CredentialCipher, GatewayKeyHasher
@@ -52,6 +59,8 @@ class CredentialInput(BaseModel):
     priority: int = Field(default=100, ge=0)
     quota_limit: float | None = Field(default=None, ge=0)
     quota_threshold: float = Field(default=0.95, gt=0, le=1)
+    requests_per_minute: int | None = Field(default=None, gt=0)
+    tokens_per_minute: int | None = Field(default=None, gt=0)
 
 
 class CredentialRotationInput(BaseModel):
@@ -78,6 +87,22 @@ class ClientInput(NormalizedStringLists):
     spending_limit: float | None = Field(default=None, ge=0)
 
 
+class ClientKeyInput(BaseModel):
+    label: str | None = Field(default=None, max_length=120)
+    expires_at: datetime | None = None
+
+    @field_validator("expires_at")
+    @classmethod
+    def require_future_expiry(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value <= datetime.now(value.tzinfo):
+            raise ValueError("expires_at must be in the future")
+        return value
+
+
+class KeyRevocationInput(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+
 class ModelInput(NormalizedStringLists):
     id: str = Field(min_length=1, max_length=160)
     display_name: str = Field(min_length=1, max_length=160)
@@ -97,6 +122,37 @@ class ProviderModelInput(NormalizedStringLists):
     weight: float = Field(default=1, gt=0)
     enabled: bool = True
     max_concurrency: int = Field(default=8, gt=0)
+    settings: dict[str, Any] = Field(default_factory=dict)
+    pricing: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("pricing")
+    @classmethod
+    def validate_pricing(cls, pricing: dict[str, Any]) -> dict[str, Any]:
+        if not pricing:
+            return pricing
+        required = {"input_per_million", "output_per_million", "currency"}
+        if missing := required - pricing.keys():
+            raise ValueError(f"pricing is missing: {', '.join(sorted(missing))}")
+        allowed = required | {"cached_input_per_million", "version", "effective_at"}
+        if extra := pricing.keys() - allowed:
+            raise ValueError(f"pricing contains unsupported fields: {', '.join(sorted(extra))}")
+        currency = pricing["currency"]
+        if not isinstance(currency, str) or len(currency.strip()) != 3 or not currency.isalpha():
+            raise ValueError("pricing currency must be a three-letter alphabetic code")
+        normalized = {**pricing, "currency": currency.strip().upper()}
+        rate_fields = {
+            "input_per_million",
+            "output_per_million",
+            "cached_input_per_million",
+        }
+        for field in rate_fields & pricing.keys():
+            try:
+                rate = Decimal(str(pricing[field]))
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise ValueError(f"pricing {field} must be numeric") from exc
+            if not rate.is_finite() or rate < 0:
+                raise ValueError(f"pricing {field} must be nonnegative and finite")
+        return normalized
 
 
 class RouteInput(BaseModel):
@@ -106,6 +162,7 @@ class RouteInput(BaseModel):
     enabled: bool = True
     allow_model_fallback: bool = False
     policy_id: str | None = None
+    pool_id: str | None = None
 
 
 class RoutingPolicyDefinition(BaseModel):
@@ -115,6 +172,12 @@ class RoutingPolicyDefinition(BaseModel):
     concurrency_weight: float = Field(default=1, ge=0)
     latency_weight: float = Field(default=1, ge=0)
     failure_weight: float = Field(default=2, ge=0)
+    min_quota_headroom: float = Field(default=0, ge=0, le=1)
+    min_rpm_headroom: float = Field(default=0, ge=0, le=1)
+    min_tpm_headroom: float = Field(default=0, ge=0, le=1)
+    max_latency_ms: float | None = Field(default=None, gt=0)
+    max_attempts: int = Field(default=3, ge=1, le=10)
+    allowed_credential_ids: list[str] = Field(default_factory=list)
 
 
 class RoutingPolicyInput(BaseModel):
@@ -128,6 +191,7 @@ async def _context(request: Request) -> tuple[AdminClaims, Any] | JSONResponse:
     if isinstance(claims, JSONResponse):
         return claims
     pool = getattr(request.app.state, "db_pool", None)
+    pool = getattr(request.state, "control_plane_connection", pool)
     if pool is None:
         return JSONResponse({"error": "control_plane_unavailable"}, status_code=503)
     return claims, pool
@@ -139,17 +203,26 @@ async def _audit(
     action: str,
     resource_type: str,
     resource_id: str | None,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     await pool.execute(
         """
-        insert into public.audit_logs(actor_id, action, resource_type, resource_id)
-        values($1, $2, $3, $4)
+        insert into public.audit_logs(actor_id, action, resource_type, resource_id, metadata)
+        values($1, $2, $3, $4, $5::jsonb)
         """,
         claims.subject,
         action,
         resource_type,
         resource_id,
+        json.dumps(metadata or {}),
     )
+
+
+def _audit_fields(body: BaseModel, *, exclude: set[str] | None = None) -> dict[str, Any]:
+    excluded = exclude or set()
+    return {
+        "changed_fields": sorted(body.model_fields_set - excluded),
+    }
 
 
 def _not_found(resource: str) -> JSONResponse:
@@ -187,7 +260,9 @@ async def create_provider(request: Request, body: ProviderInput) -> JSONResponse
         body.timeout_seconds,
         json.dumps(body.settings),
     )
-    await _audit(pool, claims, "provider_created", "provider", str(row["id"]))
+    await _audit(
+        pool, claims, "provider_created", "provider", str(row["id"]), _audit_fields(body)
+    )
     return JSONResponse(jsonable_encoder(dict(row)), status_code=201)
 
 
@@ -227,7 +302,7 @@ async def update_provider(
     )
     if row is None:
         return _not_found("provider")
-    await _audit(pool, claims, "provider_updated", "provider", provider_id)
+    await _audit(pool, claims, "provider_updated", "provider", provider_id, _audit_fields(body))
     return JSONResponse(jsonable_encoder(dict(row)))
 
 
@@ -265,8 +340,9 @@ async def create_credential(request: Request, body: CredentialInput) -> JSONResp
         """
         insert into public.provider_credentials(
           id, provider_id, name, secret_version, secret_nonce,
-          secret_ciphertext, masked_hint, priority, quota_limit, quota_threshold
-        ) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           secret_ciphertext, masked_hint, priority, quota_limit, quota_threshold,
+           requests_per_minute, tokens_per_minute
+          ) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
         returning id, provider_id, name, masked_hint, enabled, priority,
                   health, quota_limit, quota_used, cooldown_until
         """,
@@ -280,8 +356,13 @@ async def create_credential(request: Request, body: CredentialInput) -> JSONResp
         body.priority,
         body.quota_limit,
         body.quota_threshold,
+        body.requests_per_minute,
+        body.tokens_per_minute,
     )
-    await _audit(pool, claims, "credential_created", "credential", credential_id)
+    await _audit(
+        pool, claims, "credential_created", "credential", credential_id,
+        {"changed_fields": sorted(body.model_fields_set - {"secret"})},
+    )
     return JSONResponse(jsonable_encoder(dict(row)), status_code=201)
 
 
@@ -319,7 +400,7 @@ async def rotate_credential(
     )
     if row is None:
         return _not_found("credential")
-    await _audit(pool, claims, "credential_rotated", "credential", credential_id)
+    await _audit(pool, claims, "credential_rotated", "credential", credential_id, {})
     return JSONResponse(jsonable_encoder(dict(row)))
 
 
@@ -354,7 +435,9 @@ async def update_credential(
     )
     if row is None:
         return _not_found("credential")
-    await _audit(pool, claims, "credential_updated", "credential", credential_id)
+    await _audit(
+        pool, claims, "credential_updated", "credential", credential_id, _audit_fields(body)
+    )
     return JSONResponse(jsonable_encoder(dict(row)))
 
 
@@ -397,7 +480,9 @@ async def create_client(request: Request, body: ClientInput) -> JSONResponse:
         body.tokens_per_minute,
         body.spending_limit,
     )
-    await _audit(pool, claims, "client_created", "client", str(row["id"]))
+    await _audit(
+        pool, claims, "client_created", "client", str(row["id"]), _audit_fields(body)
+    )
     return JSONResponse(jsonable_encoder(dict(row)), status_code=201)
 
 
@@ -432,7 +517,7 @@ async def update_client(
     )
     if row is None:
         return _not_found("client")
-    await _audit(pool, claims, "client_updated", "client", client_id)
+    await _audit(pool, claims, "client_updated", "client", client_id, _audit_fields(body))
     return JSONResponse(jsonable_encoder(dict(row)))
 
 
@@ -452,7 +537,11 @@ async def delete_client(client_id: str, request: Request) -> JSONResponse:
 
 
 @router.post("/clients/{client_id}/keys")
-async def create_client_key(client_id: str, request: Request) -> JSONResponse:
+async def create_client_key(
+    client_id: str,
+    request: Request,
+    body: ClientKeyInput | None = None,
+) -> JSONResponse:
     context = await _context(request)
     if isinstance(context, JSONResponse):
         return context
@@ -473,21 +562,29 @@ async def create_client_key(client_id: str, request: Request) -> JSONResponse:
     )
     await pool.execute(
         """
-        insert into public.gateway_client_keys(id,client_id,key_prefix,key_digest)
-        values($1,$2,$3,$4)
+        insert into public.gateway_client_keys(
+          id,client_id,key_prefix,key_digest,label,expires_at)
+        values($1,$2,$3,$4,$5,$6)
         """,
         key_id,
         client_id,
         issued.record.key_prefix,
         issued.record.digest,
+        body.label if body else None,
+        body.expires_at if body else None,
     )
-    await _audit(pool, claims, "gateway_key_created", "client_key", key_id)
+    await _audit(
+        pool, claims, "gateway_key_created", "client_key", key_id,
+        {"client_id": client_id},
+    )
     return JSONResponse(
         {
             "id": key_id,
             "client_id": client_id,
             "key_prefix": issued.record.key_prefix,
             "key": issued.plaintext,
+            "label": body.label if body else None,
+            "expires_at": body.expires_at if body else None,
         },
         status_code=201,
     )
@@ -501,7 +598,8 @@ async def client_keys(client_id: str, request: Request) -> JSONResponse:
     _, pool = context
     rows = await pool.fetch(
         """
-        select id,client_id,key_prefix,enabled,last_used_at,expires_at,created_at,revoked_at
+        select id,client_id,key_prefix,label,enabled,last_used_at,expires_at,created_at,
+               revoked_at,revoke_reason
         from public.gateway_client_keys where client_id=$1 order by created_at desc
         """,
         client_id,
@@ -510,22 +608,82 @@ async def client_keys(client_id: str, request: Request) -> JSONResponse:
 
 
 @router.post("/client-keys/{key_id}/revoke")
-async def revoke_client_key(key_id: str, request: Request) -> JSONResponse:
+async def revoke_client_key(
+    key_id: str,
+    request: Request,
+    body: KeyRevocationInput | None = None,
+) -> JSONResponse:
     context = await _context(request)
     if isinstance(context, JSONResponse):
         return context
     claims, pool = context
     row = await pool.fetchrow(
         """
-        update public.gateway_client_keys set enabled=false,revoked_at=coalesce(revoked_at,now())
-        where id=$1 returning id,client_id,key_prefix,enabled,revoked_at
+        update public.gateway_client_keys set enabled=false,revoked_at=coalesce(revoked_at,now()),
+          revoke_reason=coalesce($2,revoke_reason)
+        where id=$1 returning id,client_id,key_prefix,enabled,revoked_at,revoke_reason
         """,
         key_id,
+        body.reason if body else None,
     )
     if row is None:
         return _not_found("client_key")
     await _audit(pool, claims, "gateway_key_revoked", "client_key", key_id)
     return JSONResponse(jsonable_encoder(dict(row)))
+
+
+@router.post("/client-keys/{key_id}/rotate")
+async def rotate_client_key(
+    key_id: str,
+    request: Request,
+    body: ClientKeyInput | None = None,
+) -> JSONResponse:
+    context = await _context(request)
+    if isinstance(context, JSONResponse):
+        return context
+    claims, pool = context
+    current = await pool.fetchrow(
+        """select client_id,label,expires_at from public.gateway_client_keys
+           where id=$1 and enabled and revoked_at is null""",
+        key_id,
+    )
+    if current is None:
+        return _not_found("client_key")
+    pepper = request.app.state.settings.key_pepper
+    if not pepper:
+        return JSONResponse({"error": "key_pepper_not_configured"}, status_code=503)
+    replacement_id = str(uuid4())
+    issued = GatewayKeyHasher.from_base64(pepper).issue(
+        key_id=replacement_id, client_id=str(current["client_id"])
+    )
+    await pool.execute(
+        """insert into public.gateway_client_keys(
+             id,client_id,key_prefix,key_digest,label,expires_at)
+           values($1,$2,$3,$4,$5,$6)""",
+        replacement_id, current["client_id"], issued.record.key_prefix, issued.record.digest,
+        body.label if body else current["label"],
+        body.expires_at if body else current["expires_at"],
+    )
+    await pool.execute(
+        """update public.gateway_client_keys set enabled=false,revoked_at=now(),
+             revoke_reason='rotated' where id=$1""",
+        key_id,
+    )
+    await _audit(
+        pool, claims, "gateway_key_rotated", "client_key", replacement_id,
+        {"replaced_key_id": key_id, "client_id": str(current["client_id"])},
+    )
+    return JSONResponse(
+        {
+            "id": replacement_id,
+            "client_id": str(current["client_id"]),
+            "key_prefix": issued.record.key_prefix,
+            "key": issued.plaintext,
+            "label": body.label if body else current["label"],
+            "expires_at": body.expires_at if body else current["expires_at"],
+        },
+        status_code=201,
+    )
 
 
 @router.post("/models")
@@ -534,25 +692,19 @@ async def create_model(request: Request, body: ModelInput) -> JSONResponse:
     if isinstance(context, JSONResponse):
         return context
     claims, pool = context
-    async with pool.acquire() as connection, connection.transaction():
-        await connection.execute(
-            """
-            insert into public.models(id,display_name,capabilities,enabled,context_window)
-            values($1,$2,$3,$4,$5)
-            """,
-            body.id,
-            body.display_name,
-            body.capabilities,
-            body.enabled,
-            body.context_window,
+    await pool.execute(
+        """
+        insert into public.models(id,display_name,capabilities,enabled,context_window)
+        values($1,$2,$3,$4,$5)
+        """,
+        body.id, body.display_name, body.capabilities, body.enabled, body.context_window,
+    )
+    for alias in body.aliases:
+        await pool.execute(
+            "insert into public.model_aliases(alias,model_id) values($1,$2)",
+            alias, body.id,
         )
-        for alias in body.aliases:
-            await connection.execute(
-                "insert into public.model_aliases(alias,model_id) values($1,$2)",
-                alias,
-                body.id,
-            )
-    await _audit(pool, claims, "model_created", "model", body.id)
+    await _audit(pool, claims, "model_created", "model", body.id, _audit_fields(body))
     return JSONResponse({"id": body.id, "aliases": body.aliases}, status_code=201)
 
 
@@ -564,25 +716,20 @@ async def update_model(model_id: str, request: Request, body: ModelInput) -> JSO
     claims, pool = context
     if body.id != model_id:
         return JSONResponse({"error": "model_id_is_immutable"}, status_code=422)
-    async with pool.acquire() as connection, connection.transaction():
-        row = await connection.fetchrow(
-            """update public.models set display_name=$2,capabilities=$3,enabled=$4,
-                      context_window=$5,updated_at=now() where id=$1
-               returning id,display_name,capabilities,enabled,context_window""",
-            model_id,
-            body.display_name,
-            body.capabilities,
-            body.enabled,
-            body.context_window,
+    row = await pool.fetchrow(
+        """update public.models set display_name=$2,capabilities=$3,enabled=$4,
+                  context_window=$5,updated_at=now() where id=$1
+           returning id,display_name,capabilities,enabled,context_window""",
+        model_id, body.display_name, body.capabilities, body.enabled, body.context_window,
+    )
+    if row is None:
+        return _not_found("model")
+    await pool.execute("delete from public.model_aliases where model_id=$1", model_id)
+    for alias in body.aliases:
+        await pool.execute(
+            "insert into public.model_aliases(alias,model_id) values($1,$2)", alias, model_id
         )
-        if row is None:
-            return _not_found("model")
-        await connection.execute("delete from public.model_aliases where model_id=$1", model_id)
-        for alias in body.aliases:
-            await connection.execute(
-                "insert into public.model_aliases(alias,model_id) values($1,$2)", alias, model_id
-            )
-    await _audit(pool, claims, "model_updated", "model", model_id)
+    await _audit(pool, claims, "model_updated", "model", model_id, _audit_fields(body))
     return JSONResponse(jsonable_encoder({**dict(row), "aliases": body.aliases}))
 
 
@@ -618,10 +765,10 @@ async def create_provider_model(
         """
         insert into public.provider_models(
           provider_id,model_id,upstream_model_id,protocol,
-          capabilities,priority,weight,enabled,max_concurrency
-        ) values($1,$2,$3,$4,$5,$6,$7,$8,$9)
+          capabilities,priority,weight,enabled,max_concurrency,settings,pricing
+        ) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb)
         returning id,provider_id,model_id,upstream_model_id,protocol,
-                  capabilities,priority,weight,enabled,max_concurrency
+                  capabilities,priority,weight,enabled,max_concurrency,settings,pricing
         """,
         body.provider_id,
         body.model_id,
@@ -632,8 +779,13 @@ async def create_provider_model(
         body.weight,
         body.enabled,
         body.max_concurrency,
+        json.dumps(body.settings),
+        json.dumps(body.pricing),
     )
-    await _audit(pool, claims, "provider_model_created", "provider_model", str(row["id"]))
+    await _audit(
+        pool, claims, "provider_model_created", "provider_model", str(row["id"]),
+        _audit_fields(body),
+    )
     return JSONResponse(jsonable_encoder(dict(row)), status_code=201)
 
 
@@ -654,16 +806,19 @@ async def update_provider_model(
     row = await pool.fetchrow(
         """update public.provider_models set provider_id=$2,model_id=$3,upstream_model_id=$4,
                    protocol=$5,capabilities=$6,priority=$7,weight=$8,enabled=$9,
-                   max_concurrency=$10,updated_at=now()
+                   max_concurrency=$10,settings=$11::jsonb,pricing=$12::jsonb,updated_at=now()
            where id=$1 returning id,provider_id,model_id,upstream_model_id,protocol,
-                                 capabilities,priority,weight,enabled,max_concurrency""",
+                                  capabilities,priority,weight,enabled,max_concurrency,settings,pricing""",
         provider_model_id, body.provider_id, body.model_id, body.upstream_model_id,
         body.protocol, body.capabilities, body.priority, body.weight, body.enabled,
-        body.max_concurrency,
+          body.max_concurrency, json.dumps(body.settings), json.dumps(body.pricing),
     )
     if row is None:
         return _not_found("provider_model")
-    await _audit(pool, claims, "provider_model_updated", "provider_model", provider_model_id)
+    await _audit(
+        pool, claims, "provider_model_updated", "provider_model", provider_model_id,
+        _audit_fields(body),
+    )
     return JSONResponse(jsonable_encoder(dict(row)))
 
 
@@ -691,9 +846,10 @@ async def create_route(request: Request, body: RouteInput) -> JSONResponse:
     row = await pool.fetchrow(
         """
         insert into public.model_routes(
-          model_id,provider_model_id,priority,enabled,allow_model_fallback,policy_id
-        ) values($1,$2,$3,$4,$5,$6)
-        returning id,model_id,provider_model_id,priority,enabled,allow_model_fallback,policy_id
+          model_id,provider_model_id,priority,enabled,allow_model_fallback,policy_id,pool_id
+        ) values($1,$2,$3,$4,$5,$6,$7)
+        returning id,model_id,provider_model_id,priority,enabled,allow_model_fallback,
+                  policy_id,pool_id
         """,
         body.model_id,
         body.provider_model_id,
@@ -701,8 +857,11 @@ async def create_route(request: Request, body: RouteInput) -> JSONResponse:
         body.enabled,
         body.allow_model_fallback,
         body.policy_id,
+        body.pool_id,
     )
-    await _audit(pool, claims, "route_created", "model_route", str(row["id"]))
+    await _audit(
+        pool, claims, "route_created", "model_route", str(row["id"]), _audit_fields(body)
+    )
     return JSONResponse(jsonable_encoder(dict(row)), status_code=201)
 
 
@@ -714,15 +873,15 @@ async def update_route(route_id: str, request: Request, body: RouteInput) -> JSO
     claims, pool = context
     row = await pool.fetchrow(
         """update public.model_routes set model_id=$2,provider_model_id=$3,priority=$4,
-                  enabled=$5,allow_model_fallback=$6,policy_id=$7 where id=$1
+                  enabled=$5,allow_model_fallback=$6,policy_id=$7,pool_id=$8 where id=$1
            returning id,model_id,provider_model_id,priority,enabled,
-                     allow_model_fallback,policy_id""",
+                     allow_model_fallback,policy_id,pool_id""",
         route_id, body.model_id, body.provider_model_id, body.priority,
-        body.enabled, body.allow_model_fallback, body.policy_id,
+        body.enabled, body.allow_model_fallback, body.policy_id, body.pool_id,
     )
     if row is None:
         return _not_found("route")
-    await _audit(pool, claims, "route_updated", "model_route", route_id)
+    await _audit(pool, claims, "route_updated", "model_route", route_id, _audit_fields(body))
     return JSONResponse(jsonable_encoder(dict(row)))
 
 
@@ -750,7 +909,10 @@ async def create_routing_policy(request: Request, body: RoutingPolicyInput) -> J
            returning id,name,enabled,policy,created_at,updated_at""",
         body.name, body.enabled, json.dumps(body.policy.model_dump()),
     )
-    await _audit(pool, claims, "routing_policy_created", "routing_policy", str(row["id"]))
+    await _audit(
+        pool, claims, "routing_policy_created", "routing_policy", str(row["id"]),
+        _audit_fields(body),
+    )
     return JSONResponse(jsonable_encoder(dict(row)), status_code=201)
 
 
@@ -770,7 +932,9 @@ async def update_routing_policy(
     )
     if row is None:
         return _not_found("routing_policy")
-    await _audit(pool, claims, "routing_policy_updated", "routing_policy", policy_id)
+    await _audit(
+        pool, claims, "routing_policy_updated", "routing_policy", policy_id, _audit_fields(body)
+    )
     return JSONResponse(jsonable_encoder(dict(row)))
 
 
@@ -807,7 +971,7 @@ async def _snapshot_payload(pool: Any) -> dict[str, Any]:
     )
     providers = await _rows(
         pool,
-         """select id::text,name,provider_type,protocol,base_url,enabled,
+         """select id::text,name,provider_type,protocol,base_url,enabled,priority,
                    capabilities,timeout_seconds,health,
                    coalesce(settings->'default_headers','{}'::jsonb) as default_headers,
                    coalesce(settings->'required_betas','[]'::jsonb) as required_betas,
@@ -819,7 +983,7 @@ async def _snapshot_payload(pool: Any) -> dict[str, Any]:
         pool,
         """select id::text,provider_id::text,secret_version,secret_nonce,
                    secret_ciphertext,enabled,priority,health,quota_limit,
-                   quota_used,cooldown_until,
+                   quota_used,cooldown_until,requests_per_minute,tokens_per_minute,
                    coalesce(
                      array_agg(cma.provider_model_id::text)
                        filter (where cma.provider_model_id is not null),
@@ -836,11 +1000,37 @@ async def _snapshot_payload(pool: Any) -> dict[str, Any]:
     aliases = await pool.fetch("select alias,model_id from public.model_aliases")
     provider_models = await _rows(
         pool,
-        """select pm.id::text,pm.model_id as canonical_model_id,pm.provider_id::text,
+        """select pm.id::text,r.id::text as route_id,
+                   pm.model_id as canonical_model_id,pm.provider_id::text,
                    pm.upstream_model_id,pm.protocol,pm.capabilities,r.priority,pm.weight,
-                    pm.max_concurrency,
-                    (pm.enabled and r.enabled) as enabled,
-                    case when rp.enabled then rp.policy else null end as routing_policy
+                     pm.max_concurrency,
+                     case when pm.settings ? 'default_headers'
+                          then pm.settings->'default_headers' end as default_headers,
+                     case when pm.settings ? 'required_betas'
+                          then pm.settings->'required_betas' end as required_betas,
+                     case when pm.settings ? 'auth_scheme'
+                          then pm.settings->>'auth_scheme' end as auth_scheme,
+                     case when pm.settings ? 'endpoint_query'
+                     then pm.settings->'endpoint_query' end as endpoint_query,
+                     pm.pricing,
+                     case when r.pool_id is null then null else array(
+                       select ppm.credential_id::text
+                       from public.provider_pool_members ppm
+                       where ppm.pool_id=r.pool_id and ppm.provider_model_id=pm.id
+                         and ppm.enabled and not ppm.draining
+                       order by ppm.priority,ppm.credential_id
+                      ) end as allowed_credential_ids,
+                      case when r.pool_id is null then null else (
+                        select jsonb_object_agg(ppm.credential_id::text,
+                          jsonb_build_object('priority',ppm.priority,'weight',ppm.weight))
+                        from public.provider_pool_members ppm
+                        where ppm.pool_id=r.pool_id and ppm.provider_model_id=pm.id
+                          and ppm.enabled and not ppm.draining
+                       ) end as pool_members,
+                      (select pp.strategy from public.provider_pools pp where pp.id=r.pool_id)
+                        as pool_strategy,
+                     (pm.enabled and r.enabled) as enabled,
+                     case when rp.enabled then rp.policy else null end as routing_policy
            from public.provider_models pm
            join public.model_routes r
              on r.provider_model_id = pm.id and r.model_id = pm.model_id
@@ -855,7 +1045,7 @@ async def _snapshot_payload(pool: Any) -> dict[str, Any]:
     for row in credentials:
         row["quota_limit"] = float(row["quota_limit"]) if row["quota_limit"] else None
         row["quota_used"] = float(row["quota_used"])
-    for row in providers:
+    for row in providers + provider_models:
         for field in ("default_headers", "required_betas", "endpoint_query"):
             if isinstance(row.get(field), str):
                 row[field] = json.loads(row[field])
@@ -867,6 +1057,8 @@ async def _snapshot_payload(pool: Any) -> dict[str, Any]:
     for row in provider_models:
         if isinstance(row.get("routing_policy"), str):
             row["routing_policy"] = json.loads(row["routing_policy"])
+        if isinstance(row.get("pricing"), str):
+            row["pricing"] = json.loads(row["pricing"])
     return {
         "clients": clients,
         "gateway_keys": keys,
@@ -875,6 +1067,49 @@ async def _snapshot_payload(pool: Any) -> dict[str, Any]:
         "models": models,
         "provider_models": provider_models,
     }
+
+
+@router.get("/config/status")
+async def config_status(request: Request) -> JSONResponse:
+    context = await _context(request)
+    if isinstance(context, JSONResponse):
+        return context
+    _, pool = context
+    payload = await _snapshot_payload(pool)
+    RuntimeSnapshot.model_validate(payload)
+    working_checksum = configuration_checksum(payload)
+    published = await pool.fetchrow(
+        """select id,checksum,payload,published_at from public.config_versions
+           where status='published'"""
+    )
+    published_payload = published["payload"] if published else {}
+    if isinstance(published_payload, str):
+        published_payload = json.loads(published_payload)
+    section_names = {
+        "providers": "Providers",
+        "credentials": "Credentials",
+        "models": "Models",
+        "provider_models": "Mappings and routes",
+        "clients": "Gateway clients",
+    }
+    working_projection = configuration_projection(payload)
+    published_projection = configuration_projection(published_payload)
+    changed_sections = [
+        label for key, label in section_names.items()
+        if working_projection.get(key, []) != published_projection.get(key, [])
+    ]
+    published_checksum = published["checksum"] if published else None
+    has_changes = published is None or published_checksum != working_checksum
+    if published is not None and published_checksum != working_checksum:
+        has_changes = working_projection != published_projection
+    return JSONResponse(jsonable_encoder({
+        "active_version": published["id"] if published else None,
+        "active_checksum": published["checksum"] if published else None,
+        "working_checksum": working_checksum,
+        "has_unpublished_changes": has_changes,
+        "changed_sections": changed_sections if has_changes else [],
+        "published_at": published["published_at"] if published else None,
+    }))
 
 
 @router.post("/config/publish")
@@ -902,8 +1137,7 @@ async def publish_config(request: Request) -> JSONResponse:
                 {"error": "configuration_validation_failed", "details": errors},
                 status_code=422,
             )
-        canonical = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
-        checksum = hashlib.sha256(canonical.encode()).hexdigest()
+        checksum = configuration_checksum(payload)
         await connection.execute(
             "update public.config_versions set status='superseded' where status='published'"
         )
@@ -919,7 +1153,8 @@ async def publish_config(request: Request) -> JSONResponse:
             claims.subject,
         )
         await _audit(
-            connection, claims, "config_published", "config_version", str(row["id"])
+            connection, claims, "config_published", "config_version", str(row["id"]),
+            {"checksum": checksum, "schema_version": 1},
         )
     return JSONResponse(
         jsonable_encoder(
@@ -980,9 +1215,12 @@ async def rollback_config(version: int, request: Request) -> JSONResponse:
                 },
                 status_code=422,
             )
-        canonical = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
-        checksum = hashlib.sha256(canonical.encode()).hexdigest()
-        if checksum != selected["checksum"]:
+        checksum = configuration_checksum(payload)
+        if selected["checksum"] not in {
+            checksum,
+            legacy_configuration_checksum(payload),
+            legacy_checksum(payload),
+        }:
             return JSONResponse(
                 {"error": "configuration_checksum_invalid"}, status_code=409
             )
@@ -1005,6 +1243,11 @@ async def rollback_config(version: int, request: Request) -> JSONResponse:
             "config_rolled_back",
             "config_version",
             str(published["id"]),
+            {
+                "source_version": version,
+                "checksum": checksum,
+                "schema_version": selected["schema_version"],
+            },
         )
     return JSONResponse(
         jsonable_encoder(

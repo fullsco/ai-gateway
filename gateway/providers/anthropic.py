@@ -21,6 +21,7 @@ QUOTA_MARKERS = (
     "insufficient balance",
     "billing limit",
 )
+DEFAULT_USER_AGENT = "ai-gateway/0.1"
 
 
 class AnthropicCompatibleAdapter(ProviderAdapter):
@@ -36,7 +37,7 @@ class AnthropicCompatibleAdapter(ProviderAdapter):
         if config.protocol is not ClientProtocol.ANTHROPIC_MESSAGES:
             raise ValueError("Anthropic adapter requires the Anthropic Messages protocol")
         self.config = config
-        self.default_headers = dict(default_headers or {})
+        self.default_headers = {"user-agent": DEFAULT_USER_AGENT, **(default_headers or {})}
         self.required_betas = frozenset(required_betas)
         self.auth_scheme = auth_scheme
         self.endpoint_query = dict(endpoint_query or {})
@@ -90,7 +91,10 @@ class AnthropicCompatibleAdapter(ProviderAdapter):
         searchable = f"{error_type} {message}".lower()
         retry_after = self._retry_after(response.headers.get("retry-after"))
 
-        if response.status_code in {401, 403}:
+        if response.status_code == 403 and self._is_waf_rejection(response):
+            category = ErrorCategory.UPSTREAM_WAF_REJECTION
+            retryable = True
+        elif response.status_code in {401, 403}:
             category = ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR
             retryable = False
         elif response.status_code in {402, 429} and any(
@@ -125,8 +129,20 @@ class AnthropicCompatibleAdapter(ProviderAdapter):
             retry_after_seconds=retry_after,
         )
 
-    def create_probe_request(self, credential: Credential) -> UpstreamRequest:
-        headers = {"accept": "application/json", **self.default_headers}
+    def create_probe_request(
+        self,
+        credential: Credential,
+        *,
+        model: str | None = None,
+    ) -> UpstreamRequest:
+        if not model:
+            raise ValueError("Anthropic health probes require an upstream model")
+        headers = {
+            "accept": "application/json",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+            **self.default_headers,
+        }
         for name in ("authorization", "cookie", "proxy-authorization", "x-api-key"):
             headers.pop(name, None)
         if self.auth_scheme in {"default", "x-api-key", "both"}:
@@ -139,11 +155,24 @@ class AnthropicCompatibleAdapter(ProviderAdapter):
         if self.endpoint_query:
             url = f"{url}?{urlencode(self.endpoint_query)}"
         return UpstreamRequest(
-            method="HEAD",
+            method="POST",
             url=url,
             headers=headers,
+            json_body={
+                "model": model,
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "ping"}],
+            },
             timeout=httpx.Timeout(min(self.config.timeout_seconds, 10)),
         )
+
+    @staticmethod
+    def _is_waf_rejection(response: httpx.Response) -> bool:
+        try:
+            payload = response.json()
+        except ValueError:
+            return True
+        return not (isinstance(payload, dict) and isinstance(payload.get("error"), dict))
 
     def _merge_betas(self, source: str | None) -> str:
         values = set(self.required_betas)

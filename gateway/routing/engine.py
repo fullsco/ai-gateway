@@ -28,6 +28,7 @@ class ProviderState:
     circuit_open: bool = False
     latency_ms: float = 0
     failure_rate: float = 0
+    priority: int = 100
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,8 @@ class CredentialState:
     latency_ms: float = 0
     cooldown_until: datetime | None = None
     supported_provider_model_ids: frozenset[str] = frozenset()
+    requests_per_minute: int | None = None
+    tokens_per_minute: int | None = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +102,7 @@ class RoutingEngine:
                 if not self._credential_is_eligible(
                     credential,
                     provider_model,
+                    provider,
                     current_time,
                     excluded_credential_ids,
                 ):
@@ -117,13 +121,44 @@ class RoutingEngine:
             raise NoRouteAvailable(f"No eligible route for model {canonical_model.id}")
         return min(
             candidates,
-            key=lambda candidate: (
+            key=lambda candidate: self._selection_key(candidate, provider_states),
+        )
+
+    def _selection_key(
+        self,
+        candidate: RouteDecision,
+        provider_states: dict[str, ProviderState],
+    ) -> tuple[object, ...]:
+        strategy = candidate.provider_model.pool_strategy
+        if strategy == "least_loaded":
+            return (
+                -min(
+                    candidate.credential.concurrency_headroom,
+                    candidate.credential.rpm_headroom,
+                    candidate.credential.tpm_headroom,
+                ),
+                provider_states[candidate.provider_model.provider_id].priority,
                 candidate.provider_model.priority,
-                candidate.credential.priority,
+                self._member_priority(candidate),
                 -candidate.score,
                 candidate.provider_model.id,
                 candidate.credential.credential_id,
-            ),
+            )
+        if strategy == "weighted":
+            return (
+                provider_states[candidate.provider_model.provider_id].priority,
+                candidate.provider_model.priority,
+                -candidate.score,
+                candidate.provider_model.id,
+                candidate.credential.credential_id,
+            )
+        return (
+            provider_states[candidate.provider_model.provider_id].priority,
+            candidate.provider_model.priority,
+            self._member_priority(candidate),
+            -candidate.score,
+            candidate.provider_model.id,
+            candidate.credential.credential_id,
         )
 
     @staticmethod
@@ -139,6 +174,7 @@ class RoutingEngine:
     def _credential_is_eligible(
         credential: CredentialState,
         provider_model: ProviderModel,
+        provider: ProviderState,
         now: datetime,
         excluded_ids: frozenset[str],
     ) -> bool:
@@ -161,7 +197,25 @@ class RoutingEngine:
         ):
             return False
         restrictions = credential.supported_provider_model_ids
-        return not restrictions or provider_model.id in restrictions
+        if restrictions and provider_model.id not in restrictions:
+            return False
+        pool_credentials = provider_model.allowed_credential_ids
+        if pool_credentials is not None and credential.credential_id not in pool_credentials:
+            return False
+        policy = provider_model.routing_policy or {}
+        max_latency = policy.get("max_latency_ms")
+        if max_latency is not None and max(
+            provider.latency_ms, credential.latency_ms
+        ) > float(max_latency):
+            return False
+        if credential.quota_headroom < float(policy.get("min_quota_headroom", 0)):
+            return False
+        if credential.rpm_headroom < float(policy.get("min_rpm_headroom", 0)):
+            return False
+        if credential.tpm_headroom < float(policy.get("min_tpm_headroom", 0)):
+            return False
+        allowed = policy.get("allowed_credential_ids") or []
+        return not allowed or credential.credential_id in allowed
 
     def _score(
         self,
@@ -182,7 +236,18 @@ class RoutingEngine:
             + policy.latency_weight * latency
             - policy.failure_weight * self._bounded(failure_rate)
         )
-        return round(score * provider_model.weight, 6)
+        member = (provider_model.pool_members or {}).get(credential.credential_id, {})
+        member_weight = float(member.get("weight", 1)) if isinstance(member, dict) else 1
+        return round(score * provider_model.weight * member_weight, 6)
+
+    @staticmethod
+    def _member_priority(candidate: RouteDecision) -> int:
+        member = (candidate.provider_model.pool_members or {}).get(
+            candidate.credential.credential_id, {}
+        )
+        if isinstance(member, dict):
+            return int(member.get("priority", candidate.credential.priority))
+        return candidate.credential.priority
 
     def _policy_for(self, provider_model: ProviderModel) -> RoutingPolicy:
         overrides = provider_model.routing_policy or {}

@@ -43,6 +43,7 @@ async def messages(request: Request) -> Response:
         runtime,
         request.app.state.settings,
         client_id=authenticated.client.id,
+        key_id=authenticated.key_id,
         db_pool=getattr(request.app.state, "db_pool", None),
         health_recorder=getattr(request.app.state, "health_recorder", None),
     )

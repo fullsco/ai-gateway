@@ -1,10 +1,13 @@
 import asyncio
+import hashlib
 import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from gateway.alerts import AlertEvent, evaluate_alert_rules
 from gateway.logging import log_event
 from gateway.protocols import ClientProtocol
 
@@ -23,6 +26,18 @@ class PassiveHealthEvent:
     error_category: str | None = None
     upstream_status: int | None = None
     retry_after_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class UsageAttribution:
+    provider_id: str
+    provider_name: str | None
+    provider_model_id: str
+    route_id: str | None
+    canonical_model: str
+    upstream_model: str
+    protocol: ClientProtocol
+    pricing: dict[str, object] | None
 
 
 class PassiveHealthRecorder:
@@ -114,12 +129,31 @@ class PassiveHealthRecorder:
             event.request_id,
             event.provider_model_id,
         )
+        if event.error_category is not None:
+            await evaluate_alert_rules(
+                self._pool,
+                AlertEvent(
+                    event_type="provider_failure",
+                    title=f"Provider request failed: {event.error_category}",
+                    scopes={
+                        "provider": event.provider_id,
+                        "credential": event.credential_id,
+                        "route": event.provider_model_id,
+                    },
+                    metadata={
+                        "error_category": event.error_category,
+                        "upstream_status": event.upstream_status,
+                        "latency_ms": event.latency_ms,
+                    },
+                ),
+            )
 
 
 def _passive_health(error_category: str | None) -> str | None:
     return {
         None: "healthy",
         "upstream_authentication_error": "auth_failed",
+        "upstream_waf_rejection": "degraded",
         "quota_exhausted": "quota_exhausted",
         "rate_limit": "rate_limited",
         "timeout": "degraded",
@@ -136,6 +170,7 @@ class RequestRecorder:
         self,
         *,
         client_id: str,
+        key_id: str | None,
         protocol: ClientProtocol,
         requested_model: str,
         started_at: datetime,
@@ -143,11 +178,12 @@ class RequestRecorder:
         await self._execute(
             """
             insert into public.request_logs(
-              id,client_id,protocol,requested_model,status,started_at
-            ) values($1,$2,$3,$4,'in_progress',$5)
+              id,client_id,key_id,protocol,requested_model,status,started_at
+            ) values($1,$2,$3,$4,$5,'in_progress',$6)
             """,
             self.request_id,
             client_id,
+            key_id,
             protocol.value,
             requested_model,
             started_at,
@@ -240,32 +276,78 @@ class RequestRecorder:
         attempt_id: int | None,
         protocol: ClientProtocol,
         content: bytes,
+        attribution: UsageAttribution,
+        *,
+        attempt_status: str,
     ) -> None:
         if attempt_id is None:
             return
         usage = extract_usage(protocol, content)
         if usage is None:
             return
-        await self.record_usage_values(attempt_id, usage)
+        await self.record_usage_values(
+            attempt_id,
+            usage,
+            attribution,
+            attempt_status=attempt_status,
+        )
 
     async def record_usage_values(
         self,
         attempt_id: int | None,
         usage: tuple[int | None, int | None, int | None],
+        attribution: UsageAttribution,
+        *,
+        attempt_status: str,
     ) -> None:
         if attempt_id is None:
             return
+        if not _valid_usage(usage):
+            log_event(logger, logging.WARNING, "invalid_usage_rejected")
+            return
+        estimated_cost, currency = estimate_cost(usage, attribution.pricing)
+        pricing_context = dict(attribution.pricing or {}) if estimated_cost is not None else None
+        pricing_context_hash = (
+            hashlib.sha256(
+                json.dumps(
+                    pricing_context,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ).encode()
+            ).hexdigest()
+            if pricing_context is not None
+            else None
+        )
         await self._execute(
             """
             insert into public.usage_records(
-              request_id,attempt_id,input_tokens,output_tokens,cached_tokens,is_estimate
-            ) values($1,$2,$3,$4,$5,true)
+              request_id,attempt_id,input_tokens,output_tokens,cached_tokens,
+              estimated_cost,currency,is_estimate,provider_id_snapshot,
+              provider_name_snapshot,provider_model_id_snapshot,route_id_snapshot,
+              canonical_model_snapshot,upstream_model_snapshot,protocol_snapshot,
+              attempt_status_snapshot,pricing_context,pricing_context_hash
+            ) values(
+              $1,$2,$3,$4,$5,$6,$7,true,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17
+            ) on conflict (attempt_id) do nothing
             """,
             self.request_id,
             attempt_id,
             usage[0],
             usage[1],
             usage[2],
+            estimated_cost,
+            currency,
+            attribution.provider_id,
+            attribution.provider_name,
+            attribution.provider_model_id,
+            attribution.route_id,
+            attribution.canonical_model,
+            attribution.upstream_model,
+            attribution.protocol.value,
+            attempt_status,
+            json.dumps(pricing_context) if pricing_context is not None else None,
+            pricing_context_hash,
         )
 
     async def _execute(self, query: str, *args: Any) -> None:
@@ -309,20 +391,67 @@ def extract_usage(
     if not isinstance(usage, dict):
         return None
     if protocol is ClientProtocol.ANTHROPIC_MESSAGES:
-        values = (
-            _integer(usage.get("input_tokens")),
-            _integer(usage.get("output_tokens")),
-            _integer(usage.get("cache_read_input_tokens")),
+        raw_values = (
+            usage.get("input_tokens"),
+            usage.get("output_tokens"),
+            usage.get("cache_read_input_tokens"),
         )
     else:
         input_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
         cached = input_details.get("cached_tokens") if isinstance(input_details, dict) else None
-        values = (
-            _integer(usage.get("prompt_tokens", usage.get("input_tokens"))),
-            _integer(usage.get("completion_tokens", usage.get("output_tokens"))),
-            _integer(cached),
+        raw_values = (
+            usage.get("prompt_tokens", usage.get("input_tokens")),
+            usage.get("completion_tokens", usage.get("output_tokens")),
+            cached,
         )
+    if any(value is not None and _integer(value) is None for value in raw_values):
+        return None
+    values = tuple(_integer(value) for value in raw_values)
     return values if any(value is not None for value in values) else None
+
+
+def estimate_cost(
+    usage: tuple[int | None, int | None, int | None],
+    pricing: dict[str, object] | None,
+) -> tuple[Decimal | None, str | None]:
+    if not pricing:
+        return None, None
+    currency_value = pricing.get("currency")
+    currency = str(currency_value).strip().upper() if currency_value is not None else ""
+    if len(currency) != 3 or not currency.isalpha():
+        return None, None
+    try:
+        input_rate = Decimal(str(pricing["input_per_million"]))
+        output_rate = Decimal(str(pricing["output_per_million"]))
+        cached_rate = Decimal(str(pricing.get("cached_input_per_million", input_rate)))
+    except (KeyError, InvalidOperation, TypeError, ValueError):
+        return None, None
+    if min(input_rate, output_rate, cached_rate) < 0:
+        return None, None
+    input_tokens, output_tokens, cached_tokens = (value or 0 for value in usage)
+    uncached_input = max(0, input_tokens - cached_tokens)
+    total = (
+        Decimal(uncached_input) * input_rate
+        + Decimal(output_tokens) * output_rate
+        + Decimal(cached_tokens) * cached_rate
+    ) / Decimal(1_000_000)
+    return total.quantize(Decimal("0.00000001")), currency
+
+
+def _valid_usage(usage: tuple[int | None, int | None, int | None]) -> bool:
+    input_tokens, _, cached_tokens = usage
+    return (
+        any(value is not None for value in usage)
+        and all(
+        value is None or (isinstance(value, int) and not isinstance(value, bool) and value >= 0)
+        for value in usage
+        )
+        and not (
+            input_tokens is not None
+            and cached_tokens is not None
+            and cached_tokens > input_tokens
+        )
+    )
 
 
 class StreamUsageAccumulator:

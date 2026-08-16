@@ -7,6 +7,51 @@ from typing import Any, Protocol
 from pydantic import BaseModel, ConfigDict, Field
 
 
+def _strip_runtime_state(payload: dict[str, Any]) -> dict[str, Any]:
+    projected = json.loads(json.dumps(payload, default=str))
+    for row in projected.get("providers", []):
+        row.pop("health", None)
+    for row in projected.get("credentials", []):
+        for field in ("health", "quota_used", "cooldown_until"):
+            row.pop(field, None)
+    return projected
+
+
+def configuration_projection(payload: dict[str, Any]) -> dict[str, Any]:
+    projected = _strip_runtime_state(payload)
+    for rows in projected.values():
+        if isinstance(rows, list) and all(isinstance(row, dict) for row in rows):
+            rows.sort(
+                key=lambda row: str(
+                    row.get("id", row.get("key_prefix", row.get("name", "")))
+                )
+            )
+    return projected
+
+
+def configuration_checksum(payload: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        configuration_projection(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def legacy_configuration_checksum(payload: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        _strip_runtime_state(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def legacy_checksum(payload: dict[str, Any]) -> str:
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 class ConfigSnapshot(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -24,22 +69,19 @@ class ConfigSnapshot(BaseModel):
         payload: dict[str, Any],
         published_at: datetime | None = None,
     ) -> "ConfigSnapshot":
-        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
-        checksum = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         return cls(
             version=version,
-            checksum=checksum,
+            checksum=configuration_checksum(payload),
             published_at=published_at or datetime.now(UTC),
             payload=payload,
         )
 
     def verify_checksum(self) -> bool:
-        expected = self.create(
-            version=self.version,
-            payload=self.payload,
-            published_at=self.published_at,
-        ).checksum
-        return expected == self.checksum
+        return self.checksum in {
+            configuration_checksum(self.payload),
+            legacy_configuration_checksum(self.payload),
+            legacy_checksum(self.payload),
+        }
 
 
 class SnapshotRepository(Protocol):

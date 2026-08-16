@@ -23,8 +23,14 @@ class ProviderModel:
     priority: int = 100
     weight: float = 1.0
     enabled: bool = True
-    routing_policy: Mapping[str, float] | None = None
+    routing_policy: Mapping[str, object] | None = None
     max_concurrency: int = 8
+    pricing: Mapping[str, object] | None = None
+    route_id: str | None = None
+    provider_name: str | None = None
+    allowed_credential_ids: frozenset[str] | None = None
+    pool_members: Mapping[str, object] | None = None
+    pool_strategy: str | None = None
 
 
 class ModelRegistry:

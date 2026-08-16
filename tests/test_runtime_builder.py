@@ -194,3 +194,41 @@ def test_runtime_builder_allows_multiple_protocol_mappings_on_one_provider() -> 
     openai = runtime.provider_model_adapters["provider-model-openai"]
     assert anthropic.config.protocol is ClientProtocol.ANTHROPIC_MESSAGES
     assert openai.config.protocol is ClientProtocol.OPENAI_CHAT_COMPLETIONS
+
+
+def test_mapping_transport_settings_override_shared_provider_defaults() -> None:
+    builder, payload = make_payload()
+    payload["provider_models"][0]["default_headers"] = {"x-model": "claude"}
+    payload["provider_models"][0]["required_betas"] = ["mapping-beta"]
+    payload["provider_models"][0]["auth_scheme"] = "x-api-key"
+    payload["provider_models"][0]["endpoint_query"] = {"mapping": "true"}
+    runtime = builder.build(payload)
+    adapter = runtime.provider_model_adapters["provider-model-1"]
+    request = adapter.create_request(
+        NormalizedRequest(
+            protocol=ClientProtocol.ANTHROPIC_MESSAGES,
+            requested_model="model-1",
+            payload={"model": "upstream-1"},
+        ),
+        Credential(id="credential-1", secret="provider-secret"),
+    )
+    assert request.url.endswith("?mapping=true")
+    assert request.headers["x-model"] == "claude"
+    assert request.headers["x-api-key"] == "provider-secret"
+    assert "mapping-beta" in request.headers["anthropic-beta"]
+
+
+def test_empty_mapping_query_does_not_inherit_provider_query() -> None:
+    builder, payload = make_payload()
+    payload["provider_models"][0]["endpoint_query"] = {}
+    runtime = builder.build(payload)
+    adapter = runtime.provider_model_adapters["provider-model-1"]
+    request = adapter.create_request(
+        NormalizedRequest(
+            protocol=ClientProtocol.ANTHROPIC_MESSAGES,
+            requested_model="model-1",
+            payload={"model": "upstream-1"},
+        ),
+        Credential(id="credential-1", secret="provider-secret"),
+    )
+    assert "?beta=true" not in request.url

@@ -6,12 +6,20 @@ from gateway.configuration.snapshots import (
     ConfigSnapshot,
     ConfigurationUnavailable,
     SnapshotRepository,
+    configuration_checksum,
+    configuration_projection,
+    legacy_checksum,
+    legacy_configuration_checksum,
 )
 
 __all__ = [
     "CachedConfiguration",
     "ConfigSnapshot",
     "ConfigurationUnavailable",
+    "configuration_checksum",
+    "configuration_projection",
+    "legacy_checksum",
+    "legacy_configuration_checksum",
     "SnapshotRepository",
     "RuntimeBuilder",
     "RuntimeSnapshot",

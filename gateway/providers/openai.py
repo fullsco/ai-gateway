@@ -97,7 +97,12 @@ class OpenAICompatibleAdapter(ProviderAdapter):
             retry_after_seconds=retry_after,
         )
 
-    def create_probe_request(self, credential: Credential) -> UpstreamRequest:
+    def create_probe_request(
+        self,
+        credential: Credential,
+        *,
+        model: str | None = None,
+    ) -> UpstreamRequest:
         return UpstreamRequest(
             method="HEAD",
             url=f"{str(self.config.base_url).rstrip('/')}/v1/models",

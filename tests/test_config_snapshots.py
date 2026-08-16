@@ -2,7 +2,13 @@ from datetime import UTC, datetime
 
 import pytest
 
-from gateway.configuration import CachedConfiguration, ConfigSnapshot, ConfigurationUnavailable
+from gateway.configuration import (
+    CachedConfiguration,
+    ConfigSnapshot,
+    ConfigurationUnavailable,
+    configuration_checksum,
+    legacy_configuration_checksum,
+)
 
 
 class StubRepository:
@@ -76,3 +82,17 @@ async def test_older_snapshot_does_not_roll_configuration_back() -> None:
     retained = await cache.refresh()
 
     assert retained.version == 2
+
+
+def test_configuration_checksum_ignores_runtime_state_and_collection_order() -> None:
+    first = {
+        "providers": [{"id": "b", "health": "healthy"}, {"id": "a"}],
+        "credentials": [{"id": "two", "quota_used": 1}, {"id": "one"}],
+    }
+    second = {
+        "providers": [{"id": "a"}, {"id": "b", "health": "unavailable"}],
+        "credentials": [{"id": "one"}, {"id": "two", "quota_used": 99}],
+    }
+
+    assert configuration_checksum(first) == configuration_checksum(second)
+    assert legacy_configuration_checksum(first) != legacy_configuration_checksum(second)

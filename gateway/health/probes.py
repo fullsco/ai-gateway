@@ -43,17 +43,35 @@ async def run_health_probes(
             error: ProviderError | None = None
             status: int | None = None
             try:
-                probe = adapter.create_probe_request(credential)
+                probe = adapter.create_probe_request(
+                    credential,
+                    model=route.upstream_model_id,
+                )
                 request = runtime.http_client.build_request(
                     probe.method,
                     probe.url,
                     headers=probe.headers,
+                    json=probe.json_body,
                     timeout=probe.timeout,
                 )
                 response = await runtime.http_client.send(request)
                 status = response.status_code
                 if status in {401, 403} or status >= 500 or status in {408, 504}:
                     error = adapter.normalize_error(response)
+                    # A synthetic probe cannot distinguish a provider's WAF
+                    # challenge from credential rejection on HTTP 403. Keep
+                    # real request classification strict, but do not poison
+                    # credential eligibility from an ambiguous probe.
+                    if (
+                        status == 403
+                        and error.category is ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR
+                    ):
+                        error = ProviderError(
+                            category=ErrorCategory.UPSTREAM_WAF_REJECTION,
+                            message="Health probe received an ambiguous upstream 403.",
+                            retryable=True,
+                            upstream_status=status,
+                        )
                 await response.aclose()
             except (TimeoutError, httpx.TransportError) as exc:
                 error = ProviderError(
@@ -80,6 +98,7 @@ async def run_health_probes(
             elif error.category in {
                 ErrorCategory.PROVIDER_UNAVAILABLE,
                 ErrorCategory.TIMEOUT,
+                ErrorCategory.UPSTREAM_WAF_REJECTION,
             }:
                 await runtime.route_controls.record_failure(route_id, now=observed)
             else:

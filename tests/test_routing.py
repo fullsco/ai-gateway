@@ -206,3 +206,31 @@ def test_route_policy_weights_override_default_scoring() -> None:
     )
 
     assert decision.provider_model.id == "quota-route"
+
+
+def test_least_loaded_pool_prefers_available_concurrency_headroom() -> None:
+    model = CanonicalModel(
+        id="model-x",
+        aliases=frozenset(),
+        capabilities=frozenset({Capability.STREAMING}),
+    )
+    route = ProviderModel(
+        id="pool-route",
+        canonical_model_id="model-x",
+        provider_id="provider-a",
+        upstream_model_id="upstream-x",
+        protocol=ClientProtocol.ANTHROPIC_MESSAGES,
+        capabilities=frozenset({Capability.STREAMING}),
+        pool_strategy="least_loaded",
+        pool_members={"busy": {"priority": 1}, "available": {"priority": 1}},
+    )
+    decision = RoutingEngine(ModelRegistry([model], [route])).select(
+        make_request().model_copy(update={"requested_model": "model-x"}),
+        [ProviderState("provider-a")],
+        [
+            CredentialState("busy", "provider-a", concurrency_headroom=0.1),
+            CredentialState("available", "provider-a", concurrency_headroom=0.9),
+        ],
+    )
+
+    assert decision.credential.credential_id == "available"
