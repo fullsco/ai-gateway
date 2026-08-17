@@ -81,6 +81,25 @@ class PassiveHealthRecorder:
 
     async def _persist(self, event: PassiveHealthEvent) -> None:
         health = _passive_health(event.error_category)
+        if event.source != "passive":
+            await self._pool.execute(
+                """
+                insert into public.health_checks(
+                  provider_id,credential_id,status,latency_ms,error_category,checked_at,source
+                ) select $1,$2,$3::public.gateway_health_state,$4,$5,$6,$7
+                  where $3::text is not null
+                """,
+                event.provider_id,
+                event.credential_id,
+                health,
+                event.latency_ms,
+                event.error_category,
+                event.observed_at,
+                event.source,
+            )
+            if event.error_category is not None:
+                await self._alert(event)
+            return
         cooldown_until = (
             event.observed_at + timedelta(seconds=event.retry_after_seconds or 30)
             if event.error_category == "rate_limit"
@@ -132,23 +151,26 @@ class PassiveHealthRecorder:
             event.source,
         )
         if event.error_category is not None:
-            await evaluate_alert_rules(
-                self._pool,
-                AlertEvent(
-                    event_type="provider_failure",
-                    title=f"Provider request failed: {event.error_category}",
-                    scopes={
-                        "provider": event.provider_id,
-                        "credential": event.credential_id,
-                        "route": event.provider_model_id,
-                    },
-                    metadata={
-                        "error_category": event.error_category,
-                        "upstream_status": event.upstream_status,
-                        "latency_ms": event.latency_ms,
-                    },
-                ),
-            )
+            await self._alert(event)
+
+    async def _alert(self, event: PassiveHealthEvent) -> None:
+        await evaluate_alert_rules(
+            self._pool,
+            AlertEvent(
+                event_type="provider_failure",
+                title=f"Provider request failed: {event.error_category}",
+                scopes={
+                    "provider": event.provider_id,
+                    "credential": event.credential_id,
+                    "route": event.provider_model_id,
+                },
+                metadata={
+                    "error_category": event.error_category,
+                    "upstream_status": event.upstream_status,
+                    "latency_ms": event.latency_ms,
+                },
+            ),
+        )
 
 
 def _passive_health(error_category: str | None) -> str | None:

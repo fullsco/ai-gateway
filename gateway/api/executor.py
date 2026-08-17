@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator, Mapping
 from copy import deepcopy
@@ -301,28 +302,15 @@ async def execute_request(
                 )
                 await response.aclose()
                 response = None
-            elif not _valid_upstream_content_type(response, normalized.stream):
-                await response.aread()
-                last_error = ProviderError(
-                    category=ErrorCategory.UPSTREAM_WAF_REJECTION,
-                    message="The upstream provider returned an unexpected response format.",
-                    retryable=True,
-                    upstream_status=response.status_code,
-                )
-                await recorder.record_usage(
-                    attempt_id,
-                    normalized.protocol,
-                    response.content,
-                    attribution,
-                    attempt_status="failed",
-                )
-                await response.aclose()
-                response = None
             elif normalized.stream:
                 iterator = response.aiter_raw()
                 try:
-                    first_chunk = await asyncio.wait_for(
-                        anext(iterator), timeout=settings.first_event_timeout_seconds
+                    first_chunk = (
+                        response.content
+                        if response.is_stream_consumed
+                        else await asyncio.wait_for(
+                            anext(iterator), timeout=settings.first_event_timeout_seconds
+                        )
                     )
                 except StopAsyncIteration:
                     last_error = ProviderError(
@@ -333,79 +321,89 @@ async def execute_request(
                     await _close_response(response)
                     response = None
                 else:
-                    finalizer = _StreamFinalizer(
-                        recorder,
-                        response=response,
-                        attempt_id=attempt_id,
-                        protocol=normalized.protocol,
-                        resolved_model=route.canonical_model_id,
-                        started_at=started_at,
-                        attempt_started_at=attempt_started_at,
-                        attempts=attempts,
-                        fallback_count=fallback_count,
-                        route_controls=runtime.route_controls,
-                        route_id=route.provider_model.id,
-                        lease=lease,
-                        health_recorder=health_recorder,
-                        provider_id=route.provider_model.provider_id,
-                        credential_id=route.credential.credential_id,
-                        provider_model_id=route.provider_model.id,
-                        attempt_number=attempts,
-                        attribution=attribution,
-                    )
-                    return StreamingResponse(
-                        _stream_response(
-                            first_chunk,
-                            iterator,
-                            finalizer,
-                        ),
-                        status_code=200,
-                        media_type=response.headers.get("content-type", "text/event-stream"),
-                        background=BackgroundTask(finalizer.finish, False),
-                    )
+                    if not _valid_upstream_stream(response, first_chunk):
+                        last_error = _unexpected_upstream_response(response.status_code)
+                        await _close_response(response)
+                        response = None
+                    else:
+                        finalizer = _StreamFinalizer(
+                            recorder,
+                            response=response,
+                            attempt_id=attempt_id,
+                            protocol=normalized.protocol,
+                            resolved_model=route.canonical_model_id,
+                            started_at=started_at,
+                            attempt_started_at=attempt_started_at,
+                            attempts=attempts,
+                            fallback_count=fallback_count,
+                            route_controls=runtime.route_controls,
+                            route_id=route.provider_model.id,
+                            lease=lease,
+                            health_recorder=health_recorder,
+                            provider_id=route.provider_model.provider_id,
+                            credential_id=route.credential.credential_id,
+                            provider_model_id=route.provider_model.id,
+                            attempt_number=attempts,
+                            attribution=attribution,
+                        )
+                        return StreamingResponse(
+                            _stream_response(
+                                first_chunk,
+                                iterator,
+                                finalizer,
+                            ),
+                            status_code=200,
+                            media_type="text/event-stream",
+                            background=BackgroundTask(finalizer.finish, False),
+                        )
             else:
                 content = await response.aread()
-                headers = _safe_response_headers(response)
-                status_code = response.status_code
-                await response.aclose()
-                lease.release()
-                await runtime.route_controls.record_success(route.provider_model.id)
-                ended_at = datetime.now(UTC)
-                latency_ms = _latency_ms(attempt_started_at, ended_at)
-                _submit_health(
-                    health_recorder,
-                    recorder,
-                    route.provider_model.provider_id,
-                    route.credential.credential_id,
-                    route.provider_model.id,
-                    attempts,
-                    ended_at,
-                    latency_ms,
-                    upstream_status=status_code,
-                )
-                await recorder.finish_attempt(
-                    attempt_id,
-                    status="succeeded",
-                    ended_at=ended_at,
-                    latency_ms=latency_ms,
-                    upstream_status=status_code,
-                )
-                await recorder.record_usage(
-                    attempt_id,
-                    normalized.protocol,
-                    content,
-                    attribution,
-                    attempt_status="succeeded",
-                )
-                await recorder.finish_request(
-                    status="succeeded",
-                    resolved_model=route.canonical_model_id,
-                    ended_at=ended_at,
-                    latency_ms=_latency_ms(started_at, ended_at),
-                    retry_count=attempts - 1,
-                    fallback_count=fallback_count,
-                )
-                return Response(content, status_code=status_code, headers=headers)
+                if not _valid_upstream_json(content):
+                    last_error = _unexpected_upstream_response(response.status_code)
+                    await response.aclose()
+                    response = None
+                else:
+                    headers = _safe_response_headers(response)
+                    status_code = response.status_code
+                    await response.aclose()
+                    lease.release()
+                    await runtime.route_controls.record_success(route.provider_model.id)
+                    ended_at = datetime.now(UTC)
+                    latency_ms = _latency_ms(attempt_started_at, ended_at)
+                    _submit_health(
+                        health_recorder,
+                        recorder,
+                        route.provider_model.provider_id,
+                        route.credential.credential_id,
+                        route.provider_model.id,
+                        attempts,
+                        ended_at,
+                        latency_ms,
+                        upstream_status=status_code,
+                    )
+                    await recorder.finish_attempt(
+                        attempt_id,
+                        status="succeeded",
+                        ended_at=ended_at,
+                        latency_ms=latency_ms,
+                        upstream_status=status_code,
+                    )
+                    await recorder.record_usage(
+                        attempt_id,
+                        normalized.protocol,
+                        content,
+                        attribution,
+                        attempt_status="succeeded",
+                    )
+                    await recorder.finish_request(
+                        status="succeeded",
+                        resolved_model=route.canonical_model_id,
+                        ended_at=ended_at,
+                        latency_ms=_latency_ms(started_at, ended_at),
+                        retry_count=attempts - 1,
+                        fallback_count=fallback_count,
+                    )
+                    return Response(content, status_code=status_code, headers=headers)
         except (TimeoutError, httpx.TransportError) as exc:
             last_error = _transport_error(exc)
             log_event(
@@ -536,11 +534,28 @@ def _transport_error(exc: Exception) -> ProviderError:
     )
 
 
-def _valid_upstream_content_type(response: httpx.Response, streaming: bool) -> bool:
+def _valid_upstream_json(content: bytes) -> bool:
+    try:
+        return isinstance(json.loads(content), dict)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+
+
+def _valid_upstream_stream(response: httpx.Response, chunk: bytes) -> bool:
     content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-    if streaming:
-        return content_type == "text/event-stream"
-    return content_type == "application/json" or content_type.endswith("+json")
+    if content_type == "text/event-stream":
+        return True
+    first_line = chunk.lstrip().splitlines()[0] if chunk.strip() else b""
+    return first_line.startswith((b"data:", b"event:", b"id:", b"retry:", b":"))
+
+
+def _unexpected_upstream_response(status_code: int) -> ProviderError:
+    return ProviderError(
+        category=ErrorCategory.UPSTREAM_WAF_REJECTION,
+        message="The upstream provider returned an unexpected response format.",
+        retryable=True,
+        upstream_status=status_code,
+    )
 
 
 def _map_upstream_model(request: NormalizedRequest, upstream_model: str) -> NormalizedRequest:

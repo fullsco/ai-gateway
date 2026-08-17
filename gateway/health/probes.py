@@ -84,19 +84,8 @@ async def run_health_probes(
                     summary["skipped"] += 1
                     continue
                 reservation_token = reservation.partition(":")[2]
-            if not await runtime.route_controls.allow(route_id):
-                if limiter is not None:
-                    await _complete_probe(
-                        limiter,
-                        state.credential_id,
-                        reservation_token,
-                        success=False,
-                        result="route_unavailable",
-                    )
-                continue
             adapter = runtime.provider_model_adapters.get(route_id)
             if adapter is None:
-                await runtime.route_controls.abandon(route_id)
                 if limiter is not None:
                     await _complete_probe(
                         limiter,
@@ -156,7 +145,6 @@ async def run_health_probes(
                     "health_probe_failed",
                     error_type=type(exc).__name__,
                 )
-                await runtime.route_controls.abandon(route_id)
                 if limiter is not None:
                     await _complete_probe(
                         limiter,
@@ -172,16 +160,6 @@ async def run_health_probes(
 
             observed = datetime.now(UTC)
             latency_ms = round((observed - started).total_seconds() * 1000, 3)
-            if error is None:
-                await runtime.route_controls.record_success(route_id)
-            elif error.category in {
-                ErrorCategory.PROVIDER_UNAVAILABLE,
-                ErrorCategory.TIMEOUT,
-                ErrorCategory.UPSTREAM_WAF_REJECTION,
-            }:
-                await runtime.route_controls.record_failure(route_id, now=observed)
-            else:
-                await runtime.route_controls.abandon(route_id)
             if limiter is not None:
                 await _complete_probe(
                     limiter,

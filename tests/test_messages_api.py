@@ -155,6 +155,27 @@ def test_streaming_response_is_relayed_without_full_buffering() -> None:
     assert response.content == b"event: done\ndata: {}\n\n"
 
 
+def test_labeled_stream_accepts_a_split_first_event_field() -> None:
+    runtime, key = make_runtime(
+        lambda _: httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=BytesStream([b"eve", b"nt: done\ndata: {}\n\n"]),
+        )
+    )
+    app = create_app(Settings(environment="test", _env_file=None), runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": key},
+            json={"model": "alias-x", "stream": True, "messages": []},
+        )
+
+    assert response.status_code == 200
+    assert response.content == b"event: done\ndata: {}\n\n"
+
+
 def test_retryable_error_returns_normalized_error_after_routes_exhausted() -> None:
     runtime, key = make_runtime(
         lambda _: httpx.Response(503, json={"error": {"message": "provider down"}})
@@ -192,6 +213,27 @@ def test_html_upstream_response_is_not_returned_as_success() -> None:
 
     assert response.status_code == 502
     assert response.json()["error"]["type"] == "upstream_waf_rejection"
+
+
+def test_valid_json_with_text_plain_content_type_is_returned() -> None:
+    runtime, key = make_runtime(
+        lambda _: httpx.Response(
+            200,
+            headers={"content-type": "text/plain; charset=utf-8"},
+            json={"type": "message", "id": "success"},
+        )
+    )
+    app = create_app(Settings(environment="test", _env_file=None), runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": key},
+            json={"model": "alias-x", "messages": []},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "success"
 
 
 def test_html_stream_is_not_committed_as_a_successful_stream() -> None:

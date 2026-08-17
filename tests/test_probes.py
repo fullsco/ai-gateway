@@ -144,7 +144,8 @@ async def test_health_probe_marks_auth_failure_without_body():
     await recorder.close()
     await runtime.http_client.aclose()
 
-    assert any(args[2] == "upstream_authentication_error" for _, args in pool.calls)
+    assert any(args[4] == "upstream_authentication_error" for _, args in pool.calls)
+    assert all("update public.provider_credentials" not in query for query, _ in pool.calls)
 
 
 @pytest.mark.asyncio
@@ -163,7 +164,8 @@ async def test_health_probe_classifies_rate_limit_as_failure():
     await recorder.close()
     await runtime.http_client.aclose()
 
-    assert any(args[2] == "rate_limit" for _, args in pool.calls)
+    assert any(args[4] == "rate_limit" for _, args in pool.calls)
+    assert all("update public.provider_credentials" not in query for query, _ in pool.calls)
 
 
 @pytest.mark.asyncio
@@ -181,7 +183,8 @@ async def test_anthropic_probe_403_does_not_poison_credential_health():
     await recorder.close()
     await runtime.http_client.aclose()
 
-    assert any(args[2] == "upstream_waf_rejection" for _, args in pool.calls)
+    assert any(args[4] == "upstream_waf_rejection" for _, args in pool.calls)
+    assert all("update public.provider_credentials" not in query for query, _ in pool.calls)
 
 
 @pytest.mark.asyncio
@@ -288,6 +291,18 @@ async def test_probe_timeout_is_one_attempt_and_applies_failure_backoff():
     assert limiter.completions == [
         ("credential", "test-token", False, "timeout")
     ]
+
+
+@pytest.mark.asyncio
+async def test_probe_failure_does_not_change_inference_route_circuit():
+    runtime = make_runtime(
+        lambda request: httpx.Response(503, json={"error": {"message": "down"}})
+    )
+    for _ in range(3):
+        await run_health_probes(runtime, None, Limiter())
+
+    assert await runtime.route_controls.allow("route") is True
+    await runtime.http_client.aclose()
 
 
 @pytest.mark.asyncio

@@ -159,6 +159,33 @@ async def test_passive_health_worker_persists_only_safe_metadata() -> None:
     assert "prompt" not in repr(args).lower()
 
 
+@pytest.mark.asyncio
+async def test_synthetic_health_observation_does_not_update_credential_state() -> None:
+    pool = TelemetryPool()
+    recorder = PassiveHealthRecorder(pool)
+    observed = datetime.now(UTC)
+
+    await recorder._persist(
+        PassiveHealthEvent(
+            provider_id="provider",
+            credential_id="credential",
+            provider_model_id="provider-model",
+            request_id="health-probe",
+            attempt_number=0,
+            observed_at=observed,
+            latency_ms=10,
+            error_category="provider_unavailable",
+            upstream_status=503,
+            source="automatic",
+        )
+    )
+
+    query, args = pool.execute_calls[0]
+    assert "insert into public.health_checks" in query
+    assert "update public.provider_credentials" not in query
+    assert args[-1] == "automatic"
+
+
 def test_passive_health_queue_saturation_drops_without_raising() -> None:
     recorder = PassiveHealthRecorder(TelemetryPool(), max_queue_size=1)
     event = PassiveHealthEvent(
