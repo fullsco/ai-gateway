@@ -185,7 +185,7 @@ def test_credential_failover_rotates_within_selected_mapping() -> None:
 
 
 @pytest.mark.asyncio
-async def test_health_probes_use_each_provider_model_adapter() -> None:
+async def test_health_probes_are_bounded_to_one_route_per_credential() -> None:
     seen_paths = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -193,8 +193,10 @@ async def test_health_probes_use_each_provider_model_adapter() -> None:
         return httpx.Response(200)
 
     runtime, _ = build_runtime(handler)
-    await run_health_probes(runtime, None)
+    from tests.test_probes import Limiter
+
+    await run_health_probes(runtime, None, Limiter(["reserved:a", "reserved:b"]))
     await runtime.http_client.aclose()
 
-    assert seen_paths.count("/v1/messages") == 2
-    assert seen_paths.count("/v1/models") == 2
+    assert len(seen_paths) == 2
+    assert set(seen_paths) <= {"/v1/messages", "/v1/models"}

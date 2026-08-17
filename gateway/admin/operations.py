@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from gateway.admin.api import _authorize, _pool
+from gateway.health.probes import run_health_probes
 
 router = APIRouter(prefix="/api/admin/v1", tags=["admin-operations"])
 
@@ -32,6 +33,35 @@ class PoolInput(BaseModel):
 
 class PoolMembersInput(BaseModel):
     members: list[PoolMemberInput]
+
+
+class ManualHealthProbeInput(BaseModel):
+    provider_id: UUID
+    credential_id: UUID | None = None
+
+
+@router.post("/health/probe")
+async def manual_health_probe(
+    request: Request, body: ManualHealthProbeInput
+) -> JSONResponse:
+    context = await _authorized_pool(request)
+    if isinstance(context, JSONResponse):
+        return context
+    runtime = getattr(request.app.state, "runtime", None)
+    limiter = getattr(request.app.state, "health_probe_limiter", None)
+    if runtime is None or limiter is None:
+        return JSONResponse({"error": "health_probe_unavailable"}, status_code=503)
+    summary = await run_health_probes(
+        runtime,
+        getattr(request.app.state, "health_recorder", None),
+        limiter,
+        provider_id=str(body.provider_id),
+        credential_id=str(body.credential_id) if body.credential_id else None,
+        manual=True,
+    )
+    if not any(summary.values()):
+        return JSONResponse({"error": "health_probe_target_not_found"}, status_code=404)
+    return JSONResponse(jsonable_encoder(summary))
 
 
 class BudgetInput(BaseModel):

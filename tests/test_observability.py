@@ -155,7 +155,7 @@ async def test_passive_health_worker_persists_only_safe_metadata() -> None:
     assert args[2] == "rate_limit"
     assert args[3] == "rate_limited"
     assert args[4] == observed + timedelta(seconds=5)
-    assert args[-2:] == ("gw_safe_request", "provider-model")
+    assert args[-3:] == ("gw_safe_request", "provider-model", "passive")
     assert "prompt" not in repr(args).lower()
 
 

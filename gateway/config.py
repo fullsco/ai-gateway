@@ -28,6 +28,13 @@ class Settings(BaseSettings):
     failover_enabled: bool = True
     health_probe_enabled: bool = True
     health_probe_interval_seconds: float = Field(default=60, gt=0)
+    health_probe_daily_limit: int = Field(default=10, ge=1, le=100)
+    health_probe_min_interval_seconds: int = Field(default=7200, ge=60)
+    health_probe_lease_seconds: int = Field(default=30, ge=15)
+    health_probe_failure_backoff_seconds: int = Field(default=7200, ge=60)
+    health_probe_max_backoff_seconds: int = Field(default=86400, ge=60)
+    health_probe_manual_daily_limit: int = Field(default=20, ge=1, le=100)
+    health_probe_manual_min_interval_seconds: int = Field(default=60, ge=1)
     credential_encryption_key: str | None = None
     key_pepper: str | None = None
     supabase_url: str | None = None

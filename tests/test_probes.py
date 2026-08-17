@@ -1,4 +1,6 @@
+import asyncio
 import json
+from dataclasses import replace
 
 import httpx
 import pytest
@@ -25,6 +27,23 @@ class Pool:
 
     async def fetchval(self, query, *args):
         return 1
+
+
+class Limiter:
+    def __init__(self, results=None):
+        self.results = list(results or ["reserved:test-token"])
+        self.reservations = []
+        self.completions = []
+
+    async def reserve(self, provider_id, credential_id, provider_model_id, *, manual=False):
+        self.reservations.append((provider_id, credential_id, provider_model_id, manual))
+        return self.results.pop(0) if self.results else "in_progress"
+
+    async def complete(self, credential_id, reservation_token, *, success, result):
+        self.completions.append((credential_id, reservation_token, success, result))
+
+    def route_index(self, credential_id, route_count):
+        return 0
 
 
 def make_runtime(handler):
@@ -103,12 +122,14 @@ async def test_health_probe_is_payload_free_and_records_success():
     pool = Pool()
     recorder = PassiveHealthRecorder(pool)
     recorder.start()
-    await run_health_probes(runtime, recorder)
+    await run_health_probes(runtime, recorder, Limiter())
     await recorder.close()
     await runtime.http_client.aclose()
 
     assert seen == {"method": "HEAD", "content": b""}
     assert any("health_checks" in query for query, _ in pool.calls)
+    health_args = next(args for query, args in pool.calls if "health_checks" in query)
+    assert health_args[-1] == "automatic"
 
 
 @pytest.mark.asyncio
@@ -119,11 +140,30 @@ async def test_health_probe_marks_auth_failure_without_body():
     pool = Pool()
     recorder = PassiveHealthRecorder(pool)
     recorder.start()
-    await run_health_probes(runtime, recorder)
+    await run_health_probes(runtime, recorder, Limiter())
     await recorder.close()
     await runtime.http_client.aclose()
 
     assert any(args[2] == "upstream_authentication_error" for _, args in pool.calls)
+
+
+@pytest.mark.asyncio
+async def test_health_probe_classifies_rate_limit_as_failure():
+    runtime = make_runtime(
+        lambda request: httpx.Response(
+            429,
+            headers={"retry-after": "60"},
+            json={"error": {"message": "limited"}},
+        )
+    )
+    pool = Pool()
+    recorder = PassiveHealthRecorder(pool)
+    recorder.start()
+    await run_health_probes(runtime, recorder, Limiter())
+    await recorder.close()
+    await runtime.http_client.aclose()
+
+    assert any(args[2] == "rate_limit" for _, args in pool.calls)
 
 
 @pytest.mark.asyncio
@@ -137,7 +177,7 @@ async def test_anthropic_probe_403_does_not_poison_credential_health():
     pool = Pool()
     recorder = PassiveHealthRecorder(pool)
     recorder.start()
-    await run_health_probes(runtime, recorder)
+    await run_health_probes(runtime, recorder, Limiter())
     await recorder.close()
     await runtime.http_client.aclose()
 
@@ -156,7 +196,7 @@ async def test_anthropic_health_probe_uses_messages_contract():
         return httpx.Response(200)
 
     runtime = make_anthropic_runtime(handler)
-    await run_health_probes(runtime, None)
+    await run_health_probes(runtime, None, Limiter())
     await runtime.http_client.aclose()
 
     assert seen["method"] == "POST"
@@ -169,3 +209,125 @@ async def test_anthropic_health_probe_uses_messages_contract():
         "max_tokens": 1,
         "messages": [{"role": "user", "content": "ping"}],
     }
+
+
+@pytest.mark.asyncio
+async def test_probe_contacts_only_one_mapping_per_credential():
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(200)
+
+    runtime = make_anthropic_runtime(handler)
+    route = runtime.model_registry.list_provider_models()[0]
+    second = ProviderModel(
+        "route-2", "model", "provider", "upstream-2",
+        ClientProtocol.ANTHROPIC_MESSAGES, route.capabilities, priority=200,
+    )
+    registry = ModelRegistry(
+        [runtime.model_registry.resolve("model")], [route, second]
+    )
+    adapters = {
+        **runtime.provider_model_adapters,
+        "route-2": runtime.provider_model_adapters["route"],
+    }
+    runtime = replace(
+        runtime,
+        model_registry=registry,
+        routing_engine=RoutingEngine(registry),
+        provider_model_adapters=adapters,
+    )
+    limiter = Limiter()
+
+    summary = await run_health_probes(runtime, None, limiter)
+    await runtime.http_client.aclose()
+
+    assert calls == ["/v1/messages"]
+    assert summary == {"contacted": 1, "skipped": 0, "credentials_without_route": 0}
+    assert len(limiter.reservations) == 1
+
+
+@pytest.mark.asyncio
+async def test_probe_does_not_contact_provider_when_reserved_or_cooling_down():
+    contacted = 0
+
+    def handler(request):
+        nonlocal contacted
+        contacted += 1
+        return httpx.Response(200)
+
+    runtime = make_runtime(handler)
+    limiter = Limiter(["in_progress"])
+    first = await run_health_probes(runtime, None, limiter)
+    limiter.results = ["cooldown"]
+    second = await run_health_probes(runtime, None, limiter)
+    limiter.results = ["daily_limit"]
+    third = await run_health_probes(runtime, None, limiter)
+    await runtime.http_client.aclose()
+
+    assert contacted == 0
+    assert [first["skipped"], second["skipped"], third["skipped"]] == [1, 1, 1]
+
+
+@pytest.mark.asyncio
+async def test_probe_timeout_is_one_attempt_and_applies_failure_backoff():
+    attempts = 0
+
+    def handler(request):
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ReadTimeout("timeout", request=request)
+
+    runtime = make_runtime(handler)
+    limiter = Limiter()
+    await run_health_probes(runtime, None, limiter)
+    await runtime.http_client.aclose()
+
+    assert attempts == 1
+    assert limiter.completions == [
+        ("credential", "test-token", False, "timeout")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_manual_probe_bypasses_automatic_limits_but_uses_lease():
+    contacted = 0
+
+    def handler(request):
+        nonlocal contacted
+        contacted += 1
+        return httpx.Response(200)
+
+    runtime = make_runtime(handler)
+    limiter = Limiter(["reserved:test-token", "in_progress"])
+    first, second = await asyncio.gather(
+        run_health_probes(runtime, None, limiter, manual=True),
+        run_health_probes(runtime, None, limiter, manual=True),
+    )
+    await runtime.http_client.aclose()
+
+    assert contacted == 1
+    assert all(reservation[3] is True for reservation in limiter.reservations)
+    assert sorted([first["contacted"], second["contacted"]]) == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_probe_respects_empty_pool_credential_allowlist():
+    contacted = 0
+
+    def handler(request):
+        nonlocal contacted
+        contacted += 1
+        return httpx.Response(200)
+
+    runtime = make_runtime(handler)
+    route = runtime.model_registry.list_provider_models()[0]
+    restricted = ProviderModel(**{**route.__dict__, "allowed_credential_ids": frozenset()})
+    registry = ModelRegistry([runtime.model_registry.resolve("model")], [restricted])
+    runtime = replace(runtime, model_registry=registry, routing_engine=RoutingEngine(registry))
+    summary = await run_health_probes(runtime, None, Limiter())
+    await runtime.http_client.aclose()
+
+    assert contacted == 0
+    assert summary["credentials_without_route"] == 1

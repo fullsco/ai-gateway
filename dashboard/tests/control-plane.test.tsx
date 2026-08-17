@@ -38,6 +38,24 @@ describe("control plane", () => {
     expect(document.body.textContent).not.toContain("[object Object]");
   });
 
+  it("health navigation and refresh only read operational records", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) =>
+      String(input).includes("health") ? response({ data: [] }) : response(overview),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ControlPlane />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Health" }));
+    await screen.findByText("No matching records");
+    await userEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    const healthCalls = fetchMock.mock.calls.filter(([input]) =>
+      String(input).includes("/api/gateway/health"),
+    );
+    expect(healthCalls).toHaveLength(2);
+    expect(healthCalls.every(([, init]) => !init?.method || init.method === "GET")).toBe(true);
+  });
+
   it("creates a provider and reports success", async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => init?.method === "POST" ? response({ id: "new", name: "New provider" }, 201) : String(input).includes("providers") ? response({ data: [] }) : response(overview));
     vi.stubGlobal("fetch", fetchMock);

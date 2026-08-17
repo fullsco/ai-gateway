@@ -26,6 +26,7 @@ class PassiveHealthEvent:
     error_category: str | None = None
     upstream_status: int | None = None
     retry_after_seconds: float | None = None
+    source: str = "passive"
 
 
 @dataclass(frozen=True)
@@ -104,8 +105,8 @@ class PassiveHealthRecorder:
               where id=$1 returning health::text as new_health
             ), health as (
               insert into public.health_checks(
-                provider_id,credential_id,status,latency_ms,error_category,checked_at
-              ) select $6,$1,$4::public.gateway_health_state,$7,$3,$2
+                provider_id,credential_id,status,latency_ms,error_category,checked_at,source
+              ) select $6,$1,$4::public.gateway_health_state,$7,$3,$2,$12
                 where $4::text is not null
             )
             insert into public.provider_events(provider_id,credential_id,event_type,metadata)
@@ -128,6 +129,7 @@ class PassiveHealthRecorder:
             event.attempt_number,
             event.request_id,
             event.provider_model_id,
+            event.source,
         )
         if event.error_category is not None:
             await evaluate_alert_rules(

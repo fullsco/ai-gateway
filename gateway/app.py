@@ -24,6 +24,7 @@ from gateway.configuration import (
     create_pool,
 )
 from gateway.context import get_request_id
+from gateway.health.limits import HealthProbeLimiter, ProbeLimitConfig
 from gateway.health.probes import health_probe_loop
 from gateway.logging import configure_logging, log_event
 from gateway.middleware import RequestContextMiddleware
@@ -66,6 +67,7 @@ def create_app(
         pool = None
         manager = None
         health_recorder = None
+        health_probe_limiter = None
         probe_task = None
         if app_settings.database_url:
             try:
@@ -109,12 +111,28 @@ def create_app(
             health_recorder = PassiveHealthRecorder(active_pool)
             health_recorder.start()
             app.state.health_recorder = health_recorder
+            health_probe_limiter = HealthProbeLimiter(
+                active_pool,
+                ProbeLimitConfig(
+                    daily_limit=app_settings.health_probe_daily_limit,
+                    min_interval_seconds=app_settings.health_probe_min_interval_seconds,
+                    lease_seconds=app_settings.health_probe_lease_seconds,
+                    failure_backoff_seconds=app_settings.health_probe_failure_backoff_seconds,
+                    max_backoff_seconds=app_settings.health_probe_max_backoff_seconds,
+                    manual_daily_limit=app_settings.health_probe_manual_daily_limit,
+                    manual_min_interval_seconds=(
+                        app_settings.health_probe_manual_min_interval_seconds
+                    ),
+                ),
+            )
+            app.state.health_probe_limiter = health_probe_limiter
         if app_settings.health_probe_enabled:
             probe_task = asyncio.create_task(
                 health_probe_loop(
                     app_settings.health_probe_interval_seconds,
                     lambda: getattr(app.state, "runtime", None),
                     lambda: getattr(app.state, "health_recorder", None),
+                    lambda: getattr(app.state, "health_probe_limiter", None),
                 )
             )
         if app.state.admin_verifier is None and app_settings.supabase_url:
@@ -177,11 +195,13 @@ def create_app(
         is_mutation = request.method in {"POST", "PUT", "PATCH", "DELETE"}
         is_control_plane = request.url.path.startswith("/api/admin/v1/")
         is_snapshot_operation = "/config/" in request.url.path
+        is_manual_probe = request.url.path.endswith("/health/probe")
         pool = getattr(request.app.state, "db_pool", None)
         transactional = (
             is_mutation
             and is_control_plane
             and not is_snapshot_operation
+            and not is_manual_probe
             and pool is not None
         )
         if not transactional:

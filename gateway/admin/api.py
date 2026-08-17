@@ -326,8 +326,8 @@ async def health(request: Request, limit: int = Query(default=50, ge=1, le=200))
         request,
         """
          select h.id, h.provider_id, p.name as provider_name,
-                h.credential_id, c.name as credential_name, h.status, h.latency_ms,
-                h.error_category, h.checked_at
+                 h.credential_id, c.name as credential_name, h.status, h.latency_ms,
+                 h.error_category, h.checked_at, h.source
          from public.health_checks h
          left join public.providers p on p.id = h.provider_id
          left join public.provider_credentials c on c.id = h.credential_id
