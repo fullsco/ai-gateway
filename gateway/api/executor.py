@@ -301,6 +301,23 @@ async def execute_request(
                 )
                 await response.aclose()
                 response = None
+            elif not _valid_upstream_content_type(response, normalized.stream):
+                await response.aread()
+                last_error = ProviderError(
+                    category=ErrorCategory.UPSTREAM_WAF_REJECTION,
+                    message="The upstream provider returned an unexpected response format.",
+                    retryable=True,
+                    upstream_status=response.status_code,
+                )
+                await recorder.record_usage(
+                    attempt_id,
+                    normalized.protocol,
+                    response.content,
+                    attribution,
+                    attempt_status="failed",
+                )
+                await response.aclose()
+                response = None
             elif normalized.stream:
                 iterator = response.aiter_raw()
                 try:
@@ -517,6 +534,13 @@ def _transport_error(exc: Exception) -> ProviderError:
         message="The upstream provider is unavailable.",
         retryable=True,
     )
+
+
+def _valid_upstream_content_type(response: httpx.Response, streaming: bool) -> bool:
+    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if streaming:
+        return content_type == "text/event-stream"
+    return content_type == "application/json" or content_type.endswith("+json")
 
 
 def _map_upstream_model(request: NormalizedRequest, upstream_model: str) -> NormalizedRequest:

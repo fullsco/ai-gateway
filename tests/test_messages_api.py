@@ -173,6 +173,48 @@ def test_retryable_error_returns_normalized_error_after_routes_exhausted() -> No
     assert response.headers["x-request-id"].startswith("gw_")
 
 
+def test_html_upstream_response_is_not_returned_as_success() -> None:
+    runtime, key = make_runtime(
+        lambda _: httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            content=b"<html>challenge</html>",
+        )
+    )
+    app = create_app(Settings(environment="test", _env_file=None), runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": key},
+            json={"model": "alias-x", "messages": []},
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "upstream_waf_rejection"
+
+
+def test_html_stream_is_not_committed_as_a_successful_stream() -> None:
+    runtime, key = make_runtime(
+        lambda _: httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            content=b"<html>challenge</html>",
+        )
+    )
+    app = create_app(Settings(environment="test", _env_file=None), runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": key},
+            json={"model": "alias-x", "stream": True, "messages": []},
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "upstream_waf_rejection"
+
+
 def test_transport_failure_logs_safe_exception_metadata() -> None:
     def handler(request: httpx.Request):
         raise httpx.ConnectError("sensitive transport detail", request=request)

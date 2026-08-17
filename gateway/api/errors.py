@@ -6,6 +6,7 @@ from gateway.providers import ErrorCategory, ProviderError
 ERROR_STATUS = {
     ErrorCategory.AUTHENTICATION_ERROR: 401,
     ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR: 502,
+    ErrorCategory.UPSTREAM_WAF_REJECTION: 502,
     ErrorCategory.RATE_LIMIT: 429,
     ErrorCategory.QUOTA_EXHAUSTED: 429,
     ErrorCategory.MODEL_UNAVAILABLE: 404,
