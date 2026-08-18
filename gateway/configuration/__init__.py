@@ -10,6 +10,7 @@ from gateway.configuration.snapshots import (
     configuration_projection,
     legacy_checksum,
     legacy_configuration_checksum,
+    summarize_configuration_changes,
 )
 
 __all__ = [
@@ -20,6 +21,7 @@ __all__ = [
     "configuration_projection",
     "legacy_checksum",
     "legacy_configuration_checksum",
+    "summarize_configuration_changes",
     "SnapshotRepository",
     "RuntimeBuilder",
     "RuntimeSnapshot",

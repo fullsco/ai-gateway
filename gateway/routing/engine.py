@@ -137,8 +137,8 @@ class RoutingEngine:
                     candidate.credential.rpm_headroom,
                     candidate.credential.tpm_headroom,
                 ),
-                provider_states[candidate.provider_model.provider_id].priority,
                 candidate.provider_model.priority,
+                provider_states[candidate.provider_model.provider_id].priority,
                 self._member_priority(candidate),
                 -candidate.score,
                 candidate.provider_model.id,
@@ -146,15 +146,15 @@ class RoutingEngine:
             )
         if strategy == "weighted":
             return (
-                provider_states[candidate.provider_model.provider_id].priority,
                 candidate.provider_model.priority,
+                provider_states[candidate.provider_model.provider_id].priority,
                 -candidate.score,
                 candidate.provider_model.id,
                 candidate.credential.credential_id,
             )
         return (
-            provider_states[candidate.provider_model.provider_id].priority,
             candidate.provider_model.priority,
+            provider_states[candidate.provider_model.provider_id].priority,
             self._member_priority(candidate),
             -candidate.score,
             candidate.provider_model.id,

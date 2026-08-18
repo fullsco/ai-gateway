@@ -33,9 +33,87 @@ describe("control plane", () => {
     render(<ControlPlane />);
     await userEvent.click(screen.getByRole("button", { name: "Health" }));
     expect(await screen.findByText("Degraded")).toBeVisible();
+    expect(screen.getByText(/upstream rejected the request with a WAF response/i)).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "Activity" }));
-    expect(await screen.findByText("credential_rotated")).toBeVisible();
+    expect(await screen.findByText("Credential secret rotated")).toBeVisible();
     expect(document.body.textContent).not.toContain("[object Object]");
+  });
+
+  it("shows human-readable audit resource names instead of raw ids", async () => {
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => String(input).includes("audit")
+      ? response({ data: [{ id: 1, action: "model_routing_updated", resource_type: "model", resource_id: "50e4c0d2-1a2b", resource_name: "Claude Opus 5", created_at: "2026-08-18T00:00:00Z" }] })
+      : response(overview)));
+    render(<ControlPlane />);
+    await userEvent.click(screen.getByRole("button", { name: "Audit" }));
+    expect(await screen.findByText("Claude Opus 5")).toBeVisible();
+    expect(screen.getByText("Model routing updated")).toBeVisible();
+    expect(document.body.textContent).not.toContain("50e4c0d2-1a2b");
+  });
+
+  it("opens a human-readable request trace with fallback and token usage", async () => {
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes("requests/request-1")) return response({
+        request: { id: "request-1", requested_model: "claude-opus-5", resolved_model: "claude-opus-5", status: "succeeded", latency_ms: 1800, retry_count: 0, fallback_count: 1 },
+        attempts: [
+          { id: "attempt-1", provider_name: "AgentRouter", credential_name: "Primary", status: "failed", upstream_status: 429, error_category: "rate_limited", latency_ms: 320 },
+          { id: "attempt-2", provider_name: "GoRouter", credential_name: "Fallback", status: "succeeded", upstream_status: 200, latency_ms: 1480 },
+        ],
+        usage: [{ input_tokens: 100, output_tokens: 40, cached_tokens: 10, estimated_cost: null }],
+      });
+      if (path.includes("requests")) return response({ data: [{ id: "request-1", requested_model: "claude-opus-5", status: "succeeded", latency_ms: 1800, retry_count: 0, fallback_count: 1 }] });
+      return response(overview);
+    }));
+    render(<ControlPlane />);
+    await userEvent.click(screen.getByRole("button", { name: "Requests" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Trace request" }));
+    expect(await screen.findByRole("dialog", { name: "Request trace" })).toBeVisible();
+    expect(screen.getByText("Succeeded through fallback")).toBeVisible();
+    expect(screen.getByText("AgentRouter")).toBeVisible();
+    expect(screen.getByText("GoRouter")).toBeVisible();
+    expect(screen.getByText("Pricing unavailable")).toBeVisible();
+  });
+
+  it("opens the high-level model routing workspace", async () => {
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes("/models/model-1/routing")) return response({ model: { id: "model-1", display_name: "Model One", capabilities: ["streaming"] }, data: [
+        { provider: "AgentRouter", route_enabled: true, priority: 0, provider_enabled: true, mapping_enabled: true },
+        { provider: "GoRouter", route_enabled: false, priority: 100, provider_enabled: true, mapping_enabled: true },
+      ] });
+      if (path.endsWith("/models")) return response({ data: [{ id: "model-1", display_name: "Model One", capabilities: ["streaming"] }] });
+      return response(overview);
+    }));
+    render(<ControlPlane />);
+    await userEvent.click(screen.getByRole("button", { name: "Models" }));
+    expect(await screen.findByText("Models and routing")).toBeVisible();
+    expect(screen.getByText("Primary provider")).toBeVisible();
+    expect(screen.getByText(/will try AgentRouter first/i)).toBeVisible();
+    // GoRouter exposes the model but is not yet routed, so it is offered to add.
+    expect(screen.getByRole("option", { name: "GoRouter" })).toBeInTheDocument();
+  });
+
+  it("shows a human-readable publish review before publishing", async () => {
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes("config/status")) return response({
+        active_version: 68,
+        has_unpublished_changes: true,
+        changed_sections: ["Mappings and routes"],
+        change_count: 2,
+        changes: [
+          { change: "added", resource: "Model routing", summary: "Added route: claude-opus-5 via GoRouter" },
+          { change: "updated", resource: "Model routing", summary: "Changed route claude-opus-5 via AgentRouter: priority 100 to 10" },
+        ],
+      });
+      if (path.includes("config/versions")) return response({ data: [{ id: 68, status: "published", schema_version: 1 }] });
+      return response(overview);
+    }));
+    render(<ControlPlane />);
+    await userEvent.click(screen.getByRole("button", { name: "Configuration" }));
+    expect(await screen.findByText("2 changes will become active when you publish")).toBeVisible();
+    expect(screen.getByText("Added route: claude-opus-5 via GoRouter")).toBeVisible();
+    expect(screen.getByText("Changed route claude-opus-5 via AgentRouter: priority 100 to 10")).toBeVisible();
   });
 
   it("creates a provider and reports success", async () => {

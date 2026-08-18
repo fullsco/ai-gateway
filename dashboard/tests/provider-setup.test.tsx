@@ -40,11 +40,11 @@ describe("provider setup", () => {
     fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "https://new.example" } });
     fireEvent.change(screen.getByLabelText("Label"), { target: { value: "primary" } });
     fireEvent.change(screen.getByLabelText("Secret"), { target: { value: "secret-value" } });
-    fireEvent.change(screen.getByLabelText("Canonical model ID"), { target: { value: "model-new" } });
-    fireEvent.change(screen.getByLabelText("Display name"), { target: { value: "Model New" } });
-    fireEvent.change(screen.getByLabelText("Upstream model ID"), { target: { value: "upstream-new" } });
+    fireEvent.change(screen.getByLabelText(/^Model ID/), { target: { value: "model-new" } });
+    fireEvent.change(screen.getByLabelText("Model display name"), { target: { value: "Model New" } });
+    fireEvent.change(screen.getByLabelText(/^Provider model ID/), { target: { value: "upstream-new" } });
     await userEvent.selectOptions(screen.getByLabelText("Selection strategy"), "least_loaded");
-    await userEvent.click(screen.getByLabelText("Allow model fallback"));
+    await userEvent.click(screen.getByLabelText("Use as model fallback"));
     await userEvent.click(screen.getByRole("button", { name: "Create provider workspace" }));
 
     await waitFor(() => expect(onSaved).toHaveBeenCalled());
@@ -69,8 +69,8 @@ describe("provider setup", () => {
     expect(screen.getByLabelText("Provider enabled")).not.toBeChecked();
     expect(screen.getByLabelText("Canonical model enabled")).not.toBeChecked();
     expect(screen.getByLabelText("Mapping enabled")).not.toBeChecked();
-    expect(screen.getByLabelText("Route enabled")).not.toBeChecked();
-    expect(screen.getByLabelText("Allow model fallback")).toBeChecked();
+    expect(screen.getByLabelText("Route active")).not.toBeChecked();
+    expect(screen.getByLabelText("Use as model fallback")).toBeChecked();
 
     await userEvent.click(screen.getByRole("button", { name: "Save provider workspace" }));
     await waitFor(() => expect(payload.name).toBe("Provider"));
