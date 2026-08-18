@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+from collections import Counter
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
@@ -50,6 +51,304 @@ def legacy_configuration_checksum(payload: dict[str, Any]) -> str:
 def legacy_checksum(payload: dict[str, Any]) -> str:
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _index(rows: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(rows, list):
+        return {}
+    return {
+        str(row["id"]): row
+        for row in rows
+        if isinstance(row, dict) and row.get("id") is not None
+    }
+
+
+def _plural(count: int) -> str:
+    return "" if count == 1 else "s"
+
+
+def _value(value: Any) -> str:
+    if value is None or value == "":
+        return "none"
+    return str(value)
+
+
+def _transition(label: str, before: Any, after: Any) -> str:
+    return f"{label} {_value(before)} to {_value(after)}"
+
+
+def _enabled_transition(_label: str, _before: Any, after: Any) -> str:
+    return "enabled" if after else "disabled"
+
+
+def _toggle_transition(label: str, _before: Any, after: Any) -> str:
+    return f"{label} {'on' if after else 'off'}"
+
+
+def _list_transition(label: str, _before: Any, after: Any) -> str:
+    values = ", ".join(str(item) for item in (after or []))
+    return f"{label} now {values or 'none'}"
+
+
+def _pricing_transition(before: Any, after: Any) -> str:
+    before = before or {}
+    after = after or {}
+    if before == after:
+        return ""
+    if not before:
+        return "pricing added"
+    if not after:
+        return "pricing removed"
+    return "pricing updated"
+
+
+def _change(change: str, resource: str, summary: str) -> dict[str, str]:
+    return {"change": change, "resource": resource, "summary": summary}
+
+
+def _field_changes(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    specs: list[tuple[str, str, Any]],
+) -> str:
+    fragments = [
+        formatter(label, before.get(field), after.get(field))
+        for field, label, formatter in specs
+        if before.get(field) != after.get(field)
+    ]
+    return ", ".join(fragment for fragment in fragments if fragment)
+
+
+def _provider_names(*projections: dict[str, Any]) -> dict[str, str]:
+    names: dict[str, str] = {}
+    for projection in projections:
+        for row in projection.get("providers", []) or []:
+            if isinstance(row, dict) and row.get("id") is not None:
+                names[str(row["id"])] = str(row.get("name", row["id"]))
+    return names
+
+
+def _provider_changes(before: dict[str, Any], after: dict[str, Any]) -> list[dict[str, str]]:
+    prior = _index(before.get("providers"))
+    current = _index(after.get("providers"))
+    changes: list[dict[str, str]] = []
+    for key in sorted(current.keys() - prior.keys()):
+        row = current[key]
+        state = "enabled" if row.get("enabled", True) else "disabled"
+        name = row.get("name", key)
+        changes.append(_change("added", "Provider", f"Added provider {name} ({state})"))
+    for key in sorted(prior.keys() - current.keys()):
+        name = prior[key].get("name", key)
+        changes.append(_change("removed", "Provider", f"Removed provider {name}"))
+    specs = [
+        ("enabled", "", _enabled_transition),
+        ("base_url", "base URL", _transition),
+        ("priority", "priority", _transition),
+        ("timeout_seconds", "timeout seconds", _transition),
+        ("capabilities", "capabilities", _list_transition),
+        ("auth_scheme", "authentication", _transition),
+    ]
+    for key in sorted(prior.keys() & current.keys()):
+        details = _field_changes(prior[key], current[key], specs)
+        if details:
+            name = current[key].get("name", key)
+            changes.append(_change("updated", "Provider", f"Changed provider {name}: {details}"))
+    return changes
+
+
+def _credential_changes(
+    before: dict[str, Any], after: dict[str, Any], names: dict[str, str]
+) -> list[dict[str, str]]:
+    prior = _index(before.get("credentials"))
+    current = _index(after.get("credentials"))
+
+    def provider_of(row: dict[str, Any]) -> str:
+        return names.get(str(row.get("provider_id")), "a provider")
+
+    def settings(row: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            row.get("priority"),
+            row.get("quota_limit"),
+            row.get("requests_per_minute"),
+            row.get("tokens_per_minute"),
+        )
+
+    added: Counter[str] = Counter()
+    removed: Counter[str] = Counter()
+    updated: Counter[str] = Counter()
+    toggled: list[tuple[str, str]] = []
+    for key in current.keys() - prior.keys():
+        added[provider_of(current[key])] += 1
+    for key in prior.keys() - current.keys():
+        removed[provider_of(prior[key])] += 1
+    for key in prior.keys() & current.keys():
+        before_row, after_row = prior[key], current[key]
+        if before_row.get("enabled", True) != after_row.get("enabled", True):
+            state = "Enabled" if after_row.get("enabled", True) else "Disabled"
+            toggled.append((provider_of(after_row), state))
+        elif settings(before_row) != settings(after_row):
+            updated[provider_of(after_row)] += 1
+    changes: list[dict[str, str]] = []
+    for provider, count in sorted(added.items()):
+        changes.append(
+            _change(
+                "added",
+                "Credentials",
+                f"Added {count} credential{_plural(count)} to {provider}",
+            )
+        )
+    for provider, count in sorted(removed.items()):
+        changes.append(
+            _change(
+                "removed",
+                "Credentials",
+                f"Removed {count} credential{_plural(count)} from {provider}",
+            )
+        )
+    for provider, state in sorted(toggled):
+        changes.append(_change("updated", "Credentials", f"{state} a credential on {provider}"))
+    for provider, count in sorted(updated.items()):
+        changes.append(
+            _change(
+                "updated",
+                "Credentials",
+                f"Updated limits on {count} credential{_plural(count)} for {provider}",
+            )
+        )
+    return changes
+
+
+def _model_changes(before: dict[str, Any], after: dict[str, Any]) -> list[dict[str, str]]:
+    prior = _index(before.get("models"))
+    current = _index(after.get("models"))
+    changes: list[dict[str, str]] = []
+    for key in sorted(current.keys() - prior.keys()):
+        changes.append(_change("added", "Model", f"Added model {key}"))
+    for key in sorted(prior.keys() - current.keys()):
+        changes.append(_change("removed", "Model", f"Removed model {key}"))
+    specs = [
+        ("enabled", "", _enabled_transition),
+        ("capabilities", "capabilities", _list_transition),
+        ("aliases", "aliases", _list_transition),
+    ]
+    for key in sorted(prior.keys() & current.keys()):
+        details = _field_changes(prior[key], current[key], specs)
+        if details:
+            changes.append(_change("updated", "Model", f"Changed model {key}: {details}"))
+    return changes
+
+
+def _route_changes(
+    before: dict[str, Any], after: dict[str, Any], names: dict[str, str]
+) -> list[dict[str, str]]:
+    prior = _index(before.get("provider_models"))
+    current = _index(after.get("provider_models"))
+
+    def label(row: dict[str, Any]) -> str:
+        model = row.get("canonical_model_id", "model")
+        provider = names.get(str(row.get("provider_id")), "a provider")
+        return f"{model} via {provider}"
+
+    changes: list[dict[str, str]] = []
+    for key in sorted(current.keys() - prior.keys()):
+        changes.append(_change("added", "Model routing", f"Added route: {label(current[key])}"))
+    for key in sorted(prior.keys() - current.keys()):
+        changes.append(_change("removed", "Model routing", f"Removed route: {label(prior[key])}"))
+    specs = [
+        ("enabled", "", _enabled_transition),
+        ("priority", "priority", _transition),
+        ("weight", "traffic share", _transition),
+        ("allow_model_fallback", "model fallback", _toggle_transition),
+        ("pool_strategy", "strategy", _transition),
+        ("protocol", "protocol", _transition),
+    ]
+    for key in sorted(prior.keys() & current.keys()):
+        details = _field_changes(prior[key], current[key], specs)
+        pricing = _pricing_transition(prior[key].get("pricing"), current[key].get("pricing"))
+        combined = ", ".join(fragment for fragment in (details, pricing) if fragment)
+        if combined:
+            changes.append(
+                _change(
+                    "updated",
+                    "Model routing",
+                    f"Changed route {label(current[key])}: {combined}",
+                )
+            )
+    return changes
+
+
+def _client_changes(before: dict[str, Any], after: dict[str, Any]) -> list[dict[str, str]]:
+    prior = _index(before.get("clients"))
+    current = _index(after.get("clients"))
+    changes: list[dict[str, str]] = []
+    for key in sorted(current.keys() - prior.keys()):
+        name = current[key].get("name", key)
+        changes.append(_change("added", "Gateway client", f"Added client {name}"))
+    for key in sorted(prior.keys() - current.keys()):
+        name = prior[key].get("name", key)
+        changes.append(_change("removed", "Gateway client", f"Removed client {name}"))
+    specs = [
+        ("enabled", "", _enabled_transition),
+        ("allowed_protocols", "allowed protocols", _list_transition),
+        ("allowed_models", "allowed models", _list_transition),
+        ("requests_per_minute", "requests per minute", _transition),
+        ("tokens_per_minute", "tokens per minute", _transition),
+        ("spending_limit", "spending limit", _transition),
+    ]
+    for key in sorted(prior.keys() & current.keys()):
+        details = _field_changes(prior[key], current[key], specs)
+        if details:
+            name = current[key].get("name", key)
+            changes.append(
+                _change("updated", "Gateway client", f"Changed client {name}: {details}")
+            )
+    return changes
+
+
+def _key_changes(before: dict[str, Any], after: dict[str, Any]) -> list[dict[str, str]]:
+    prior = _index(before.get("gateway_keys"))
+    current = _index(after.get("gateway_keys"))
+    changes: list[dict[str, str]] = []
+    for key in sorted(current.keys() - prior.keys()):
+        prefix = current[key].get("key_prefix", "")
+        changes.append(_change("added", "Gateway key", f"Issued key {prefix}".strip()))
+    for key in sorted(prior.keys() - current.keys()):
+        prefix = prior[key].get("key_prefix", "")
+        changes.append(_change("removed", "Gateway key", f"Revoked key {prefix}".strip()))
+    specs = [
+        ("enabled", "", _enabled_transition),
+        ("expires_at", "expiry", _transition),
+    ]
+    for key in sorted(prior.keys() & current.keys()):
+        details = _field_changes(prior[key], current[key], specs)
+        if details:
+            prefix = current[key].get("key_prefix", "")
+            changes.append(
+                _change("updated", "Gateway key", f"Changed key {prefix}: {details}".strip())
+            )
+    return changes
+
+
+def summarize_configuration_changes(
+    published: dict[str, Any] | None,
+    working: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    """Describe the difference between two configuration payloads for operators.
+
+    Returns human-readable change entries. Secrets and digests are never surfaced;
+    credentials and keys are referenced by provider name or key prefix only.
+    """
+    before = configuration_projection(published or {})
+    after = configuration_projection(working or {})
+    names = _provider_names(before, after)
+    return [
+        *_provider_changes(before, after),
+        *_credential_changes(before, after, names),
+        *_model_changes(before, after),
+        *_route_changes(before, after, names),
+        *_client_changes(before, after),
+        *_key_changes(before, after),
+    ]
 
 
 class ConfigSnapshot(BaseModel):

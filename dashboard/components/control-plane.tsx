@@ -3,6 +3,7 @@
 import { Activity, Cable, Clipboard, Coins, KeyRound, Menu, Network, Pencil, Plus, RefreshCw, Route, ScrollText, Settings2, ShieldCheck, Trash2, Users, X } from "lucide-react";
 import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
 import ProviderSetup, { gatewayApi } from "./provider-setup";
+import ModelRouting from "./model-routing";
 
 type Row = Record<string, unknown>;
 type View = "overview" | "providers" | "credentials" | "clients" | "models" | "provider-models" | "routing" | "routing-policies" | "requests" | "health" | "usage" | "analytics" | "audit" | "events" | "configuration" | "pools" | "budgets" | "alerts" | "alert-rules";
@@ -10,9 +11,9 @@ type ResourceView = Exclude<View, "overview">;
 type Notice = { kind: "success" | "error"; message: string } | null;
 
 function readable(value: unknown): string {
-  if (value === null || value === undefined || value === "") return "--";
+  if (value === null || value === undefined || value === "") return "Not recorded";
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
-  if (Array.isArray(value)) return value.map(readable).join(", ");
+  if (Array.isArray(value)) return value.length ? value.map(readable).join(", ") : "None configured";
   try {
     return JSON.stringify(value);
   } catch {
@@ -23,13 +24,13 @@ function readable(value: unknown): string {
 const navigation: [View, typeof Activity, string][] = [
   ["overview", Activity, "Overview"],
   ["providers", Cable, "Providers"],
-  ["pools", Network, "Provider pools"],
-  ["credentials", KeyRound, "Credentials"],
+  ["pools", Network, "Provider pools (Advanced)"],
+  ["credentials", KeyRound, "Credentials (Advanced)"],
   ["clients", Users, "Clients"],
   ["models", Network, "Models"],
-  ["provider-models", Network, "Mappings"],
-  ["routing", Route, "Routes"],
-  ["routing-policies", Settings2, "Policies"],
+  ["provider-models", Network, "Mappings (Advanced)"],
+  ["routing", Route, "Routes (Advanced)"],
+  ["routing-policies", Settings2, "Policies (Advanced)"],
   ["requests", ScrollText, "Requests"],
   ["health", ShieldCheck, "Health"],
   ["usage", Coins, "Usage"],
@@ -65,7 +66,7 @@ const resources: Record<ResourceView, { endpoint: string; title: string; mutable
     endpoint: "models",
     title: "Canonical models",
     mutable: true,
-    columns: ["id", "display_name", "aliases", "capabilities", "enabled", "provider_route_count"],
+    columns: ["display_name", "aliases", "available_through", "protocols", "capabilities", "enabled", "provider_route_count"],
   },
   "provider-models": {
     endpoint: "provider-models",
@@ -95,7 +96,7 @@ const resources: Record<ResourceView, { endpoint: string; title: string; mutable
     endpoint: "health",
     title: "Health checks",
     mutable: false,
-    columns: ["provider_name", "credential_name", "status", "latency_ms", "error_category", "checked_at"],
+    columns: ["provider_name", "credential_name", "status", "routing_eligibility", "latency_ms", "error_category", "checked_at"],
   },
   usage: {
     endpoint: "usage",
@@ -113,7 +114,7 @@ const resources: Record<ResourceView, { endpoint: string; title: string; mutable
     endpoint: "audit",
     title: "Audit trail",
     mutable: false,
-    columns: ["action", "resource_type", "resource_id", "actor_id", "created_at"],
+    columns: ["action", "resource_name", "resource_type", "created_at"],
   },
   configuration: {
     endpoint: "config/versions",
@@ -157,15 +158,26 @@ const api = gatewayApi;
 
 function display(value: unknown, key: string, row?: Row) {
   if (key.includes("cost") && (value === null || value === undefined || value === "")) return "Pricing unavailable";
-  if (value === null || value === undefined || value === "") return "--";
+  if (value === null || value === undefined || value === "") {
+    if (key.includes("cooldown")) return "Not cooling down";
+    if (key.includes("pricing")) return "Pricing unavailable";
+    return "Not configured";
+  }
   if (typeof value === "boolean") return value ? "Enabled" : "Disabled";
+  if (key === "event_type" || key === "action") return humanizeEvent(value);
   if (key === "protocol" || key === "health" || key === "status")
     return String(value)
       .replaceAll("_", " ")
       .replace(/\b\w/g, (letter) => letter.toUpperCase());
   if (key === "allow_model_fallback") return value ? "Allowed" : "Disabled";
-  if (Array.isArray(value)) return value.length ? value.join(", ") : "Any";
-  if (typeof value === "object") return readable(value);
+  if (Array.isArray(value)) {
+    if (value.length) return value.join(", ");
+    if (key.includes("capabilit")) return "No additional capabilities";
+    if (key.includes("alias")) return "No aliases";
+    if (key.includes("protocol")) return "No protocols configured";
+    return "None configured";
+  }
+  if (typeof value === "object") return "Advanced details available";
   if (key.endsWith("_at"))
     return new Intl.DateTimeFormat(undefined, {
       dateStyle: "medium",
@@ -173,7 +185,76 @@ function display(value: unknown, key: string, row?: Row) {
     }).format(new Date(String(value)));
   if (key.includes("cost")) return row?.currency ? `${Number(value).toFixed(4)} ${String(row.currency)}` : "Pricing unavailable";
   if (key.includes("latency") && value !== "--") return `${Number(value).toFixed(0)} ms`;
-  return String(value);
+  return String(value).replaceAll("_", " ");
+}
+
+function humanizeEvent(value: unknown): string {
+  const events: Record<string, string> = {
+    provider_created: "Provider added",
+    provider_updated: "Provider configuration updated",
+    provider_deleted: "Provider removed",
+    provider_model_created: "Model availability added",
+    provider_model_updated: "Model routing configuration updated",
+    provider_model_deleted: "Model availability removed",
+    credential_created: "Credential added",
+    credential_updated: "Credential limits updated",
+    credential_rotated: "Credential secret rotated",
+    credential_deleted: "Credential removed",
+    route_created: "Provider route added",
+    route_updated: "Provider route updated",
+    route_deleted: "Provider route removed",
+    config_published: "Working configuration published",
+    config_rolled_back: "Configuration rolled back",
+  };
+  const key = String(value ?? "");
+  return events[key] ?? key.replaceAll("_", " ").replace(/^./, (letter) => letter.toUpperCase());
+}
+
+const labels: Record<string, string> = {
+  provider_name: "Provider",
+  provider_name_snapshot: "Provider",
+  available_through: "Available through",
+  routing_eligibility: "Routing eligibility",
+  resource_name: "Resource",
+  resource_type: "Resource type",
+  credential_name: "Credential",
+  requested_model: "Requested model",
+  resolved_model: "Resolved model",
+  canonical_model_snapshot: "Model",
+  upstream_model_snapshot: "Upstream model",
+  protocol_snapshot: "Protocol",
+  requests_per_minute: "Requests per minute",
+  tokens_per_minute: "Tokens per minute",
+  quota_limit: "Quota limit",
+  quota_used: "Quota used",
+  quota_threshold: "Quota warning threshold",
+  max_concurrency: "Concurrent request limit",
+  priority: "Routing priority",
+  weight: "Traffic share",
+  cooldown_until: "Cooling down until",
+  error_category: "Reason",
+  fallback_count: "Fallbacks used",
+  retry_count: "Retries",
+  estimated_cost: "Estimated cost",
+  is_estimate: "Estimated value",
+  attempt_status_snapshot: "Attempt result",
+  response_committed: "Response started",
+};
+
+function columnLabel(column: string): string {
+  return labels[column] ?? column.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function explainError(value: unknown): string {
+  const explanations: Record<string, string> = {
+    upstream_waf_rejection: "The upstream rejected the request with a WAF response. Other eligible routes may still be used.",
+    rate_limited: "The provider or credential is rate limited. The Gateway may try another eligible credential or provider.",
+    authentication_failed: "The provider credential was rejected. Rotate or disable it before relying on this route.",
+    quota_exhausted: "The configured quota has been reached. Another eligible credential or provider is required.",
+    timeout: "The provider did not respond before the configured timeout.",
+    model_unavailable: "The provider cannot currently serve this model.",
+  };
+  return explanations[String(value)] ?? String(value ?? "No reason recorded").replaceAll("_", " ");
 }
 
 function DataTable({ rows, columns, actions }: { rows: Row[]; columns: string[]; actions?: (row: Row) => ReactNode }) {
@@ -191,7 +272,7 @@ function DataTable({ rows, columns, actions }: { rows: Row[]; columns: string[];
         <thead>
           <tr>
             {columns.map((column) => (
-              <th key={column}>{column.replaceAll("_", " ")}</th>
+              <th key={column}>{columnLabel(column)}</th>
             ))}
             {actions && <th className="action-heading">Actions</th>}
           </tr>
@@ -200,9 +281,9 @@ function DataTable({ rows, columns, actions }: { rows: Row[]; columns: string[];
           {rows.map((row, index) => (
             <tr key={String(row.id ?? index)}>
               {columns.map((column) => (
-                <td key={column} data-label={column.replaceAll("_", " ")}>
-                  <span title={display(row[column], column, row)} className={column === "status" || column === "health" || column === "enabled" ? `value status-value ${String(row[column])}` : "value"}>
-                    {display(row[column], column, row)}
+                <td key={column} data-label={columnLabel(column)}>
+                  <span title={column === "error_category" ? explainError(row[column]) : display(row[column], column, row)} className={column === "status" || column === "health" || column === "enabled" ? `value status-value ${String(row[column])}` : "value"}>
+                    {column === "error_category" ? explainError(row[column]) : display(row[column], column, row)}
                   </span>
                 </td>
               ))}
@@ -331,7 +412,7 @@ export default function ControlPlane() {
             </button>
           </div>
         )}
-        {view === "overview" ? <Overview runtime={overview} metrics={metrics} loading={loading} /> : <Resource view={view} rows={rows} loading={loading} reload={() => load(view, true)} notify={setNotice} />}
+        {view === "overview" ? <Overview runtime={overview} metrics={metrics} loading={loading} /> : view === "models" ? <ModelRouting onNotice={(message, kind = "success") => setNotice({ message, kind })} /> : <Resource view={view} rows={rows} loading={loading} reload={() => load(view, true)} notify={setNotice} />}
       </section>
     </main>
   );
@@ -414,6 +495,7 @@ function Resource({ view, rows, loading, reload, notify }: { view: ResourceView;
   const [keys, setKeys] = useState<{ client: Row; rows: Row[] } | null>(null);
   const [publishState, setPublishState] = useState<Row | null>(null);
   const [providerSetup, setProviderSetup] = useState<Row | null | undefined>(null);
+  const [requestDetail, setRequestDetail] = useState<Row | null>(null);
   useEffect(() => {
     if (view === "configuration")
       void api("config/status")
@@ -496,6 +578,16 @@ function Resource({ view, rows, loading, reload, notify }: { view: ResourceView;
     if (!window.confirm("Publish the current working configuration and refresh the gateway runtime?")) return;
     await mutate("Configuration publish", () => api("config/publish", { method: "POST" }));
   }
+  async function showRequest(row: Row) {
+    setBusy("Request detail");
+    try {
+      setRequestDetail(await api(`requests/${row.id}`));
+    } catch (reason) {
+      notify({ kind: "error", message: reason instanceof Error ? reason.message : "Unable to load request detail" });
+    } finally {
+      setBusy("");
+    }
+  }
   async function rollback() {
     if (!confirm) return;
     const completed = await mutate("Configuration rollback", () => api(`config/versions/${confirm.row.id}/rollback`, { method: "POST" }));
@@ -527,6 +619,7 @@ function Resource({ view, rows, loading, reload, notify }: { view: ResourceView;
       {view === "alerts" && row.status !== "resolved" && <button onClick={() => void mutate("Alert resolve", () => api(`alerts/${row.id}/resolve`, { method: "POST" }))}>Resolve</button>}
       {view === "configuration" && row.status !== "published" && <button onClick={() => setConfirm({ row, action: "rollback" })}>Rollback</button>}
       {view === "configuration" && <span className="immutable-label">Snapshot immutable</span>}
+      {view === "requests" && <button onClick={() => void showRequest(row)} disabled={!!busy}>Trace request</button>}
     </div>
   );
   const filteredRows = search.trim() ? rows.filter((row) => Object.values(row).some((value) => display(value, "").toLowerCase().includes(search.trim().toLowerCase()))) : rows;
@@ -536,6 +629,25 @@ function Resource({ view, rows, loading, reload, notify }: { view: ResourceView;
         <div className={`publish-state ${publishState.has_unpublished_changes ? "draft" : "published"}`}>
           <strong>{publishState.has_unpublished_changes ? "Unpublished working changes" : "Working configuration matches production"}</strong>
           <span>Active snapshot {String(publishState.active_version ?? "None")}. Publishing creates a new immutable snapshot and activates it after runtime refresh.</span>
+          {Boolean(publishState.has_unpublished_changes) && Array.isArray(publishState.changes) && (publishState.changes as Row[]).length > 0 && (
+            <div className="change-review">
+              <span className="change-review-head">{Number(publishState.change_count ?? (publishState.changes as Row[]).length)} change{Number(publishState.change_count ?? (publishState.changes as Row[]).length) === 1 ? "" : "s"} will become active when you publish</span>
+              <ul>
+                {(publishState.changes as Row[]).map((entry, index) => (
+                  <li key={index} className={`change-${String(entry.change)}`}>
+                    <span className="change-mark" aria-hidden="true">{entry.change === "added" ? "+" : entry.change === "removed" ? "-" : "~"}</span>
+                    <span className="change-copy"><strong>{String(entry.resource)}</strong>{String(entry.summary)}</span>
+                  </li>
+                ))}
+              </ul>
+              {Number(publishState.change_count ?? 0) > (publishState.changes as Row[]).length && (
+                <span className="change-more">Showing the first {(publishState.changes as Row[]).length} of {String(publishState.change_count)} changes.</span>
+              )}
+            </div>
+          )}
+          {Boolean(publishState.has_unpublished_changes) && (!Array.isArray(publishState.changes) || (publishState.changes as Row[]).length === 0) && Array.isArray(publishState.changed_sections) && (
+            <span>Changes affect: {(publishState.changed_sections as string[]).join(", ") || "the initial configuration"}.</span>
+          )}
         </div>
       )}
       <div className="section-head">
@@ -606,6 +718,7 @@ function Resource({ view, rows, loading, reload, notify }: { view: ResourceView;
           onRotate={rotateKey}
         />
       )}
+      {requestDetail && <RequestDetail value={requestDetail} onClose={() => setRequestDetail(null)} />}
       {providerSetup !== null && <ProviderSetup provider={providerSetup ?? undefined} onClose={() => setProviderSetup(null)} onSaved={async () => { setProviderSetup(null); await reload(); notify({ kind: "success", message: "Provider configuration reconciled. Review and publish when ready." }); }} />}
     </section>
   );
@@ -1197,6 +1310,54 @@ function KeyManager({ value, busy, onClose, onRevoke, onRotate }: { value: { cli
             )
           }
         />
+      </section>
+    </div>
+  );
+}
+
+function RequestDetail({ value, onClose }: { value: Row; onClose: () => void }) {
+  const request = (value.request as Row | undefined) ?? {};
+  const attempts = (value.attempts as Row[] | undefined) ?? [];
+  const usage = (value.usage as Row[] | undefined) ?? [];
+  const totals = usage.reduce<{ input: number; output: number; cached: number }>(
+    (result, row) => ({
+      input: result.input + Number(row.input_tokens ?? 0),
+      output: result.output + Number(row.output_tokens ?? 0),
+      cached: result.cached + Number(row.cached_tokens ?? 0),
+    }),
+    { input: 0, output: 0, cached: 0 },
+  );
+  return (
+    <div className="dialog-backdrop">
+      <section className="editor request-detail" role="dialog" aria-modal="true" aria-labelledby="request-detail-title">
+        <div className="editor-head">
+          <div>
+            <h2 id="request-detail-title">Request trace</h2>
+            <p>{String(request.resolved_model ?? request.requested_model ?? "Unknown model")} · {display(request.status, "status")}</p>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="Close request trace"><X size={18} /></button>
+        </div>
+        <div className="trace-summary">
+          <div><span>Total latency</span><strong>{display(request.latency_ms, "latency_ms")}</strong></div>
+          <div><span>Retries</span><strong>{String(request.retry_count ?? 0)}</strong></div>
+          <div><span>Fallbacks used</span><strong>{String(request.fallback_count ?? 0)}</strong></div>
+          <div><span>Final result</span><strong>{request.status === "succeeded" && Number(request.fallback_count ?? 0) > 0 ? "Succeeded through fallback" : display(request.status, "status")}</strong></div>
+        </div>
+        <h3>Routing attempts</h3>
+        {attempts.length ? <ol className="attempt-list">{attempts.map((attempt, index) => <li key={String(attempt.id ?? index)}>
+          <div><strong>{String(attempt.provider_name ?? `Provider attempt ${index + 1}`)}</strong><span>{display(attempt.status, "status")}</span></div>
+          <p>{attempt.credential_name ? `Credential: ${String(attempt.credential_name)}` : "Credential name unavailable"} · {display(attempt.latency_ms, "latency_ms")}</p>
+          {Boolean(attempt.upstream_status) && <p>Upstream response: {String(attempt.upstream_status)}</p>}
+          {Boolean(attempt.error_category) && <p className="trace-error">{explainError(attempt.error_category)}</p>}
+          {Boolean(attempt.response_committed) && <p>The response had already started, so the Gateway could not safely retry.</p>}
+        </li>)}</ol> : <div className="empty-state"><strong>No provider attempts recorded</strong><span>The request ended before an upstream attempt was persisted.</span></div>}
+        <h3>Token usage</h3>
+        <div className="trace-summary">
+          <div><span>Input tokens</span><strong>{totals.input.toLocaleString()}</strong></div>
+          <div><span>Output tokens</span><strong>{totals.output.toLocaleString()}</strong></div>
+          <div><span>Cached tokens</span><strong>{totals.cached.toLocaleString()}</strong></div>
+          <div><span>Cost</span><strong>{usage.some((row) => row.estimated_cost !== null && row.estimated_cost !== undefined) ? formatCurrencyTotals(usage) : "Pricing unavailable"}</strong></div>
+        </div>
       </section>
     </div>
   );

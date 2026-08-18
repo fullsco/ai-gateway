@@ -8,6 +8,7 @@ from gateway.configuration import (
     ConfigurationUnavailable,
     configuration_checksum,
     legacy_configuration_checksum,
+    summarize_configuration_changes,
 )
 
 
@@ -96,3 +97,106 @@ def test_configuration_checksum_ignores_runtime_state_and_collection_order() -> 
 
     assert configuration_checksum(first) == configuration_checksum(second)
     assert legacy_configuration_checksum(first) != legacy_configuration_checksum(second)
+
+
+def test_summarize_changes_describes_additions_removals_and_updates() -> None:
+    published = {
+        "providers": [
+            {"id": "p1", "name": "AgentRouter", "enabled": True, "priority": 100},
+            {"id": "p2", "name": "LegacyRouter", "enabled": True, "priority": 100},
+        ],
+        "models": [{"id": "claude-opus-5", "enabled": True, "capabilities": ["streaming"]}],
+        "provider_models": [
+            {
+                "id": "pm1",
+                "canonical_model_id": "claude-opus-5",
+                "provider_id": "p1",
+                "priority": 100,
+                "enabled": True,
+            }
+        ],
+    }
+    working = {
+        "providers": [
+            {"id": "p1", "name": "AgentRouter", "enabled": True, "priority": 100},
+            {"id": "p3", "name": "GoRouter", "enabled": True, "priority": 100},
+        ],
+        "models": [{"id": "claude-opus-5", "enabled": True, "capabilities": ["streaming"]}],
+        "provider_models": [
+            {
+                "id": "pm1",
+                "canonical_model_id": "claude-opus-5",
+                "provider_id": "p1",
+                "priority": 10,
+                "enabled": True,
+            },
+            {
+                "id": "pm2",
+                "canonical_model_id": "claude-opus-5",
+                "provider_id": "p3",
+                "priority": 20,
+                "enabled": True,
+            },
+        ],
+    }
+
+    summaries = [entry["summary"] for entry in summarize_configuration_changes(published, working)]
+
+    assert "Added provider GoRouter (enabled)" in summaries
+    assert "Removed provider LegacyRouter" in summaries
+    assert "Added route: claude-opus-5 via GoRouter" in summaries
+    assert "Changed route claude-opus-5 via AgentRouter: priority 100 to 10" in summaries
+
+
+def test_summarize_changes_never_exposes_secrets_or_digests() -> None:
+    published = {
+        "credentials": [
+            {
+                "id": "c1",
+                "provider_id": "p1",
+                "enabled": True,
+                "secret_ciphertext": "PUBLISHED-SECRET",
+            }
+        ],
+        "providers": [{"id": "p1", "name": "AgentRouter"}],
+        "gateway_keys": [
+            {
+                "id": "k1",
+                "key_prefix": "gw_live",
+                "key_digest": "PUBLISHED-DIGEST",
+                "enabled": True,
+            }
+        ],
+    }
+    working = {
+        "credentials": [
+            {
+                "id": "c1",
+                "provider_id": "p1",
+                "enabled": False,
+                "secret_ciphertext": "WORKING-SECRET",
+            },
+            {
+                "id": "c2",
+                "provider_id": "p1",
+                "enabled": True,
+                "secret_ciphertext": "NEW-SECRET",
+            },
+        ],
+        "providers": [{"id": "p1", "name": "AgentRouter"}],
+        "gateway_keys": [],
+    }
+
+    changes = summarize_configuration_changes(published, working)
+    text = " ".join(entry["summary"] for entry in changes)
+
+    assert "SECRET" not in text
+    assert "DIGEST" not in text
+    assert "Added 1 credential to AgentRouter" in text
+    assert "Disabled a credential on AgentRouter" in text
+    assert "Revoked key gw_live" in text
+
+
+def test_summarize_changes_is_empty_for_identical_payloads() -> None:
+    payload = {"providers": [{"id": "p1", "name": "AgentRouter", "health": "healthy"}]}
+    assert summarize_configuration_changes(payload, payload) == []

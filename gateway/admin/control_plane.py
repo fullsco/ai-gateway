@@ -16,6 +16,7 @@ from gateway.configuration import (
     configuration_projection,
     legacy_checksum,
     legacy_configuration_checksum,
+    summarize_configuration_changes,
 )
 from gateway.configuration.runtime_builder import RuntimeSnapshot
 from gateway.protocols import ClientProtocol
@@ -184,6 +185,29 @@ class RoutingPolicyInput(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     enabled: bool = True
     policy: RoutingPolicyDefinition = Field(default_factory=RoutingPolicyDefinition)
+
+
+class HighLevelRouteInput(BaseModel):
+    provider: str = Field(min_length=1, max_length=120)
+    priority: int = Field(default=100, ge=0)
+    fallback: bool = False
+
+
+class ModelRoutingInput(BaseModel):
+    providers: list[HighLevelRouteInput] = Field(min_length=1)
+    strategy: Literal["priority", "weighted", "least_loaded"] = "priority"
+    health_aware: bool = True
+    quota_aware: bool = True
+
+    @field_validator("providers")
+    @classmethod
+    def unique_providers(cls, values: list[HighLevelRouteInput]) -> list[HighLevelRouteInput]:
+        names = [value.provider.casefold() for value in values]
+        if len(names) != len(set(names)):
+            raise ValueError("providers must be unique")
+        if not any(not value.fallback for value in values):
+            raise ValueError("at least one primary provider is required")
+        return values
 
 
 async def _context(request: Request) -> tuple[AdminClaims, Any] | JSONResponse:
@@ -898,6 +922,214 @@ async def delete_route(route_id: str, request: Request) -> JSONResponse:
     return JSONResponse({"deleted": True})
 
 
+@router.get("/models/{model_id}/routing")
+async def model_routing(model_id: str, request: Request) -> JSONResponse:
+    context = await _context(request)
+    if isinstance(context, JSONResponse):
+        return context
+    _, pool = context
+    model = await pool.fetchrow(
+        "select id,display_name,capabilities,enabled from public.models where id=$1",
+        model_id,
+    )
+    if model is None:
+        return _not_found("model")
+    rows = await pool.fetch(
+        """
+        select p.name as provider, p.health as provider_health,
+               p.enabled as provider_enabled,
+               pm.id::text as provider_model_id, pm.upstream_model_id, pm.protocol,
+               pm.capabilities, pm.enabled as mapping_enabled, r.priority,
+               r.enabled as route_enabled,
+               r.pool_id::text as pool_id, count(c.id) as credential_count,
+               count(c.id) filter (
+                 where c.enabled and c.health in ('healthy','degraded')
+               ) as routable_credentials,
+               pp.strategy,
+               coalesce((pp.settings->>'health_aware')::boolean,true) as health_aware,
+               coalesce((pp.settings->>'quota_aware')::boolean,true) as quota_aware
+        from public.provider_models pm
+        join public.providers p on p.id=pm.provider_id
+        left join public.model_routes r on r.provider_model_id=pm.id and r.model_id=pm.model_id
+        left join public.provider_pools pp on pp.id=r.pool_id
+        left join public.provider_credentials c on c.provider_id=p.id
+        where pm.model_id=$1
+        group by p.name,p.health,p.enabled,pm.id,r.id,pp.id
+        order by coalesce(r.priority,100),p.name,pm.protocol
+        """,
+        model_id,
+    )
+    return JSONResponse(
+        jsonable_encoder(
+            {"model": dict(model), "data": [dict(row) for row in rows]}
+        )
+    )
+
+
+@router.put("/models/{model_id}/routing")
+async def update_model_routing(
+    model_id: str, request: Request, body: ModelRoutingInput
+) -> JSONResponse:
+    context = await _context(request)
+    if isinstance(context, JSONResponse):
+        return context
+    claims, pool = context
+    model = await pool.fetchval("select 1 from public.models where id=$1", model_id)
+    if model is None:
+        return _not_found("model")
+    names = [item.provider for item in body.providers]
+    mappings = await pool.fetch(
+        """
+        select pm.id, pm.provider_id, p.name as provider, pm.protocol, pm.weight
+        from public.provider_models pm
+        join public.providers p on p.id=pm.provider_id
+        where pm.model_id=$1 and p.name = any($2::text[]) and p.enabled and pm.enabled
+        order by p.name, pm.protocol
+        """,
+        model_id,
+        names,
+    )
+    found = {str(row["provider"]).casefold() for row in mappings}
+    missing = [name for name in names if name.casefold() not in found]
+    if missing:
+        return JSONResponse(
+            {
+                "error": "model_provider_unavailable",
+                "details": [
+                    {
+                        "provider": name,
+                        "message": (
+                            "This provider does not currently expose the selected model."
+                        ),
+                    }
+                    for name in missing
+                ],
+            },
+            status_code=422,
+        )
+    policy_name = f"Model {model_id} routing"
+    policy = {
+        "health_weight": 3 if body.health_aware else 0,
+        "quota_weight": 2 if body.quota_aware else 0,
+        "rate_limit_weight": 2,
+        "concurrency_weight": 1,
+        "latency_weight": 1,
+        "failure_weight": 2,
+    }
+    policy_row = await pool.fetchrow(
+        """
+        insert into public.routing_policies(name,enabled,policy) values($1,true,$2::jsonb)
+        on conflict(name) do update set enabled=true,policy=excluded.policy,updated_at=now()
+        returning id
+        """,
+        policy_name,
+        json.dumps(policy),
+    )
+    route_by_provider = {item.provider.casefold(): item for item in body.providers}
+    pools: dict[str, Any] = {}
+    for mapping in mappings:
+        provider_name = str(mapping["provider"])
+        provider_key = provider_name.casefold()
+        if provider_key in pools:
+            continue
+        pool_name = f"{model_id} / {provider_name} routing"
+        pool_row = await pool.fetchrow(
+            """
+            insert into public.provider_pools(name,model_id,enabled,strategy,settings)
+            values($1,$2,true,$3,$4::jsonb)
+            on conflict(name) do update set model_id=excluded.model_id,enabled=true,
+              strategy=excluded.strategy,settings=excluded.settings,updated_at=now()
+            returning id
+            """,
+            pool_name,
+            model_id,
+            body.strategy,
+            json.dumps(
+                {
+                    "health_aware": body.health_aware,
+                    "quota_aware": body.quota_aware,
+                }
+            ),
+        )
+        pools[provider_key] = pool_row["id"]
+        provider_mapping_ids = [
+            item["id"]
+            for item in mappings
+            if str(item["provider"]).casefold() == provider_key
+        ]
+        await pool.execute(
+            "delete from public.provider_pool_members where pool_id=$1",
+            pool_row["id"],
+        )
+        await pool.execute(
+            """
+            insert into public.provider_pool_members(
+              pool_id,provider_model_id,credential_id,priority,weight
+            )
+            select $1,pm.id,c.id,c.priority,pm.weight
+            from public.provider_models pm
+            join public.provider_credentials c on c.provider_id=pm.provider_id
+            where pm.id = any($2::uuid[]) and c.enabled
+              and exists (
+                select 1 from public.credential_model_access cma
+                where cma.credential_id=c.id and cma.provider_model_id=pm.id
+              )
+            """,
+            pool_row["id"],
+            provider_mapping_ids,
+        )
+    for mapping in mappings:
+        route = route_by_provider[str(mapping["provider"]).casefold()]
+        await pool.execute(
+            """
+            insert into public.model_routes(
+              model_id,provider_model_id,priority,enabled,
+              allow_model_fallback,policy_id,pool_id
+            )
+            values($1,$2,$3,true,false,$4,$5)
+            on conflict(model_id,provider_model_id) do update set priority=excluded.priority,
+              enabled=true,allow_model_fallback=false,policy_id=excluded.policy_id,
+              pool_id=coalesce(excluded.pool_id,model_routes.pool_id)
+            """,
+            model_id,
+            mapping["id"],
+            route.priority,
+            policy_row["id"],
+            pools[str(mapping["provider"]).casefold()],
+        )
+    await pool.execute(
+        """
+        update public.model_routes r set enabled=false
+        where r.model_id=$1 and not exists (
+          select 1 from public.provider_models pm join public.providers p on p.id=pm.provider_id
+          where pm.id=r.provider_model_id and p.name = any($2::text[])
+        )
+        """,
+        model_id,
+        names,
+    )
+    await _audit(
+        pool,
+        claims,
+        "model_routing_updated",
+        "model",
+        model_id,
+        {
+            "providers": names,
+            "strategy": body.strategy,
+            "health_aware": body.health_aware,
+            "quota_aware": body.quota_aware,
+        },
+    )
+    return JSONResponse(
+        {
+            "model_id": model_id,
+            "provider_count": len(names),
+            "strategy": body.strategy,
+        }
+    )
+
+
 @router.post("/routing-policies")
 async def create_routing_policy(request: Request, body: RoutingPolicyInput) -> JSONResponse:
     context = await _context(request)
@@ -1062,6 +1294,10 @@ async def _snapshot_payload(pool: Any) -> dict[str, Any]:
         pool_enabled = row.pop("pool_enabled", False)
         active_credentials = row.pop("active_pool_credential_ids", None)
         active_members = row.pop("active_pool_members", None)
+        if isinstance(active_members, str):
+            active_members = json.loads(active_members)
+        if isinstance(active_credentials, str):
+            active_credentials = json.loads(active_credentials)
         row["allowed_credential_ids"] = (
             None if pool_id is None else active_credentials if pool_enabled else []
         )
@@ -1115,12 +1351,16 @@ async def config_status(request: Request) -> JSONResponse:
     has_changes = published is None or published_checksum != working_checksum
     if published is not None and published_checksum != working_checksum:
         has_changes = working_projection != published_projection
+    changes = summarize_configuration_changes(published_payload, payload) if has_changes else []
+    change_limit = 100
     return JSONResponse(jsonable_encoder({
         "active_version": published["id"] if published else None,
         "active_checksum": published["checksum"] if published else None,
         "working_checksum": working_checksum,
         "has_unpublished_changes": has_changes,
         "changed_sections": changed_sections if has_changes else [],
+        "changes": changes[:change_limit],
+        "change_count": len(changes),
         "published_at": published["published_at"] if published else None,
     }))
 

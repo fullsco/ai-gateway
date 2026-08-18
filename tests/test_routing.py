@@ -64,6 +64,23 @@ def test_prefers_route_and_credential_priority_before_composite_score() -> None:
     assert decision.canonical_model_id == "model-x"
 
 
+def test_model_route_priority_beats_provider_priority() -> None:
+    engine = make_engine()
+    decision = engine.select(
+        make_request(),
+        [
+            ProviderState("provider-a", priority=100),
+            ProviderState("provider-b", priority=1),
+        ],
+        [
+            CredentialState("a", "provider-a"),
+            CredentialState("b", "provider-b"),
+        ],
+    )
+
+    assert decision.provider_model.provider_id == "provider-a"
+
+
 def test_composite_score_selects_healthier_key_with_equal_priority() -> None:
     decision = make_engine().select(
         make_request(),

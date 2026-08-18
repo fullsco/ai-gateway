@@ -9,7 +9,12 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from gateway.admin.auth import AdminClaims
-from gateway.admin.control_plane import ClientKeyInput, ProviderModelInput, _snapshot_payload
+from gateway.admin.control_plane import (
+    ClientKeyInput,
+    ModelRoutingInput,
+    ProviderModelInput,
+    _snapshot_payload,
+)
 from gateway.app import create_app
 from gateway.auth import authenticate_key
 from gateway.config import Settings
@@ -25,6 +30,19 @@ from gateway.security import CredentialCipher, EncryptedCredential, GatewayKeyHa
 def test_client_key_expiry_must_be_in_the_future() -> None:
     with pytest.raises(ValidationError, match="expires_at must be in the future"):
         ClientKeyInput(expires_at=datetime(2020, 1, 1, tzinfo=UTC))
+
+
+def test_model_routing_requires_one_primary_and_unique_providers() -> None:
+    with pytest.raises(ValidationError, match="at least one primary provider"):
+        ModelRoutingInput(providers=[{"provider": "GoRouter", "fallback": True}])
+
+    with pytest.raises(ValidationError, match="providers must be unique"):
+        ModelRoutingInput(
+            providers=[
+                {"provider": "AgentRouter"},
+                {"provider": "agentr ou ter".replace(" ", "")},
+            ]
+        )
 
 
 class AdminVerifier:
@@ -113,6 +131,35 @@ class SnapshotPool(FakePool):
         return await super().fetch(query, *args)
 
 
+class RequestDetailPool(FakePool):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempt_query = ""
+
+    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
+        if "from public.request_logs where id=$1" in query:
+            return {
+                "id": "request-1",
+                "requested_model": "claude-opus-5",
+                "status": "succeeded",
+            }
+        return await super().fetchrow(query, *args)
+
+    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        if "from public.request_attempts a" in query:
+            self.attempt_query = query
+            return [{
+                "id": "attempt-1",
+                "attempt_number": 1,
+                "provider_name": "AgentRouter",
+                "credential_name": "Primary",
+                "status": "succeeded",
+            }]
+        if "from public.usage_records where request_id=$1" in query:
+            return []
+        return []
+
+
 def settings() -> Settings:
     return Settings(
         environment="test",
@@ -189,6 +236,43 @@ async def test_snapshot_decodes_provider_model_pricing_json() -> None:
     provider_model_query = pool.fetch_queries[-1]
     assert "ppm.enabled and not ppm.draining" in provider_model_query
     assert "left join public.provider_pools" in provider_model_query
+
+
+@pytest.mark.asyncio
+async def test_snapshot_decodes_pool_members_json_from_asyncpg() -> None:
+    pool = SnapshotPool()
+    pool.fetch_results = [
+        [], [], [], [], [], [],
+        [{
+            "id": "mapping-1",
+            "route_id": "route-1",
+            "canonical_model_id": "model-1",
+            "provider_id": "provider-1",
+            "upstream_model_id": "upstream-1",
+            "protocol": "anthropic_messages",
+            "capabilities": [],
+            "priority": 1,
+            "weight": 1,
+            "max_concurrency": 8,
+            "pricing": "{}",
+            "allow_model_fallback": False,
+            "pool_id": "pool-1",
+            "pool_enabled": True,
+            "active_pool_credential_ids": ["credential-active"],
+            "active_pool_members": '{"credential-active": {"priority": 1, "weight": 2}}',
+            "pool_strategy": "priority",
+            "enabled": True,
+            "routing_policy": None,
+        }],
+    ]
+
+    payload = await _snapshot_payload(pool)
+
+    members = payload["provider_models"][0]["pool_members"]
+    # Regression: jsonb_object_agg returns a JSON string that must be decoded to a dict,
+    # otherwise RuntimeSnapshot validation (config/status and publish) fails.
+    assert isinstance(members, dict)
+    assert members == {"credential-active": {"priority": 1, "weight": 2}}
 
 
 @pytest.mark.asyncio
@@ -298,6 +382,59 @@ def test_analytics_separates_currency_and_uses_immutable_attribution() -> None:
     assert payload["usage_by_route"][0]["route"] == "route-1"
     attribution_queries = [query for query, _ in pool.fetchrow_calls]
     assert all("sum(estimated_cost)" not in query for query in attribution_queries)
+
+
+def test_request_detail_includes_operator_facing_attempt_names() -> None:
+    pool = RequestDetailPool()
+    test_settings = settings().model_copy(update={"database_url": None})
+
+    with TestClient(
+        create_app(test_settings, admin_verifier=AdminVerifier(), db_pool=pool),
+        raise_server_exceptions=False,
+    ) as test_client:
+        response = test_client.get("/api/admin/v1/requests/request-1", headers=auth())
+
+    assert response.status_code == 200
+    assert response.json()["attempts"][0]["provider_name"] == "AgentRouter"
+    assert response.json()["attempts"][0]["credential_name"] == "Primary"
+    assert "left join public.providers" in pool.attempt_query
+    assert "left join public.provider_credentials" in pool.attempt_query
+
+
+class AuditPool(FakePool):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fetch_query = ""
+
+    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        self.fetch_query = query
+        return [
+            {
+                "id": 1,
+                "action": "model_routing_updated",
+                "resource_type": "model",
+                "resource_id": "claude-opus-5",
+                "resource_name": "Claude Opus 5",
+                "metadata": {"providers": ["AgentRouter"]},
+            }
+        ]
+
+
+def test_audit_resolves_human_readable_resource_names() -> None:
+    pool = AuditPool()
+    test_settings = settings().model_copy(update={"database_url": None})
+
+    with TestClient(
+        create_app(test_settings, admin_verifier=AdminVerifier(), db_pool=pool),
+        raise_server_exceptions=False,
+    ) as test_client:
+        response = test_client.get("/api/admin/v1/audit", headers=auth())
+
+    assert response.status_code == 200
+    assert response.json()["data"][0]["resource_name"] == "Claude Opus 5"
+    assert "as resource_name" in pool.fetch_query
+    assert "left join public.provider_models pm" in pool.fetch_query
+    assert "'(no longer present)'" in pool.fetch_query
 
 
 def test_control_plane_mutations_require_authentication() -> None:

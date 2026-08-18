@@ -125,16 +125,25 @@ async def models(request: Request) -> JSONResponse:
         request,
         """
          select m.id, m.display_name, m.enabled, m.capabilities, m.context_window,
-                m.created_at, m.updated_at,
+                 m.created_at, m.updated_at,
                 coalesce(
                   array_agg(distinct a.alias order by a.alias)
                     filter (where a.alias is not null), '{}'
                 ) as aliases,
-               count(distinct pm.id) as provider_route_count
-        from public.models m
-        left join public.model_aliases a on a.model_id = m.id
-        left join public.provider_models pm on pm.model_id = m.id and pm.enabled
-        group by m.id
+                count(distinct pm.id) as provider_route_count,
+                coalesce(
+                  array_agg(distinct p.name order by p.name)
+                    filter (where pm.enabled and p.enabled), '{}'
+                ) as available_through,
+                coalesce(
+                  array_agg(distinct pm.protocol order by pm.protocol)
+                    filter (where pm.enabled and p.enabled), '{}'
+                ) as protocols
+         from public.models m
+         left join public.model_aliases a on a.model_id = m.id
+         left join public.provider_models pm on pm.model_id = m.id and pm.enabled
+         left join public.providers p on p.id = pm.provider_id
+         group by m.id
         order by m.id
         """,
     )
@@ -283,10 +292,14 @@ async def request_detail(request_id: str, request: Request) -> JSONResponse:
         return JSONResponse({"error": "request_not_found"}, status_code=404)
     attempts = await pool.fetch(
         """
-        select id, attempt_number, provider_id, credential_id, provider_model_id,
-               status, upstream_status, error_category, response_committed,
-               started_at, ended_at, latency_ms
-        from public.request_attempts where request_id=$1 order by attempt_number
+        select a.id, a.attempt_number, a.provider_id, p.name as provider_name,
+               a.credential_id, c.name as credential_name, a.provider_model_id,
+               a.status, a.upstream_status, a.error_category, a.response_committed,
+               a.started_at, a.ended_at, a.latency_ms
+        from public.request_attempts a
+        left join public.providers p on p.id=a.provider_id
+        left join public.provider_credentials c on c.id=a.credential_id
+        where a.request_id=$1 order by a.attempt_number
         """,
         request_id,
     )
@@ -327,7 +340,13 @@ async def health(request: Request, limit: int = Query(default=50, ge=1, le=200))
         """
          select h.id, h.provider_id, p.name as provider_name,
                  h.credential_id, c.name as credential_name, h.status, h.latency_ms,
-                 h.error_category, h.checked_at, h.source
+                 h.error_category,
+                 case
+                   when h.status in ('healthy','degraded') then 'Evaluated at request time'
+                   when h.status in ('rate_limited','cooldown') then 'Temporarily unavailable'
+                   else 'Not eligible in this state'
+                 end as routing_eligibility,
+                 h.checked_at
          from public.health_checks h
          left join public.providers p on p.id = h.provider_id
          left join public.provider_credentials c on c.id = h.credential_id
@@ -343,9 +362,43 @@ async def audit(request: Request, limit: int = Query(default=50, ge=1, le=200)) 
     return await _list_query(
         request,
         """
-        select id, actor_id, action, resource_type, resource_id, metadata, created_at
-        from public.audit_logs
-        order by created_at desc
+        select a.id, a.actor_id, a.action, a.resource_type, a.resource_id,
+               a.metadata, a.created_at,
+               coalesce(
+                 case a.resource_type
+                   when 'provider' then p.name
+                   when 'credential' then cr.name
+                   when 'client' then cl.name
+                   when 'client_key' then k.key_prefix
+                   when 'model' then coalesce(m.display_name, a.resource_id)
+                   when 'provider_model' then pm.model_id || ' via ' || pmp.name
+                   when 'model_route' then mrpm.model_id || ' via ' || mrp.name
+                   when 'routing_policy' then rp.name
+                   when 'config_version' then 'Snapshot ' || a.resource_id
+                 end,
+                 '(no longer present)'
+               ) as resource_name
+        from public.audit_logs a
+        left join public.providers p
+          on a.resource_type = 'provider' and p.id::text = a.resource_id
+        left join public.provider_credentials cr
+          on a.resource_type = 'credential' and cr.id::text = a.resource_id
+        left join public.gateway_clients cl
+          on a.resource_type = 'client' and cl.id::text = a.resource_id
+        left join public.gateway_client_keys k
+          on a.resource_type = 'client_key' and k.id::text = a.resource_id
+        left join public.models m
+          on a.resource_type = 'model' and m.id = a.resource_id
+        left join public.provider_models pm
+          on a.resource_type = 'provider_model' and pm.id::text = a.resource_id
+        left join public.providers pmp on pmp.id = pm.provider_id
+        left join public.model_routes mr
+          on a.resource_type = 'model_route' and mr.id::text = a.resource_id
+        left join public.provider_models mrpm on mrpm.id = mr.provider_model_id
+        left join public.providers mrp on mrp.id = mrpm.provider_id
+        left join public.routing_policies rp
+          on a.resource_type = 'routing_policy' and rp.id::text = a.resource_id
+        order by a.created_at desc
         limit $1
         """,
         limit,
