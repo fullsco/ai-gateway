@@ -4,7 +4,9 @@ from gateway.providers.base import (
     ProviderAdapter,
     ProviderConfig,
     ProviderError,
+    RetryScope,
     UpstreamRequest,
+    build_provider_error,
 )
 
 __all__ = [
@@ -13,5 +15,7 @@ __all__ = [
     "ProviderAdapter",
     "ProviderConfig",
     "ProviderError",
+    "RetryScope",
     "UpstreamRequest",
+    "build_provider_error",
 ]

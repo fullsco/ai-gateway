@@ -16,6 +16,7 @@ from gateway.configuration import (
     configuration_projection,
     legacy_checksum,
     legacy_configuration_checksum,
+    stranded_models,
     summarize_configuration_changes,
 )
 from gateway.configuration.runtime_builder import RuntimeSnapshot
@@ -330,20 +331,108 @@ async def update_provider(
     return JSONResponse(jsonable_encoder(dict(row)))
 
 
+# Models that would be left with no enabled route once $1 is deleted.
+_STRANDED_BY_PROVIDER_DELETE = """
+select distinct pm.model_id
+from public.provider_models pm
+join public.model_routes r
+  on r.provider_model_id = pm.id and r.model_id = pm.model_id
+join public.models m on m.id = pm.model_id
+where pm.provider_id = $1 and pm.enabled and r.enabled and m.enabled
+  and not exists (
+    select 1
+    from public.provider_models pm2
+    join public.model_routes r2
+      on r2.provider_model_id = pm2.id and r2.model_id = pm2.model_id
+    join public.providers p2 on p2.id = pm2.provider_id
+    where pm2.model_id = pm.model_id and pm2.provider_id <> $1
+      and pm2.enabled and r2.enabled and p2.enabled
+      and exists (
+        select 1 from public.provider_credentials c
+        where c.provider_id = pm2.provider_id and c.enabled
+      )
+  )
+"""
+
 @router.delete("/providers/{provider_id}")
-async def delete_provider(provider_id: str, request: Request) -> JSONResponse:
+async def delete_provider(
+    provider_id: str, request: Request, cascade: bool = Query(default=False)
+) -> JSONResponse:
+    """Delete a provider, refusing to silently cascade away active routing.
+
+    provider_credentials, provider_models and (transitively) model_routes are all
+    ON DELETE CASCADE, so an unguarded delete can strand a model with no route.
+    """
     context = await _context(request)
     if isinstance(context, JSONResponse):
         return context
     claims, pool = context
-    row = await pool.fetchrow(
-        "delete from public.providers where id=$1 returning id",
-        provider_id,
-    )
-    if row is None:
-        return _not_found("provider")
-    await _audit(pool, claims, "provider_deleted", "provider", provider_id)
-    return JSONResponse({"deleted": True})
+    async with pool.acquire() as connection, connection.transaction():
+        dependents = await connection.fetchrow(
+            """
+            select
+              (select count(*) from public.provider_credentials where provider_id=$1)
+                as credentials,
+              (select count(*) from public.provider_models where provider_id=$1)
+                as mappings,
+              (select count(*) from public.model_routes r
+                 join public.provider_models pm on pm.id=r.provider_model_id
+                where pm.provider_id=$1) as routes,
+              (select count(*) from public.model_routes r
+                 join public.provider_models pm on pm.id=r.provider_model_id
+                where pm.provider_id=$1 and r.enabled and pm.enabled) as enabled_routes
+            """,
+            provider_id,
+        )
+        stranded = [
+            row["model_id"]
+            for row in await connection.fetch(_STRANDED_BY_PROVIDER_DELETE, provider_id)
+        ]
+        if not cascade and (
+            stranded
+            or dependents["credentials"]
+            or dependents["mappings"]
+            or dependents["routes"]
+        ):
+            return JSONResponse(
+                {
+                    "error": "provider_has_dependents",
+                    "message": (
+                        "Deleting this provider would also remove configuration that "
+                        "active models depend on. Disable the provider instead, or "
+                        "repeat the request with cascade=true to confirm."
+                    ),
+                    "dependents": {
+                        "credentials": dependents["credentials"],
+                        "mappings": dependents["mappings"],
+                        "routes": dependents["routes"],
+                        "enabled_routes": dependents["enabled_routes"],
+                    },
+                    "would_strand_models": stranded,
+                },
+                status_code=409,
+            )
+        row = await connection.fetchrow(
+            "delete from public.providers where id=$1 returning id",
+            provider_id,
+        )
+        if row is None:
+            return _not_found("provider")
+        await _audit(
+            connection,
+            claims,
+            "provider_deleted",
+            "provider",
+            provider_id,
+            {
+                "cascade": cascade,
+                "removed_credentials": dependents["credentials"],
+                "removed_mappings": dependents["mappings"],
+                "removed_routes": dependents["routes"],
+                "stranded_models": stranded,
+            },
+        )
+    return JSONResponse({"deleted": True, "stranded_models": stranded})
 
 
 @router.post("/credentials")
@@ -1390,6 +1479,19 @@ async def publish_config(request: Request) -> JSONResponse:
                 {"error": "configuration_validation_failed", "details": errors},
                 status_code=422,
             )
+        stranded = stranded_models(payload)
+        if stranded:
+            return JSONResponse(
+                {
+                    "error": "publish_would_strand_models",
+                    "message": (
+                        "These enabled models would have no usable route or no "
+                        "eligible credential in the published configuration."
+                    ),
+                    "models": stranded,
+                },
+                status_code=409,
+            )
         checksum = configuration_checksum(payload)
         await connection.execute(
             "update public.config_versions set status='superseded' where status='published'"
@@ -1467,6 +1569,19 @@ async def rollback_config(version: int, request: Request) -> JSONResponse:
                     ],
                 },
                 status_code=422,
+            )
+        stranded = stranded_models(payload)
+        if stranded:
+            return JSONResponse(
+                {
+                    "error": "rollback_would_strand_models",
+                    "message": (
+                        "These enabled models would have no usable route or no "
+                        "eligible credential in the restored configuration."
+                    ),
+                    "models": stranded,
+                },
+                status_code=409,
             )
         checksum = configuration_checksum(payload)
         if selected["checksum"] not in {

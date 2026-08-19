@@ -387,8 +387,10 @@ def make_multi_credential_runtime(handler):
         routing_engine=RoutingEngine(registry),
         provider_states=(ProviderState("provider-a"),),
         credential_states=(
-            CredentialState("credential-a", "provider-a"),
-            CredentialState("credential-b", "provider-a"),
+            # Explicit priorities: credential-a is the primary, so the failover
+            # order is deterministic and operator intent is preserved.
+            CredentialState("credential-a", "provider-a", priority=10),
+            CredentialState("credential-b", "provider-a", priority=20),
         ),
         provider_model_adapters={"provider-model-x": adapter},
         credentials={

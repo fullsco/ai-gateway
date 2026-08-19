@@ -26,12 +26,29 @@ from gateway.configuration import (
 from gateway.context import get_request_id
 from gateway.health.limits import HealthProbeLimiter, ProbeLimitConfig
 from gateway.health.probes import health_probe_loop
+from gateway.health.usage import usage_poll_loop
 from gateway.logging import configure_logging, log_event
 from gateway.middleware import RequestContextMiddleware
 from gateway.observability import PassiveHealthRecorder
+from gateway.routing.live_state import LiveOperationalState, QuotaPolicy
 from gateway.runtime import GatewayRuntime
 
 logger = logging.getLogger("gateway.lifecycle")
+
+
+async def _refresh_live_state(interval: float, live_state: LiveOperationalState) -> None:
+    """Keep dynamic operational state fresh without touching configuration."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await live_state.refresh()
+        except Exception as exc:  # pragma: no cover - defensive
+            log_event(
+                logger,
+                logging.WARNING,
+                "live_state_refresh_failed",
+                error_type=type(exc).__name__,
+            )
 
 
 async def _refresh_runtime(app: FastAPI, manager: RuntimeManager) -> None:
@@ -69,6 +86,8 @@ def create_app(
         health_recorder = None
         health_probe_limiter = None
         probe_task = None
+        live_state_task = None
+        usage_task = None
         if app_settings.database_url:
             try:
                 if not app_settings.credential_encryption_key or not app_settings.key_pepper:
@@ -126,6 +145,30 @@ def create_app(
                 ),
             )
             app.state.health_probe_limiter = health_probe_limiter
+        live_state = LiveOperationalState(
+            getattr(app.state, "db_pool", None),
+            quota_policy=QuotaPolicy(
+                soft_threshold=app_settings.quota_soft_threshold,
+                hard_threshold=app_settings.quota_hard_threshold,
+            ),
+        )
+        app.state.live_state = live_state
+        if getattr(app.state, "db_pool", None) is not None:
+            await live_state.refresh()
+            live_state_task = asyncio.create_task(
+                _refresh_live_state(app_settings.live_state_refresh_seconds, live_state)
+            )
+        if (
+            app_settings.credential_usage_poll_enabled
+            and getattr(app.state, "db_pool", None) is not None
+        ):
+            usage_task = asyncio.create_task(
+                usage_poll_loop(
+                    app_settings.credential_usage_poll_interval_seconds,
+                    lambda: getattr(app.state, "db_pool", None),
+                    app_settings.credential_encryption_key,
+                )
+            )
         if app_settings.health_probe_enabled:
             probe_task = asyncio.create_task(
                 health_probe_loop(
@@ -152,6 +195,14 @@ def create_app(
                 probe_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await probe_task
+            if live_state_task is not None:
+                live_state_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await live_state_task
+            if usage_task is not None:
+                usage_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await usage_task
             if health_recorder is not None:
                 await health_recorder.close()
             if manager is not None:
@@ -173,6 +224,12 @@ def create_app(
     app.state.db_pool = db_pool
     app.state.admin_verifier = admin_verifier
     app.state.health_recorder = None
+    app.state.live_state = LiveOperationalState(
+        quota_policy=QuotaPolicy(
+            soft_threshold=app_settings.quota_soft_threshold,
+            hard_threshold=app_settings.quota_hard_threshold,
+        )
+    )
     app.state.ready = False
     app.add_middleware(RequestContextMiddleware, settings=app_settings)
 

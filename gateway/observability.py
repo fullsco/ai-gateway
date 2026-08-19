@@ -295,6 +295,16 @@ class RequestRecorder:
             error_category,
         )
 
+    async def record_routing_trace(self, traces: list[dict[str, Any]]) -> None:
+        """Persist why each candidate was considered, excluded, or selected."""
+        if not traces:
+            return
+        await self._execute(
+            "update public.request_logs set routing_trace=$2::jsonb where id=$1",
+            self.request_id,
+            json.dumps(traces, default=str),
+        )
+
     async def record_usage(
         self,
         attempt_id: int | None,

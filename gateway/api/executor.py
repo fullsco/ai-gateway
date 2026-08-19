@@ -23,7 +23,7 @@ from gateway.observability import (
     estimate_cost,
 )
 from gateway.protocols import ClientProtocol, NormalizedRequest
-from gateway.providers import ErrorCategory, ProviderError
+from gateway.providers import ErrorCategory, ProviderError, build_provider_error
 from gateway.quotas import (
     BudgetExceeded,
     ProviderQuotaExceeded,
@@ -37,7 +37,8 @@ from gateway.quotas import (
 )
 from gateway.routing import AttemptCoordinator, AttemptPolicy
 from gateway.routing.controls import ConcurrencyLease
-from gateway.routing.engine import NoRouteAvailable
+from gateway.routing.engine import NoRouteAvailable, RoutingTrace
+from gateway.routing.live_state import LiveOperationalState
 from gateway.runtime import GatewayRuntime
 
 logger = logging.getLogger("gateway.executor")
@@ -53,6 +54,7 @@ async def execute_request(
     key_id: str | None = None,
     db_pool=None,
     health_recorder: PassiveHealthRecorder | None = None,
+    live_state: LiveOperationalState | None = None,
 ) -> Response:
     started_at = datetime.now(UTC)
     deadline = started_at + timedelta(seconds=settings.request_timeout_seconds)
@@ -108,17 +110,41 @@ async def execute_request(
     excluded_routes: frozenset[str] = frozenset()
     last_error: ProviderError | None = None
 
+    traces: list[dict] = []
     while attempts < coordinator.policy.max_attempts:
+        # Configuration comes from the published snapshot; health, cooldown, quota,
+        # rate headroom and latency come from live runtime state so a failing
+        # credential is avoided immediately, without publishing a new snapshot.
+        if live_state is not None:
+            provider_states, credential_states, diagnostics = live_state.overlay(
+                runtime.provider_states, runtime.credential_states
+            )
+        else:
+            provider_states = list(runtime.provider_states)
+            credential_states = list(runtime.credential_states)
+            diagnostics = {}
+        trace = RoutingTrace(attempt_number=attempts + 1)
+        if attempts:
+            trace.is_fallback = True
+            trace.fallback_reason = (
+                last_error.category.value if last_error is not None else "retry"
+            )
         try:
             route = runtime.routing_engine.select(
                 normalized,
-                list(runtime.provider_states),
-                list(runtime.credential_states),
+                provider_states,
+                credential_states,
                 excluded_credential_ids=excluded,
                 excluded_provider_model_ids=excluded_routes,
+                trace=trace,
+                diagnostics=diagnostics,
             )
-        except (LookupError, NoRouteAvailable):
+        except (LookupError, NoRouteAvailable) as exc:
+            trace.selected = None
+            trace.fallback_reason = trace.fallback_reason or type(exc).__name__
+            traces.append(trace.as_dict())
             break
+        traces.append(trace.as_dict())
         if not route.provider_model.allow_model_fallback:
             excluded_routes = excluded_routes | {
                 candidate.id
@@ -139,10 +165,9 @@ async def execute_request(
         )
         if lease is None:
             await runtime.route_controls.abandon(route.provider_model.id)
-            last_error = ProviderError(
-                category=ErrorCategory.PROVIDER_UNAVAILABLE,
-                message="The selected provider route is at its concurrency limit.",
-                retryable=True,
+            last_error = build_provider_error(
+                ErrorCategory.PROVIDER_UNAVAILABLE,
+                "The selected provider route is at its concurrency limit.",
             )
             excluded_routes = excluded_routes | {route.provider_model.id}
             if not settings.failover_enabled or datetime.now(UTC) >= deadline:
@@ -198,11 +223,7 @@ async def execute_request(
                     metadata={"reason": str(exc)},
                 ),
             )
-            last_error = ProviderError(
-                category=ErrorCategory.QUOTA_EXHAUSTED,
-                message=str(exc),
-                retryable=True,
-            )
+            last_error = build_provider_error(ErrorCategory.QUOTA_EXHAUSTED, str(exc))
             if isinstance(exc, BudgetExceeded):
                 excluded_routes = excluded_routes | {route.provider_model.id}
             else:
@@ -313,10 +334,9 @@ async def execute_request(
                         )
                     )
                 except StopAsyncIteration:
-                    last_error = ProviderError(
-                        category=ErrorCategory.PROVIDER_UNAVAILABLE,
-                        message="The upstream provider closed the stream before sending data.",
-                        retryable=True,
+                    last_error = build_provider_error(
+                        ErrorCategory.PROVIDER_UNAVAILABLE,
+                        "The upstream provider closed the stream before sending data.",
                     )
                     await _close_response(response)
                     response = None
@@ -346,6 +366,15 @@ async def execute_request(
                             attempt_number=attempts,
                             attribution=attribution,
                         )
+                        if live_state is not None:
+                            live_state.record_attempt(
+                                provider_id=route.provider_model.provider_id,
+                                credential_id=route.credential.credential_id,
+                                succeeded=True,
+                                latency_ms=_latency_ms(
+                                    attempt_started_at, datetime.now(UTC)
+                                ),
+                            )
                         return StreamingResponse(
                             _stream_response(
                                 first_chunk,
@@ -370,6 +399,13 @@ async def execute_request(
                     await runtime.route_controls.record_success(route.provider_model.id)
                     ended_at = datetime.now(UTC)
                     latency_ms = _latency_ms(attempt_started_at, ended_at)
+                    if live_state is not None:
+                        live_state.record_attempt(
+                            provider_id=route.provider_model.provider_id,
+                            credential_id=route.credential.credential_id,
+                            succeeded=True,
+                            latency_ms=latency_ms,
+                        )
                     _submit_health(
                         health_recorder,
                         recorder,
@@ -403,6 +439,7 @@ async def execute_request(
                         retry_count=attempts - 1,
                         fallback_count=fallback_count,
                     )
+                    await recorder.record_routing_trace(traces)
                     return Response(content, status_code=status_code, headers=headers)
         except (TimeoutError, httpx.TransportError) as exc:
             last_error = _transport_error(exc)
@@ -438,10 +475,9 @@ async def execute_request(
             )
             raise
         except Exception as exc:
-            last_error = ProviderError(
-                category=ErrorCategory.PROVIDER_UNAVAILABLE,
-                message="The gateway failed while dispatching to the upstream provider.",
-                retryable=True,
+            last_error = build_provider_error(
+                ErrorCategory.PROVIDER_UNAVAILABLE,
+                "The gateway failed while dispatching to the upstream provider.",
             )
             log_event(
                 logger,
@@ -481,6 +517,24 @@ async def execute_request(
             )
         lease.release()
 
+        # Feed the outcome back into live state immediately so the very next
+        # selection (this request's retry, and every later request) already
+        # reflects it. No configuration publish is involved.
+        if live_state is not None:
+            live_state.record_attempt(
+                provider_id=route.provider_model.provider_id,
+                credential_id=route.credential.credential_id,
+                succeeded=last_error is None,
+                error_category=last_error.category.value if last_error else None,
+                latency_ms=_latency_ms(attempt_started_at, datetime.now(UTC)),
+                retry_after_seconds=last_error.retry_after_seconds if last_error else None,
+                credential_at_fault=last_error.credential_at_fault if last_error else True,
+            )
+
+        # Always retire the credential that just failed for this request. Provider
+        # level problems additionally penalise the provider's score via live state,
+        # so a sibling credential is still tried first and the configured provider
+        # fallback is used once this provider's pool is exhausted.
         excluded = excluded | {route.credential.credential_id}
         if (
             not settings.failover_enabled
@@ -506,6 +560,7 @@ async def execute_request(
             fallback_count=fallback_count,
             error_category=last_error.category.value,
         )
+        await recorder.record_routing_trace(traces)
         return gateway_error(last_error)
     ended_at = datetime.now(UTC)
     await recorder.finish_request(
@@ -522,15 +577,11 @@ async def execute_request(
 
 def _transport_error(exc: Exception) -> ProviderError:
     if isinstance(exc, httpx.TimeoutException):
-        return ProviderError(
-            category=ErrorCategory.TIMEOUT,
-            message="The upstream provider timed out.",
-            retryable=True,
+        return build_provider_error(
+            ErrorCategory.TIMEOUT, "The upstream provider timed out."
         )
-    return ProviderError(
-        category=ErrorCategory.PROVIDER_UNAVAILABLE,
-        message="The upstream provider is unavailable.",
-        retryable=True,
+    return build_provider_error(
+        ErrorCategory.PROVIDER_UNAVAILABLE, "The upstream provider is unavailable."
     )
 
 
@@ -550,10 +601,9 @@ def _valid_upstream_stream(response: httpx.Response, chunk: bytes) -> bool:
 
 
 def _unexpected_upstream_response(status_code: int) -> ProviderError:
-    return ProviderError(
-        category=ErrorCategory.UPSTREAM_WAF_REJECTION,
-        message="The upstream provider returned an unexpected response format.",
-        retryable=True,
+    return build_provider_error(
+        ErrorCategory.UPSTREAM_WAF_REJECTION,
+        "The upstream provider returned an unexpected response format.",
         upstream_status=status_code,
     )
 

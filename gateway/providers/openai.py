@@ -11,6 +11,7 @@ from gateway.providers.base import (
     ProviderConfig,
     ProviderError,
     UpstreamRequest,
+    build_provider_error,
 )
 
 ENDPOINTS = {
@@ -72,30 +73,27 @@ class OpenAICompatibleAdapter(ProviderAdapter):
 
         if response.status_code in {401, 403}:
             # The upstream rejected *this credential*, not the client's gateway key.
-            # Retryable so the executor excludes it and fails over to another
-            # credential; otherwise one blocked key takes the whole provider down.
-            category, retryable = ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR, True
+            category = ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR
         elif response.status_code in {402, 429} and any(
             marker in searchable for marker in QUOTA_MARKERS
         ):
-            category, retryable = ErrorCategory.QUOTA_EXHAUSTED, False
+            category = ErrorCategory.QUOTA_EXHAUSTED
         elif response.status_code == 429:
-            category, retryable = ErrorCategory.RATE_LIMIT, True
+            category = ErrorCategory.RATE_LIMIT
         elif response.status_code in {408, 504}:
-            category, retryable = ErrorCategory.TIMEOUT, True
+            category = ErrorCategory.TIMEOUT
         elif response.status_code >= 500:
-            category, retryable = ErrorCategory.PROVIDER_UNAVAILABLE, True
+            category = ErrorCategory.PROVIDER_UNAVAILABLE
         elif response.status_code == 404 and "model" in searchable:
-            category, retryable = ErrorCategory.MODEL_UNAVAILABLE, False
+            category = ErrorCategory.MODEL_UNAVAILABLE
         elif 400 <= response.status_code < 500:
-            category, retryable = ErrorCategory.INVALID_REQUEST, False
+            category = ErrorCategory.INVALID_REQUEST
         else:
-            category, retryable = ErrorCategory.INTERNAL_ERROR, False
+            category = ErrorCategory.INTERNAL_ERROR
 
-        return ProviderError(
-            category=category,
-            message=message,
-            retryable=retryable,
+        return build_provider_error(
+            category,
+            message,
             upstream_status=response.status_code,
             retry_after_seconds=retry_after,
         )

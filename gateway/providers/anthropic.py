@@ -12,6 +12,7 @@ from gateway.providers.base import (
     ProviderConfig,
     ProviderError,
     UpstreamRequest,
+    build_provider_error,
 )
 
 FORWARDED_HEADERS = {"anthropic-beta", "anthropic-version"}
@@ -93,41 +94,29 @@ class AnthropicCompatibleAdapter(ProviderAdapter):
 
         if response.status_code == 403 and self._is_waf_rejection(response):
             category = ErrorCategory.UPSTREAM_WAF_REJECTION
-            retryable = True
         elif response.status_code in {401, 403}:
             # The upstream rejected *this credential*, not the client's gateway key.
-            # Retryable so the executor excludes it and fails over to another
-            # credential; otherwise one blocked key takes the whole provider down.
             category = ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR
-            retryable = True
         elif response.status_code in {402, 429} and any(
             marker in searchable for marker in QUOTA_MARKERS
         ):
             category = ErrorCategory.QUOTA_EXHAUSTED
-            retryable = False
         elif response.status_code == 429:
             category = ErrorCategory.RATE_LIMIT
-            retryable = True
         elif response.status_code in {408, 504}:
             category = ErrorCategory.TIMEOUT
-            retryable = True
         elif response.status_code >= 500:
             category = ErrorCategory.PROVIDER_UNAVAILABLE
-            retryable = True
         elif response.status_code == 404 and "model" in searchable:
             category = ErrorCategory.MODEL_UNAVAILABLE
-            retryable = False
         elif 400 <= response.status_code < 500:
             category = ErrorCategory.INVALID_REQUEST
-            retryable = False
         else:
             category = ErrorCategory.INTERNAL_ERROR
-            retryable = False
 
-        return ProviderError(
-            category=category,
-            message=message,
-            retryable=retryable,
+        return build_provider_error(
+            category,
+            message,
             upstream_status=response.status_code,
             retry_after_seconds=retry_after,
         )

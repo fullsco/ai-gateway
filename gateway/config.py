@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     trust_incoming_request_id: bool = False
     database_url: str | None = None
     config_refresh_seconds: float = Field(default=5, gt=0)
+    # How often live operational state (health, cooldown, quota) is re-read from the
+    # database. In-process attempt outcomes apply immediately regardless of this.
+    live_state_refresh_seconds: float = Field(default=3, gt=0)
+    credential_usage_poll_enabled: bool = False
+    credential_usage_poll_interval_seconds: float = Field(default=900, gt=0)
+    quota_soft_threshold: float = Field(default=0.15, ge=0, le=1)
+    quota_hard_threshold: float = Field(default=0.02, ge=0, le=1)
     request_timeout_seconds: float = Field(default=600, gt=0)
     first_event_timeout_seconds: float = Field(default=60, gt=0)
     concurrency_acquire_timeout_seconds: float = Field(default=1, gt=0)

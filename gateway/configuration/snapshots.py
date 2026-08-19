@@ -427,3 +427,48 @@ class CachedConfiguration:
                         "Configuration refresh failed and no cached snapshot is available"
                     ) from exc
             return self.snapshot
+
+def stranded_models(payload: dict[str, Any]) -> list[str]:
+    """Enabled models that would have no usable route in this snapshot.
+
+    A model is usable when at least one enabled provider-model belongs to an
+    enabled provider and at least one enabled credential is permitted to serve it.
+    Deliberately ignores transient runtime health: a temporarily rate-limited
+    credential must not make a configuration unpublishable.
+    """
+    providers = {
+        str(provider.get("id")): provider
+        for provider in payload.get("providers") or []
+    }
+    credentials = [
+        credential
+        for credential in payload.get("credentials") or []
+        if credential.get("enabled")
+    ]
+    usable: set[str] = set()
+    for mapping in payload.get("provider_models") or []:
+        if not mapping.get("enabled"):
+            continue
+        provider = providers.get(str(mapping.get("provider_id")))
+        if provider is None or not provider.get("enabled"):
+            continue
+        allowed = mapping.get("allowed_credential_ids")
+        if allowed is not None and len(allowed) == 0:
+            # An empty pool means "no credential may serve this route".
+            continue
+        allowed_set = {str(item) for item in allowed} if allowed is not None else None
+        for credential in credentials:
+            if str(credential.get("provider_id")) != str(mapping.get("provider_id")):
+                continue
+            if allowed_set is not None and str(credential.get("id")) not in allowed_set:
+                continue
+            supported = credential.get("supported_provider_model_ids") or []
+            if supported and str(mapping.get("id")) not in {str(x) for x in supported}:
+                continue
+            usable.add(str(mapping.get("canonical_model_id")))
+            break
+    return sorted(
+        str(model.get("id"))
+        for model in payload.get("models") or []
+        if model.get("enabled") and str(model.get("id")) not in usable
+    )

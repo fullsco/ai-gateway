@@ -2,7 +2,7 @@ import httpx
 import pytest
 
 from gateway.protocols import Capability, ClientProtocol, normalize_request
-from gateway.providers import Credential, ErrorCategory, ProviderConfig
+from gateway.providers import Credential, ErrorCategory, ProviderConfig, RetryScope
 from gateway.providers.openai import OpenAICompatibleAdapter
 
 
@@ -90,7 +90,10 @@ def test_openai_quota_error_is_normalized() -> None:
     error = make_adapter().normalize_error(response)
 
     assert error.category is ErrorCategory.QUOTA_EXHAUSTED
-    assert error.retryable is False
+    # Quota is per-credential: a sibling key may still have budget, so the request
+    # fails over to another credential rather than failing outright.
+    assert error.retryable is True
+    assert error.retry_scope is RetryScope.CREDENTIAL
 
 
 def test_openai_upstream_authentication_error_is_distinct_from_client_auth() -> None:

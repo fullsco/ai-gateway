@@ -46,4 +46,5 @@ async def messages(request: Request) -> Response:
         key_id=authenticated.key_id,
         db_pool=getattr(request.app.state, "db_pool", None),
         health_recorder=getattr(request.app.state, "health_recorder", None),
+        live_state=getattr(request.app.state, "live_state", None),
     )
