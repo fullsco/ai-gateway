@@ -7,7 +7,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from gateway.admin.api import _authorize
 from gateway.admin.auth import AdminClaims
@@ -189,9 +189,35 @@ class RoutingPolicyInput(BaseModel):
 
 
 class HighLevelRouteInput(BaseModel):
-    provider: str = Field(min_length=1, max_length=120)
+    """A single routing target.
+
+    ``provider_id`` is the stable identity and is preferred. ``provider`` (a
+    display name) stays supported for older clients, and is matched
+    case-insensitively so it cannot silently fail to resolve.
+
+    ``provider_model_ids`` narrows the target to specific provider/model
+    mappings. A provider may expose one model under several protocols, so
+    omitting it means "every enabled mapping this provider has for the model".
+    """
+
+    provider: str | None = Field(default=None, min_length=1, max_length=120)
+    provider_id: str | None = Field(default=None, min_length=1, max_length=64)
+    provider_model_ids: list[str] | None = Field(default=None, min_length=1)
     priority: int = Field(default=100, ge=0)
     fallback: bool = False
+
+    @model_validator(mode="after")
+    def require_an_identifier(self) -> "HighLevelRouteInput":
+        if not self.provider and not self.provider_id:
+            raise ValueError("each routing target requires provider or provider_id")
+        return self
+
+    @property
+    def key(self) -> str:
+        """Stable dedupe key: identity when given, else the case-folded name."""
+        if self.provider_id:
+            return f"id:{self.provider_id}"
+        return f"name:{(self.provider or '').casefold()}"
 
 
 class ModelRoutingInput(BaseModel):
@@ -203,8 +229,8 @@ class ModelRoutingInput(BaseModel):
     @field_validator("providers")
     @classmethod
     def unique_providers(cls, values: list[HighLevelRouteInput]) -> list[HighLevelRouteInput]:
-        names = [value.provider.casefold() for value in values]
-        if len(names) != len(set(names)):
+        keys = [value.key for value in values]
+        if len(keys) != len(set(keys)):
             raise ValueError("providers must be unique")
         if not any(not value.fallback for value in values):
             raise ValueError("at least one primary provider is required")
@@ -1025,11 +1051,17 @@ async def model_routing(model_id: str, request: Request) -> JSONResponse:
         return _not_found("model")
     rows = await pool.fetch(
         """
-        select p.name as provider, p.health as provider_health,
+        select p.id::text as provider_id, p.name as provider, p.health as provider_health,
                p.enabled as provider_enabled,
                pm.id::text as provider_model_id, pm.upstream_model_id, pm.protocol,
                pm.capabilities, pm.enabled as mapping_enabled, r.priority,
                r.enabled as route_enabled,
+               -- Effective routing: a route through a disabled provider or mapping
+               -- carries no traffic, so it must not be presented as active. The
+               -- update endpoint only accepts enabled providers, so reporting it
+               -- as routed would produce a payload that cannot be saved back.
+               coalesce(r.enabled,false) and p.enabled and pm.enabled as route_active,
+               r.allow_model_fallback,
                r.pool_id::text as pool_id, count(c.id) as credential_count,
                count(c.id) filter (
                  where c.enabled and c.health in ('healthy','degraded')
@@ -1043,7 +1075,7 @@ async def model_routing(model_id: str, request: Request) -> JSONResponse:
         left join public.provider_pools pp on pp.id=r.pool_id
         left join public.provider_credentials c on c.provider_id=p.id
         where pm.model_id=$1
-        group by p.name,p.health,p.enabled,pm.id,r.id,pp.id
+        group by p.id,p.name,p.health,p.enabled,pm.id,r.id,pp.id
         order by coalesce(r.priority,100),p.name,pm.protocol
         """,
         model_id,
@@ -1066,20 +1098,35 @@ async def update_model_routing(
     model = await pool.fetchval("select 1 from public.models where id=$1", model_id)
     if model is None:
         return _not_found("model")
-    names = [item.provider for item in body.providers]
+    requested_ids = [item.provider_id for item in body.providers if item.provider_id]
+    requested_names = [item.provider for item in body.providers if item.provider]
     mappings = await pool.fetch(
         """
         select pm.id, pm.provider_id, p.name as provider, pm.protocol, pm.weight
         from public.provider_models pm
         join public.providers p on p.id=pm.provider_id
-        where pm.model_id=$1 and p.name = any($2::text[]) and p.enabled and pm.enabled
+        where pm.model_id=$1 and p.enabled and pm.enabled
+          and (p.id::text = any($2::text[]) or lower(p.name) = any($3::text[]))
         order by p.name, pm.protocol
         """,
         model_id,
-        names,
+        requested_ids,
+        [name.casefold() for name in requested_names],
     )
-    found = {str(row["provider"]).casefold() for row in mappings}
-    missing = [name for name in names if name.casefold() not in found]
+    # Resolve every target onto a provider id so nothing downstream depends on
+    # display names, which are free text and compared case-sensitively in SQL.
+    by_id = {str(row["provider_id"]): str(row["provider"]) for row in mappings}
+    by_name = {str(row["provider"]).casefold(): str(row["provider_id"]) for row in mappings}
+    resolved: dict[str, HighLevelRouteInput] = {}
+    missing: list[str] = []
+    for item in body.providers:
+        provider_id = item.provider_id if item.provider_id in by_id else None
+        if provider_id is None and item.provider:
+            provider_id = by_name.get(item.provider.casefold())
+        if provider_id is None:
+            missing.append(item.provider or item.provider_id or "")
+            continue
+        resolved[provider_id] = item
     if missing:
         return JSONResponse(
             {
@@ -1096,6 +1143,53 @@ async def update_model_routing(
             },
             status_code=422,
         )
+    # Honour explicit mapping selection, and reject ids that belong elsewhere so a
+    # stale dashboard cannot route a model through another provider's mapping.
+    selected: list[dict[str, Any]] = []
+    unknown_mappings: list[str] = []
+    for provider_id, item in resolved.items():
+        owned = [row for row in mappings if str(row["provider_id"]) == provider_id]
+        if item.provider_model_ids is None:
+            selected.extend(owned)
+            continue
+        allowed = {str(row["id"]) for row in owned}
+        unknown_mappings.extend(
+            mapping_id for mapping_id in item.provider_model_ids if mapping_id not in allowed
+        )
+        selected.extend(row for row in owned if str(row["id"]) in set(item.provider_model_ids))
+    if unknown_mappings:
+        return JSONResponse(
+            {
+                "error": "provider_model_not_available",
+                "details": [
+                    {
+                        "provider_model_id": mapping_id,
+                        "message": (
+                            "This provider/model mapping is not available for the "
+                            "selected provider."
+                        ),
+                    }
+                    for mapping_id in sorted(set(unknown_mappings))
+                ],
+            },
+            status_code=422,
+        )
+    mappings = selected
+    if not mappings:
+        # Unreachable through the validated input, but `provider_model_id <> all
+        # ('{}')` is vacuously true in PostgreSQL, so an empty selection would
+        # disable every route for the model. Fail closed instead.
+        return JSONResponse(
+            {
+                "error": "model_routing_would_remove_every_route",
+                "message": (
+                    "This change resolves to no provider mapping, which would leave "
+                    "the model with no route."
+                ),
+            },
+            status_code=422,
+        )
+    names = [by_id[provider_id] for provider_id in resolved]
     policy_name = f"Model {model_id} routing"
     policy = {
         "health_weight": 3 if body.health_aware else 0,
@@ -1114,88 +1208,44 @@ async def update_model_routing(
         policy_name,
         json.dumps(policy),
     )
-    route_by_provider = {item.provider.casefold(): item for item in body.providers}
-    pools: dict[str, Any] = {}
+    # Credential pools are deliberately NOT synthesised here.
+    #
+    # This endpoint expresses "which providers serve this model, in what order".
+    # Pool membership is a different, narrower concern -- which credentials may
+    # serve a route -- and it is owned by the explicit /provider-pools API where
+    # the operator supplies members directly.
+    #
+    # Deriving membership from credential_model_access instead silently narrows
+    # routing, because that table is sparsely populated: AgentRouter has 24
+    # enabled credentials but only one access row, so a derived pool cut the
+    # route from 24 usable credentials to 1 and destroyed credential failover.
+    # Where no access row exists at all the derived pool is empty, and an empty
+    # pool means "no credential may serve this route", stranding the model.
+    # Existing pool assignments are therefore preserved untouched.
     for mapping in mappings:
-        provider_name = str(mapping["provider"])
-        provider_key = provider_name.casefold()
-        if provider_key in pools:
-            continue
-        pool_name = f"{model_id} / {provider_name} routing"
-        pool_row = await pool.fetchrow(
-            """
-            insert into public.provider_pools(name,model_id,enabled,strategy,settings)
-            values($1,$2,true,$3,$4::jsonb)
-            on conflict(name) do update set model_id=excluded.model_id,enabled=true,
-              strategy=excluded.strategy,settings=excluded.settings,updated_at=now()
-            returning id
-            """,
-            pool_name,
-            model_id,
-            body.strategy,
-            json.dumps(
-                {
-                    "health_aware": body.health_aware,
-                    "quota_aware": body.quota_aware,
-                }
-            ),
-        )
-        pools[provider_key] = pool_row["id"]
-        provider_mapping_ids = [
-            item["id"]
-            for item in mappings
-            if str(item["provider"]).casefold() == provider_key
-        ]
-        await pool.execute(
-            "delete from public.provider_pool_members where pool_id=$1",
-            pool_row["id"],
-        )
-        await pool.execute(
-            """
-            insert into public.provider_pool_members(
-              pool_id,provider_model_id,credential_id,priority,weight
-            )
-            select $1,pm.id,c.id,c.priority,pm.weight
-            from public.provider_models pm
-            join public.provider_credentials c on c.provider_id=pm.provider_id
-            where pm.id = any($2::uuid[]) and c.enabled
-              and exists (
-                select 1 from public.credential_model_access cma
-                where cma.credential_id=c.id and cma.provider_model_id=pm.id
-              )
-            """,
-            pool_row["id"],
-            provider_mapping_ids,
-        )
-    for mapping in mappings:
-        route = route_by_provider[str(mapping["provider"]).casefold()]
+        route = resolved[str(mapping["provider_id"])]
         await pool.execute(
             """
             insert into public.model_routes(
               model_id,provider_model_id,priority,enabled,
               allow_model_fallback,policy_id,pool_id
             )
-            values($1,$2,$3,true,false,$4,$5)
+            values($1,$2,$3,true,false,$4,null)
             on conflict(model_id,provider_model_id) do update set priority=excluded.priority,
-              enabled=true,allow_model_fallback=false,policy_id=excluded.policy_id,
-              pool_id=coalesce(excluded.pool_id,model_routes.pool_id)
+              enabled=true,policy_id=excluded.policy_id
             """,
             model_id,
             mapping["id"],
             route.priority,
             policy_row["id"],
-            pools[str(mapping["provider"]).casefold()],
         )
     await pool.execute(
         """
         update public.model_routes r set enabled=false
-        where r.model_id=$1 and not exists (
-          select 1 from public.provider_models pm join public.providers p on p.id=pm.provider_id
-          where pm.id=r.provider_model_id and p.name = any($2::text[])
-        )
+        where r.model_id=$1 and r.provider_model_id <> all($2::uuid[])
         """,
         model_id,
-        names,
+        [item["id"] for item in mappings],
     )
     await _audit(
         pool,

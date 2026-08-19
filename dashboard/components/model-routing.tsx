@@ -5,29 +5,79 @@ import { useCallback, useEffect, useState } from "react";
 import { gatewayApi } from "./provider-setup";
 
 type Row = Record<string, unknown>;
-type RouteDraft = { provider: string; priority: number };
-type ProviderOption = { provider: string; enabled: boolean; routed: boolean; priority: number };
+type RouteDraft = {
+  provider: string;
+  providerId: string;
+  providerModelIds: string[];
+  priority: number;
+};
+type ProviderOption = {
+  provider: string;
+  providerId: string;
+  enabled: boolean;
+  routed: boolean;
+  priority: number;
+  /** Every enabled mapping this provider has for the model. */
+  mappingIds: string[];
+  /** The mappings that are currently carrying traffic. */
+  activeMappingIds: string[];
+};
 
 const text = (value: unknown, fallback = "") => String(value ?? fallback);
 
+/**
+ * A provider may expose the same model under several protocols, so one provider
+ * can own several provider/model mappings. Those mapping ids are carried through
+ * to the save payload; collapsing them and letting the server re-expand by name
+ * silently enabled routes the operator never selected.
+ */
 function optionsFromRouting(rows: Row[]): ProviderOption[] {
   const byProvider = new Map<string, ProviderOption>();
   rows.forEach((row) => {
     const provider = text(row.provider);
     if (!provider) return;
     const enabled = row.provider_enabled !== false && row.mapping_enabled !== false;
-    const routed = row.route_enabled === true;
+    // `route_active` already accounts for a disabled provider or mapping. Fall
+    // back to the raw flag for gateways that predate it.
+    const routed = row.route_active === undefined ? row.route_enabled === true : row.route_active === true;
     const priority = Number(row.priority ?? 100);
+    const mappingId = text(row.provider_model_id);
     const existing = byProvider.get(provider);
     if (!existing) {
-      byProvider.set(provider, { provider, enabled, routed, priority });
+      byProvider.set(provider, {
+        provider,
+        providerId: text(row.provider_id),
+        enabled,
+        routed,
+        priority,
+        mappingIds: enabled && mappingId ? [mappingId] : [],
+        activeMappingIds: routed && mappingId ? [mappingId] : [],
+      });
       return;
     }
     existing.enabled = existing.enabled || enabled;
     existing.routed = existing.routed || routed;
     existing.priority = Math.min(existing.priority, priority);
+    if (!existing.providerId) existing.providerId = text(row.provider_id);
+    if (enabled && mappingId && !existing.mappingIds.includes(mappingId)) {
+      existing.mappingIds.push(mappingId);
+    }
+    if (routed && mappingId && !existing.activeMappingIds.includes(mappingId)) {
+      existing.activeMappingIds.push(mappingId);
+    }
   });
   return [...byProvider.values()];
+}
+
+function draftFromOption(option: ProviderOption, priority: number): RouteDraft {
+  return {
+    provider: option.provider,
+    providerId: option.providerId,
+    // Keep serving exactly what is already routed; a newly added provider takes
+    // every mapping it has for the model.
+    providerModelIds: option.activeMappingIds.length ? option.activeMappingIds : option.mappingIds,
+    priority,
+  };
 }
 
 export default function ModelRouting({ onNotice }: { onNotice: (message: string, kind?: "success" | "error") => void }) {
@@ -64,7 +114,7 @@ export default function ModelRouting({ onNotice }: { onNotice: (message: string,
         derived
           .filter((option) => option.routed)
           .sort((a, b) => a.priority - b.priority)
-          .map((option, index) => ({ provider: option.provider, priority: index * 10 })),
+          .map((option, index) => draftFromOption(option, index * 10)),
       );
     } catch (reason) {
       onNotice(reason instanceof Error ? reason.message : "Unable to load model routing", "error");
@@ -81,7 +131,9 @@ export default function ModelRouting({ onNotice }: { onNotice: (message: string,
 
   function addProvider(provider: string) {
     if (!provider || routes.some((route) => route.provider === provider)) return;
-    setRoutes((current) => [...current, { provider, priority: current.length * 10 }]);
+    const option = options.find((candidate) => candidate.provider === provider);
+    if (!option) return;
+    setRoutes((current) => [...current, draftFromOption(option, current.length * 10)]);
   }
 
   function reindex(next: RouteDraft[]): RouteDraft[] {
@@ -103,7 +155,19 @@ export default function ModelRouting({ onNotice }: { onNotice: (message: string,
       await gatewayApi(`models/${encodeURIComponent(modelId)}/routing`, {
         method: "PUT",
         body: JSON.stringify({
-          providers: routes.map((route, index) => ({ provider: route.provider, priority: route.priority, fallback: index > 0 })),
+          providers: routes.map((route, index) => ({
+            // Prefer the stable identifier; provider names are free text and
+            // were previously matched case-sensitively in SQL, which silently
+            // disabled the very route being selected.
+            ...(route.providerId ? { provider_id: route.providerId } : { provider: route.provider }),
+            // Name the exact mappings so the server never expands a provider
+            // selection onto mappings the operator did not choose.
+            ...(route.providerModelIds.length
+              ? { provider_model_ids: route.providerModelIds }
+              : {}),
+            priority: route.priority,
+            fallback: index > 0,
+          })),
           strategy,
           health_aware: healthAware,
           quota_aware: quotaAware,

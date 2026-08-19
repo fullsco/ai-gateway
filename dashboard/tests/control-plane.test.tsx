@@ -93,6 +93,74 @@ describe("control plane", () => {
     expect(screen.getByRole("option", { name: "GoRouter" })).toBeInTheDocument();
   });
 
+  it("saves routing by provider identity and explicit mappings", async () => {
+    // One provider exposing the model under two protocols owns two mappings.
+    // Only the anthropic mapping is routed, so only that one may be sent back:
+    // sending the provider name alone let the gateway enable both.
+    const routing = {
+      model: { id: "model-1", display_name: "Model One", capabilities: ["streaming"] },
+      data: [
+        { provider: "AgentRouter", provider_id: "prov-1", provider_model_id: "map-anthropic", protocol: "anthropic_messages", route_enabled: true, route_active: true, priority: 0, provider_enabled: true, mapping_enabled: true },
+        { provider: "AgentRouter", provider_id: "prov-1", provider_model_id: "map-openai", protocol: "openai_chat_completions", route_enabled: false, route_active: false, priority: 100, provider_enabled: true, mapping_enabled: true },
+      ],
+    };
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.includes("/models/model-1/routing")) {
+        if (init?.method === "PUT") return response({ model_id: "model-1", provider_count: 1, strategy: "priority" });
+        return response(routing);
+      }
+      if (path.endsWith("/models")) return response({ data: [{ id: "model-1", display_name: "Model One", capabilities: ["streaming"] }] });
+      return response(overview);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ControlPlane />);
+    await userEvent.click(screen.getByRole("button", { name: "Models" }));
+    await userEvent.click(await screen.findByRole("button", { name: /Save working changes/i }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === "PUT")).toBe(true));
+    const put = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
+    const sent = JSON.parse(String((put?.[1] as RequestInit).body));
+    expect(sent.providers).toHaveLength(1);
+    expect(sent.providers[0].provider_id).toBe("prov-1");
+    expect(sent.providers[0].provider_model_ids).toEqual(["map-anthropic"]);
+    expect(sent.providers[0].provider).toBeUndefined();
+  });
+
+  it("does not present a route through a disabled provider as active", async () => {
+    // A route row can stay enabled while its provider is disabled. Reporting it
+    // as routed produced a payload the gateway rejected with 422, which blocked
+    // every save for the model.
+    const routing = {
+      model: { id: "model-1", display_name: "Model One", capabilities: [] },
+      data: [
+        { provider: "AgentRouter", provider_id: "prov-1", provider_model_id: "map-1", route_enabled: true, route_active: true, priority: 0, provider_enabled: true, mapping_enabled: true },
+        { provider: "TabiAi", provider_id: "prov-2", provider_model_id: "map-2", route_enabled: true, route_active: false, priority: 100, provider_enabled: false, mapping_enabled: true },
+      ],
+    };
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.includes("/models/model-1/routing")) {
+        if (init?.method === "PUT") return response({ model_id: "model-1", provider_count: 1, strategy: "priority" });
+        return response(routing);
+      }
+      if (path.endsWith("/models")) return response({ data: [{ id: "model-1", display_name: "Model One", capabilities: [] }] });
+      return response(overview);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ControlPlane />);
+    await userEvent.click(screen.getByRole("button", { name: "Models" }));
+    expect(await screen.findByText(/will try AgentRouter first/i)).toBeVisible();
+    // The disabled provider is neither routed nor offered for selection.
+    expect(screen.queryByText("TabiAi")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /Save working changes/i }));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === "PUT")).toBe(true));
+    const put = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === "PUT");
+    const sent = JSON.parse(String((put?.[1] as RequestInit).body));
+    expect(sent.providers.map((entry: { provider_id: string }) => entry.provider_id)).toEqual(["prov-1"]);
+  });
+
   it("shows a human-readable publish review before publishing", async () => {
     vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
       const path = String(input);
