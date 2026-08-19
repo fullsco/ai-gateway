@@ -346,3 +346,28 @@ async def test_probe_respects_empty_pool_credential_allowlist():
 
     assert contacted == 0
     assert summary["credentials_without_route"] == 1
+
+
+def test_probe_rejects_a_non_api_200_response() -> None:
+    """A parked or suspended domain answering 200 HTML must not read as healthy.
+
+    Regression test: probe success used to be decided purely by status < 400, so a
+    Cloudflare parking page that returns 200 on every path kept a provider that
+    cannot serve a single request marked healthy.
+    """
+    from gateway.health.probes import _looks_like_api_response
+
+    parked = httpx.Response(
+        200,
+        headers={"content-type": "text/html; charset=utf-8"},
+        content=b"<html><title>Cloudflare Registrar</title></html>",
+    )
+    assert _looks_like_api_response(parked) is False
+
+    real = httpx.Response(
+        200, headers={"content-type": "application/json"}, json={"data": []}
+    )
+    assert _looks_like_api_response(real) is True
+
+    streaming = httpx.Response(200, headers={"content-type": "text/event-stream"})
+    assert _looks_like_api_response(streaming) is True

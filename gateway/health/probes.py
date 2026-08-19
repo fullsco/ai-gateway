@@ -7,7 +7,7 @@ import httpx
 from gateway.health.limits import HealthProbeLimiter
 from gateway.logging import log_event
 from gateway.observability import PassiveHealthEvent, PassiveHealthRecorder
-from gateway.providers import ErrorCategory, ProviderError
+from gateway.providers import ErrorCategory, ProviderError, build_provider_error
 from gateway.runtime import GatewayRuntime
 
 logger = logging.getLogger("gateway.health.probes")
@@ -114,7 +114,16 @@ async def run_health_probes(
                 summary["contacted"] += 1
                 response = await runtime.http_client.send(request)
                 status = response.status_code
-                if status >= 400:
+                if status < 400 and not _looks_like_api_response(response):
+                    # A suspended/parked domain or an edge interstitial can answer
+                    # 200 to every path. Treating that as healthy is how a provider
+                    # that cannot serve a single request stays marked healthy.
+                    error = build_provider_error(
+                        ErrorCategory.UPSTREAM_WAF_REJECTION,
+                        "Health probe received a non-API response body.",
+                        upstream_status=status,
+                    )
+                elif status >= 400:
                     error = adapter.normalize_error(response)
                     # A synthetic probe cannot distinguish a provider's WAF
                     # challenge from credential rejection on HTTP 403. Keep
@@ -124,19 +133,17 @@ async def run_health_probes(
                         status == 403
                         and error.category is ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR
                     ):
-                        error = ProviderError(
-                            category=ErrorCategory.UPSTREAM_WAF_REJECTION,
-                            message="Health probe received an ambiguous upstream 403.",
-                            retryable=True,
+                        error = build_provider_error(
+                            ErrorCategory.UPSTREAM_WAF_REJECTION,
+                            "Health probe received an ambiguous upstream 403.",
                             upstream_status=status,
                         )
             except (TimeoutError, httpx.TransportError) as exc:
-                error = ProviderError(
-                    category=ErrorCategory.TIMEOUT
+                error = build_provider_error(
+                    ErrorCategory.TIMEOUT
                     if isinstance(exc, httpx.TimeoutException)
                     else ErrorCategory.PROVIDER_UNAVAILABLE,
-                    message="Health probe transport failure.",
-                    retryable=True,
+                    "Health probe transport failure.",
                 )
             except Exception as exc:
                 log_event(
@@ -231,3 +238,11 @@ async def health_probe_loop(
                     "health_probe_sweep_failed",
                     error_type=type(exc).__name__,
                 )
+
+
+def _looks_like_api_response(response: httpx.Response) -> bool:
+    """True when the body plausibly came from the provider API, not an edge page."""
+    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type == "text/event-stream":
+        return True
+    return content_type == "application/json" or content_type.endswith("+json")
