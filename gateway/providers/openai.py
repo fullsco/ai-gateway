@@ -71,7 +71,10 @@ class OpenAICompatibleAdapter(ProviderAdapter):
         retry_after = self._retry_after(response.headers.get("retry-after"))
 
         if response.status_code in {401, 403}:
-            category, retryable = ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR, False
+            # The upstream rejected *this credential*, not the client's gateway key.
+            # Retryable so the executor excludes it and fails over to another
+            # credential; otherwise one blocked key takes the whole provider down.
+            category, retryable = ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR, True
         elif response.status_code in {402, 429} and any(
             marker in searchable for marker in QUOTA_MARKERS
         ):

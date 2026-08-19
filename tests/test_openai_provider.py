@@ -99,4 +99,7 @@ def test_openai_upstream_authentication_error_is_distinct_from_client_auth() -> 
     error = make_adapter().normalize_error(response)
 
     assert error.category is ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR
-    assert error.retryable is False
+    assert error.category is not ErrorCategory.AUTHENTICATION_ERROR
+    # Retryable so a single upstream-blocked credential fails over to another
+    # credential instead of failing the whole request with 502.
+    assert error.retryable is True

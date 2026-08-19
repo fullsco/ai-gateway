@@ -113,7 +113,7 @@ def test_probe_requires_an_upstream_model() -> None:
             401,
             {"error": {"message": "bad key"}},
             ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR,
-            False,
+            True,
         ),
         (
             403,
@@ -131,7 +131,7 @@ def test_probe_requires_an_upstream_model() -> None:
             403,
             {"error": {"message": "credential rejected"}},
             ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR,
-            False,
+            True,
         ),
         (429, {"error": {"message": "rate limited"}}, ErrorCategory.RATE_LIMIT, True),
         (

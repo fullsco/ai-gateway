@@ -348,3 +348,114 @@ def test_upstream_authentication_failure_returns_bad_gateway() -> None:
 
     assert response.status_code == 502
     assert response.json()["error"]["type"] == "upstream_authentication_error"
+
+
+def make_multi_credential_runtime(handler):
+    """Runtime with two credentials on one provider, to exercise credential failover."""
+    hasher = GatewayKeyHasher(b"p" * 32)
+    issued = hasher.issue(key_id="key-1", client_id="client-1")
+    client = GatewayClient(
+        id="client-1",
+        name="test",
+        permissions=ClientPermissions(frozenset({ClientProtocol.ANTHROPIC_MESSAGES})),
+    )
+    store = InMemoryGatewayKeyStore([issued.record], [client])
+    capabilities = frozenset({Capability.STREAMING})
+    model = CanonicalModel("model-x", frozenset({"alias-x"}), capabilities)
+    provider_model = ProviderModel(
+        "provider-model-x",
+        "model-x",
+        "provider-a",
+        "upstream-x",
+        ClientProtocol.ANTHROPIC_MESSAGES,
+        capabilities,
+    )
+    registry = ModelRegistry([model], [provider_model])
+    adapter = AnthropicCompatibleAdapter(
+        ProviderConfig(
+            id="provider-a",
+            name="Provider A",
+            base_url="https://upstream.example",
+            protocol=ClientProtocol.ANTHROPIC_MESSAGES,
+            capabilities=capabilities,
+        )
+    )
+    runtime = GatewayRuntime(
+        key_store=store,
+        key_hasher=hasher,
+        model_registry=registry,
+        routing_engine=RoutingEngine(registry),
+        provider_states=(ProviderState("provider-a"),),
+        credential_states=(
+            CredentialState("credential-a", "provider-a"),
+            CredentialState("credential-b", "provider-a"),
+        ),
+        provider_model_adapters={"provider-model-x": adapter},
+        credentials={
+            "credential-a": Credential(id="credential-a", secret="blocked-key"),
+            "credential-b": Credential(id="credential-b", secret="good-key"),
+        },
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    return runtime, issued.plaintext
+
+
+def test_upstream_403_fails_over_to_another_credential() -> None:
+    """A single upstream-blocked credential must not take the whole provider down.
+
+    Regression test: upstream 401/403 used to be non-retryable, so the executor
+    stopped after one attempt and returned 502 Bad Gateway even when other healthy
+    credentials for the same provider were available.
+    """
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        key = request.headers.get("x-api-key") or request.headers.get("authorization", "")
+        seen.append(key)
+        if "blocked-key" in key:
+            return httpx.Response(403, json={"error": {"message": "credential rejected"}})
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            json={"content": [{"type": "text", "text": "ok"}]},
+        )
+
+    runtime, key = make_multi_credential_runtime(handler)
+    app = create_app(Settings(environment="test", _env_file=None), runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": key},
+            json={"model": "alias-x", "messages": []},
+        )
+
+    assert response.status_code == 200, response.text
+    assert len(seen) == 2, f"expected failover to a second credential, saw {seen}"
+    assert any("blocked-key" in k for k in seen)
+    assert any("good-key" in k for k in seen)
+
+
+def test_all_credentials_blocked_still_reports_upstream_auth_error() -> None:
+    """When every credential is rejected, the client gets a clear 502 (not a hang)."""
+
+    attempts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request.headers.get("x-api-key", ""))
+        return httpx.Response(403, json={"error": {"message": "credential rejected"}})
+
+    runtime, key = make_multi_credential_runtime(handler)
+    app = create_app(Settings(environment="test", _env_file=None), runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": key},
+            json={"model": "alias-x", "messages": []},
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "upstream_authentication_error"
+    # Both credentials tried, bounded by max_attempts.
+    assert len(attempts) == 2, attempts

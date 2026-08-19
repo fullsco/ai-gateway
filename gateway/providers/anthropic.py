@@ -95,8 +95,11 @@ class AnthropicCompatibleAdapter(ProviderAdapter):
             category = ErrorCategory.UPSTREAM_WAF_REJECTION
             retryable = True
         elif response.status_code in {401, 403}:
+            # The upstream rejected *this credential*, not the client's gateway key.
+            # Retryable so the executor excludes it and fails over to another
+            # credential; otherwise one blocked key takes the whole provider down.
             category = ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR
-            retryable = False
+            retryable = True
         elif response.status_code in {402, 429} and any(
             marker in searchable for marker in QUOTA_MARKERS
         ):
