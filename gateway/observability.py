@@ -449,10 +449,24 @@ def extract_usage(
     if not isinstance(usage, dict):
         return None
     if protocol is ClientProtocol.ANTHROPIC_MESSAGES:
+        # Anthropic reports input_tokens EXCLUDING cache reads and cache writes,
+        # while OpenAI reports a prompt total that INCLUDES cached tokens. Two
+        # conventions downstream meant a normal Anthropic cache hit looked
+        # invalid (cached greater than input) and the whole record was discarded,
+        # and it also understated input whenever caching was in use. Normalize to
+        # the inclusive convention here so one meaning holds everywhere: input is
+        # every billable input token, cached is the discountable part of it.
+        reported = _integer(usage.get("input_tokens"))
+        cache_read = _integer(usage.get("cache_read_input_tokens"))
+        cache_write = _integer(usage.get("cache_creation_input_tokens"))
+        if reported is None:
+            total_input = None
+        else:
+            total_input = reported + (cache_read or 0) + (cache_write or 0)
         raw_values = (
-            usage.get("input_tokens"),
-            usage.get("output_tokens"),
-            usage.get("cache_read_input_tokens"),
+            total_input,
+            _integer(usage.get("output_tokens")),
+            cache_read,
         )
     else:
         input_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")

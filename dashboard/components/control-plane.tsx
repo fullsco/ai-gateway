@@ -726,7 +726,22 @@ function Resource({ view, rows, loading, reload, notify }: { view: ResourceView;
 
 function formatCurrencyTotals(value: unknown): string {
   const rows = Array.isArray(value) ? (value as Row[]) : [];
-  return rows.length ? rows.map((row) => `${Number(row.estimated_cost).toFixed(4)} ${String(row.currency)}`).join(" / ") : "Pricing unavailable";
+  // Drop rows with no cost rather than coercing them: Number(null).toFixed(4)
+  // rendered an unpriced attempt as "0.0000 null", which reads as a measured
+  // zero. Amounts are grouped per currency and never summed across currencies.
+  const totals = new Map<string, number>();
+  rows.forEach((row) => {
+    if (row.estimated_cost === null || row.estimated_cost === undefined) return;
+    const currency = String(row.currency ?? "").trim();
+    if (!currency) return;
+    totals.set(currency, (totals.get(currency) ?? 0) + Number(row.estimated_cost));
+  });
+  if (!totals.size) return "Pricing unavailable";
+  const priced = rows.filter((row) => row.estimated_cost !== null && row.estimated_cost !== undefined).length;
+  const rendered = [...totals.entries()].sort().map(([currency, amount]) => `${amount.toFixed(4)} ${currency}`).join(" / ");
+  // Say so when only part of the request could be priced, so a partial figure is
+  // never mistaken for the whole cost.
+  return priced < rows.length ? `${rendered} (${rows.length - priced} unpriced)` : rendered;
 }
 
 function AnalyticsTables({ payload }: { payload: Row }) {
@@ -1356,7 +1371,7 @@ function RequestDetail({ value, onClose }: { value: Row; onClose: () => void }) 
           <div><span>Input tokens</span><strong>{totals.input.toLocaleString()}</strong></div>
           <div><span>Output tokens</span><strong>{totals.output.toLocaleString()}</strong></div>
           <div><span>Cached tokens</span><strong>{totals.cached.toLocaleString()}</strong></div>
-          <div><span>Cost</span><strong>{usage.some((row) => row.estimated_cost !== null && row.estimated_cost !== undefined) ? formatCurrencyTotals(usage) : "Pricing unavailable"}</strong></div>
+          <div><span>Cost</span><strong>{formatCurrencyTotals(usage)}</strong></div>
         </div>
       </section>
     </div>

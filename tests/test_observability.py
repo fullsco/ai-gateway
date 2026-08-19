@@ -18,6 +18,7 @@ from gateway.observability import (
     StreamUsageAccumulator,
     UsageAttribution,
     _passive_health,
+    _valid_usage,
     estimate_cost,
     extract_usage,
 )
@@ -73,7 +74,10 @@ def test_extracts_anthropic_and_openai_usage_without_content() -> None:
         ).encode(),
     )
 
-    assert anthropic == (12, 8, 4)
+    # Anthropic reports input_tokens excluding cache reads; it is normalized to
+    # the inclusive convention (12 + 4) so one meaning of "input" holds for both
+    # protocols. OpenAI already reports an inclusive prompt total.
+    assert anthropic == (16, 8, 4)
     assert openai == (10, 5, 2)
 
 
@@ -683,3 +687,62 @@ def test_blended_rate_ignores_cached_discount_it_cannot_support() -> None:
     cost, _ = estimate_cost((8, 2, 8), pricing)
 
     assert cost == Decimal("10.00000000")
+
+
+def test_anthropic_cache_hit_is_recorded_instead_of_discarded() -> None:
+    """A cache hit is the normal shape, not an invalid record.
+
+    Anthropic reports input_tokens excluding cache reads, so a cached request has
+    a large cache_read and a tiny input. Comparing them under the OpenAI
+    convention made cached exceed input, which failed validation and threw the
+    whole measurement away.
+    """
+    usage = extract_usage(
+        ClientProtocol.ANTHROPIC_MESSAGES,
+        json.dumps(
+            {
+                "usage": {
+                    "input_tokens": 5,
+                    "output_tokens": 40,
+                    "cache_read_input_tokens": 150_000,
+                }
+            }
+        ).encode(),
+    )
+
+    # Normalized to the inclusive convention: every billable input token.
+    assert usage == (150_005, 40, 150_000)
+    assert _valid_usage(usage) is True
+
+
+def test_anthropic_cache_write_counts_as_billable_input() -> None:
+    usage = extract_usage(
+        ClientProtocol.ANTHROPIC_MESSAGES,
+        json.dumps(
+            {
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 3,
+                    "cache_creation_input_tokens": 2_000,
+                    "cache_read_input_tokens": 0,
+                }
+            }
+        ).encode(),
+    )
+
+    assert usage == (2_010, 3, 0)
+
+
+def test_cached_read_is_discounted_once_under_the_normalized_convention() -> None:
+    pricing = {
+        "input_per_million": "1000000",
+        "output_per_million": "0",
+        "cached_input_per_million": "0",
+        "currency": "USD",
+    }
+
+    # 150,005 total input of which 150,000 was a cache read at zero: only the 5
+    # uncached tokens are charged.
+    cost, _ = estimate_cost((150_005, 40, 150_000), pricing)
+
+    assert cost == Decimal("5.00000000")

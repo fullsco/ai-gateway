@@ -158,7 +158,20 @@ async def credentials(request: Request) -> JSONResponse:
                c.enabled, c.priority, c.health, c.quota_limit, c.quota_used,
                c.quota_threshold, c.requests_per_minute, c.tokens_per_minute,
                c.cooldown_until, c.last_used_at, c.last_success_at, c.last_failure_at,
-               c.success_count, c.failure_count, c.created_at, c.updated_at
+               c.success_count, c.failure_count, c.created_at, c.updated_at,
+               -- Provenance, so a quota figure is never read as a measurement it
+               -- is not. Without a limit there is no denominator and headroom is
+               -- unknowable, however precise quota_used looks.
+               c.quota_source, c.quota_observed_at, c.quota_note,
+               case
+                 when c.quota_limit is not null and c.quota_limit <> 0
+                      and c.quota_used is not null then 'known'
+                 when c.quota_source = 'upstream_usage' and c.quota_used is not null
+                      then 'estimated'
+                 else 'unknown'
+               end as quota_confidence,
+               c.balance_amount, c.balance_currency, c.balance_observed_at,
+               c.balance_source
         from public.provider_credentials c
         join public.providers p on p.id = c.provider_id
         order by p.priority, c.priority, c.name
@@ -489,10 +502,19 @@ async def analytics(request: Request, days: int = Query(default=7, ge=1, le=90))
     )
     usage = await pool.fetchrow(
         """
+        -- Totals include every attempt, because every attempt was billed. The
+        -- failed_* columns separate the part that bought nothing, so retries and
+        -- failovers are visible as waste instead of inflating an apparent total.
         select sum(input_tokens) as input_tokens, sum(output_tokens) as output_tokens,
                sum(cached_tokens) as cached_tokens,
                 count(*) filter (where estimated_cost is not null) as priced_records,
-                count(*) as usage_records
+                count(*) as usage_records,
+                count(*) filter (where attempt_status_snapshot <> 'succeeded')
+                  as failed_records,
+                sum(input_tokens) filter (where attempt_status_snapshot <> 'succeeded')
+                  as failed_input_tokens,
+                sum(output_tokens) filter (where attempt_status_snapshot <> 'succeeded')
+                  as failed_output_tokens
         from public.usage_records
         where recorded_at >= current_date - ($1::int - 1)
         """,
@@ -500,7 +522,11 @@ async def analytics(request: Request, days: int = Query(default=7, ge=1, le=90))
     )
     costs_by_currency = await pool.fetch(
         """
-        select currency, sum(estimated_cost) as estimated_cost
+        select currency, sum(estimated_cost) as estimated_cost,
+               sum(estimated_cost) filter (where attempt_status_snapshot = 'succeeded')
+                 as succeeded_cost,
+               sum(estimated_cost) filter (where attempt_status_snapshot <> 'succeeded')
+                 as failed_cost
         from public.usage_records
         where recorded_at >= current_date - ($1::int - 1)
           and estimated_cost is not null and currency is not null
@@ -563,7 +589,11 @@ async def _usage_attribution(
                sum(output_tokens) as output_tokens,
                sum(cached_tokens) as cached_tokens,
                count(*) as usage_records,
-               count(*) filter (where estimated_cost is not null) as priced_records
+               count(*) filter (where estimated_cost is not null) as priced_records,
+               count(*) filter (where attempt_status_snapshot <> 'succeeded')
+                 as failed_records,
+               sum(input_tokens) filter (where attempt_status_snapshot <> 'succeeded')
+                 as failed_input_tokens
         from public.usage_records
         where recorded_at >= current_date - ($1::int - 1)
         group by 1 order by usage_records desc, {label}

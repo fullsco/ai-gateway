@@ -96,6 +96,39 @@ async def reserve_provider_quota(
         raise ProviderQuotaExceeded(str(result))
 
 
+class ClientSpendingLimitExceeded(BudgetExceeded):
+    """The client's own monthly spending limit would be exceeded.
+
+    Reported as a budget failure so the executor excludes the route and tries
+    another, but the limit is the client's rather than an operator budget, so it
+    is distinguished for the operator-facing message.
+    """
+
+
+async def reserve_client_spending(
+    pool: Any, client_id: str, estimated_cost: object | None
+) -> None:
+    """Hold spend against gateway_clients.spending_limit.
+
+    The limit was previously stored, published and displayed but never read, so a
+    client spend cap had no effect at all.
+    """
+    if pool is None or estimated_cost is None:
+        return
+    try:
+        result = await pool.fetchval(
+            "select public.reserve_client_spending($1::uuid,$2::numeric)",
+            client_id,
+            estimated_cost,
+        )
+    except Exception as exc:
+        raise QuotaUnavailable("Client spending enforcement is unavailable.") from exc
+    if result:
+        raise ClientSpendingLimitExceeded(
+            "This client has reached its configured monthly spending limit."
+        )
+
+
 _BLOCKING_BUDGET_FOR_SCOPE = """
 select b.name from public.gateway_budgets b
 where b.enabled and b.enforcement = 'block' and (

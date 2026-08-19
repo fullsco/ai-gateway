@@ -62,9 +62,25 @@ class OpenAICompatibleAdapter(ProviderAdapter):
         return UpstreamRequest(
             url=url,
             headers=headers,
-            json_body=request.payload,
+            json_body=self._upstream_payload(request),
             timeout=httpx.Timeout(self.config.timeout_seconds),
         )
+
+    @staticmethod
+    def _upstream_payload(request: NormalizedRequest) -> dict[str, Any]:
+        """Ask for usage on streamed Chat Completions.
+
+        Chat Completions emits no usage over SSE unless the caller opts in, so
+        every streamed request produced no usage record and therefore no cost at
+        all. A caller that set stream_options itself is left alone.
+        """
+        if (
+            not request.stream
+            or request.protocol is not ClientProtocol.OPENAI_CHAT_COMPLETIONS
+            or "stream_options" in request.payload
+        ):
+            return request.payload
+        return {**request.payload, "stream_options": {"include_usage": True}}
 
     def normalize_error(self, response: httpx.Response) -> ProviderError:
         message, error_type, error_code = self._extract_error(response)

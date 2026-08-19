@@ -344,26 +344,56 @@ async def test_snapshot_enabled_empty_pool_has_no_eligible_credentials() -> None
     assert payload["provider_models"][0]["allowed_credential_ids"] == []
 
 
+class AnalyticsPool(FakePool):
+    """Analytics issues ~10 fetches, so results must be keyed on the query.
+
+    A positional queue silently handed the provider rows to costs_by_currency,
+    which meant the test could not detect an analytics regression at all.
+    """
+
+    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        if "sum(estimated_cost)" in query and "group by currency" in query:
+            return [
+                {
+                    "currency": "EUR",
+                    "estimated_cost": 1.5,
+                    "succeeded_cost": 1.0,
+                    "failed_cost": 0.5,
+                },
+                {
+                    "currency": "USD",
+                    "estimated_cost": 2.5,
+                    "succeeded_cost": 2.5,
+                    "failed_cost": None,
+                },
+            ]
+        if "canonical_model_snapshot" in query:
+            return [{"model": "model-1", "usage_records": 2, "failed_records": 1}]
+        if "provider_name_snapshot" in query:
+            return [{"provider": "Provider One", "usage_records": 2, "failed_records": 1}]
+        if "route_id_snapshot" in query:
+            return [{"route": "route-1", "usage_records": 2, "failed_records": 0}]
+        if "from public.request_attempts" in query:
+            return []
+        if "requested_model" in query:
+            return [{"model": "model-1", "requests": 2, "succeeded": 1, "failed": 1}]
+        if "as day" in query or "date_trunc" in query:
+            return [{"day": "2026-08-16", "requests": 2, "succeeded": 1, "failed": 1}]
+        return []
+
+
 def test_analytics_separates_currency_and_uses_immutable_attribution() -> None:
-    pool = FakePool()
+    pool = AnalyticsPool()
     pool.fetchrow_result = {
         "input_tokens": 12,
         "output_tokens": 4,
         "cached_tokens": 2,
         "priced_records": 1,
         "usage_records": 2,
+        "failed_records": 1,
+        "failed_input_tokens": 6,
+        "failed_output_tokens": 1,
     }
-    pool.fetch_results = [
-        [{"day": "2026-08-16", "requests": 2, "succeeded": 1, "failed": 1}],
-        [{"model": "model-1", "requests": 2, "succeeded": 1, "failed": 1}],
-        [
-            {"currency": "EUR", "estimated_cost": 1.5},
-            {"currency": "USD", "estimated_cost": 2.5},
-        ],
-        [{"model": "model-1", "usage_records": 2}],
-        [{"provider": "Provider One", "usage_records": 2}],
-        [{"route": "route-1", "usage_records": 2}],
-    ]
 
     with TestClient(
         create_app(settings(), admin_verifier=AdminVerifier(), db_pool=pool),
@@ -374,12 +404,26 @@ def test_analytics_separates_currency_and_uses_immutable_attribution() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["costs_by_currency"] == [
-        {"currency": "EUR", "estimated_cost": 1.5},
-        {"currency": "USD", "estimated_cost": 2.5},
+        {
+            "currency": "EUR",
+            "estimated_cost": 1.5,
+            "succeeded_cost": 1.0,
+            "failed_cost": 0.5,
+        },
+        {
+            "currency": "USD",
+            "estimated_cost": 2.5,
+            "succeeded_cost": 2.5,
+            "failed_cost": None,
+        },
     ]
     assert payload["usage_by_model"][0]["model"] == "model-1"
     assert payload["usage_by_provider"][0]["provider"] == "Provider One"
     assert payload["usage_by_route"][0]["route"] == "route-1"
+    # Spend that bought nothing must be visible, not folded into the total.
+    assert payload["usage"]["failed_records"] == 1
+    assert payload["usage_by_provider"][0]["failed_records"] == 1
+    # Cost is never summed across currencies in an attribution query.
     attribution_queries = [query for query, _ in pool.fetchrow_calls]
     assert all("sum(estimated_cost)" not in query for query in attribution_queries)
 

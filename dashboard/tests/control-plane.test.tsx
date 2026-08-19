@@ -161,6 +161,34 @@ describe("control plane", () => {
     expect(sent.providers.map((entry: { provider_id: string }) => entry.provider_id)).toEqual(["prov-1"]);
   });
 
+  it("never renders an unpriced attempt as a measured zero cost", async () => {
+    // A request that failed over from an unpriced route to a priced one used to
+    // render "0.0000 null" for the unpriced attempt, which reads as measured.
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes("requests/request-1")) return response({
+        request: { id: "request-1", requested_model: "claude-opus-5", status: "succeeded", latency_ms: 1200, retry_count: 1, fallback_count: 0 },
+        attempts: [
+          { id: "a1", attempt_number: 1, provider_name: "GoRouter", credential_name: "k1", status: "failed", error_category: "provider_unavailable" },
+          { id: "a2", attempt_number: 2, provider_name: "AgentRouter", credential_name: "k2", status: "succeeded", upstream_status: 200 },
+        ],
+        usage: [
+          { input_tokens: 10, output_tokens: 0, cached_tokens: 0, estimated_cost: null, currency: null },
+          { input_tokens: 24, output_tokens: 30, cached_tokens: 0, estimated_cost: 0.000348, currency: "USD" },
+        ],
+      });
+      if (path.includes("requests")) return response({ data: [{ id: "request-1", requested_model: "claude-opus-5", status: "succeeded", latency_ms: 1200, retry_count: 1, fallback_count: 0 }] });
+      return response(overview);
+    }));
+    render(<ControlPlane />);
+    await userEvent.click(screen.getByRole("button", { name: "Requests" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Trace request" }));
+    expect(await screen.findByRole("dialog", { name: "Request trace" })).toBeVisible();
+    expect(screen.queryByText(/0\.0000 null/)).not.toBeInTheDocument();
+    // The priced attempt is shown, and the unpriced one is declared, not hidden.
+    expect(screen.getByText(/0\.0003 USD \(1 unpriced\)/)).toBeVisible();
+  });
+
   it("shows a human-readable publish review before publishing", async () => {
     vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
       const path = String(input);

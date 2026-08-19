@@ -270,7 +270,21 @@ async def list_budgets(request: Request) -> JSONResponse:
         return context
     _, pool = context
     rows = await pool.fetch(
-        """select b.*,coalesce(sum(w.reserved_cost),0) as used
+        """select b.*,
+                  coalesce(sum(w.reserved_cost) filter (
+                    where w.window_started_at = case b.period
+                      when 'daily' then date_trunc('day', now())
+                      else date_trunc('month', now()) end
+                  ),0) as used,
+                  coalesce(sum(w.request_count) filter (
+                    where w.window_started_at = case b.period
+                      when 'daily' then date_trunc('day', now())
+                      else date_trunc('month', now()) end
+                  ),0) as requests_this_period,
+                  coalesce(sum(w.reserved_cost),0) as used_all_time,
+                  case b.period
+                    when 'daily' then date_trunc('day', now())
+                    else date_trunc('month', now()) end as current_window_started_at
            from public.gateway_budgets b left join public.budget_usage_windows w on w.budget_id=b.id
            group by b.id order by b.name"""
     )

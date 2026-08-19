@@ -108,3 +108,48 @@ def test_openai_upstream_authentication_error_is_distinct_from_client_auth() -> 
     # Retryable so a single upstream-blocked credential fails over to another
     # credential instead of failing the whole request with 502.
     assert error.retryable is True
+
+
+def test_streamed_chat_completions_requests_usage() -> None:
+    """Chat Completions omits usage over SSE unless the caller opts in.
+
+    Without it every streamed request produced no usage record and no cost.
+    """
+    request = normalize_request(
+        ClientProtocol.OPENAI_CHAT_COMPLETIONS,
+        {"model": "model-x", "stream": True, "messages": []},
+    )
+
+    adapter = make_adapter(ClientProtocol.OPENAI_CHAT_COMPLETIONS)
+    upstream = adapter.create_request(request, Credential(id="c", secret="s"))
+
+    assert upstream.json_body["stream_options"] == {"include_usage": True}
+
+
+def test_non_streamed_request_is_forwarded_unchanged() -> None:
+    request = normalize_request(
+        ClientProtocol.OPENAI_CHAT_COMPLETIONS,
+        {"model": "model-x", "messages": []},
+    )
+
+    adapter = make_adapter(ClientProtocol.OPENAI_CHAT_COMPLETIONS)
+    upstream = adapter.create_request(request, Credential(id="c", secret="s"))
+
+    assert "stream_options" not in upstream.json_body
+
+
+def test_caller_supplied_stream_options_are_respected() -> None:
+    request = normalize_request(
+        ClientProtocol.OPENAI_CHAT_COMPLETIONS,
+        {
+            "model": "model-x",
+            "stream": True,
+            "messages": [],
+            "stream_options": {"include_usage": False},
+        },
+    )
+
+    adapter = make_adapter(ClientProtocol.OPENAI_CHAT_COMPLETIONS)
+    upstream = adapter.create_request(request, Credential(id="c", secret="s"))
+
+    assert upstream.json_body["stream_options"] == {"include_usage": False}

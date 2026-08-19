@@ -4,6 +4,7 @@ import pytest
 
 from gateway.quotas import (
     BudgetExceeded,
+    ClientSpendingLimitExceeded,
     QuotaExceeded,
     QuotaRequest,
     QuotaUnavailable,
@@ -11,6 +12,7 @@ from gateway.quotas import (
     estimate_tokens,
     reserve_budgets,
     reserve_client_quota,
+    reserve_client_spending,
 )
 
 
@@ -157,3 +159,53 @@ async def test_unpriced_guard_failure_does_not_break_inference() -> None:
             raise RuntimeError("database unavailable")
 
     await reserve_budgets(BrokenPool(), currency=None, estimated_cost=None, **_scopes())
+
+
+class SpendPool:
+    def __init__(self, result=None) -> None:
+        self.result = result
+        self.calls: list[tuple[str, tuple]] = []
+
+    async def fetchval(self, query, *args):
+        self.calls.append((query, args))
+        return self.result
+
+
+@pytest.mark.asyncio
+async def test_client_spending_limit_is_actually_enforced() -> None:
+    """spending_limit was stored, published and displayed but never read."""
+    pool = SpendPool("spending_limit")
+
+    with pytest.raises(ClientSpendingLimitExceeded, match="monthly spending limit"):
+        await reserve_client_spending(pool, "client-1", Decimal("0.50"))
+
+    assert "reserve_client_spending" in pool.calls[0][0]
+
+
+@pytest.mark.asyncio
+async def test_client_within_spending_limit_proceeds() -> None:
+    pool = SpendPool(None)
+
+    await reserve_client_spending(pool, "client-1", Decimal("0.50"))
+
+    assert pool.calls, "the reservation must be attempted"
+
+
+@pytest.mark.asyncio
+async def test_unpriced_request_does_not_reserve_client_spend() -> None:
+    """An unpriced request is refused by the unpriced-route guard, not here."""
+    pool = SpendPool(None)
+
+    await reserve_client_spending(pool, "client-1", None)
+
+    assert pool.calls == []
+
+
+@pytest.mark.asyncio
+async def test_client_spending_enforcement_failure_fails_closed() -> None:
+    class BrokenPool:
+        async def fetchval(self, query, *args):
+            raise RuntimeError("database unavailable")
+
+    with pytest.raises(QuotaUnavailable):
+        await reserve_client_spending(BrokenPool(), "client-1", Decimal("0.50"))

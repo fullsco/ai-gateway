@@ -26,6 +26,7 @@ from gateway.protocols import ClientProtocol, NormalizedRequest
 from gateway.providers import ErrorCategory, ProviderError, build_provider_error
 from gateway.quotas import (
     BudgetExceeded,
+    ClientSpendingLimitExceeded,
     ProviderQuotaExceeded,
     QuotaExceeded,
     QuotaRequest,
@@ -33,6 +34,7 @@ from gateway.quotas import (
     estimate_tokens,
     reserve_budgets,
     reserve_client_quota,
+    reserve_client_spending,
     reserve_provider_quota,
 )
 from gateway.routing import AttemptCoordinator, AttemptPolicy
@@ -195,6 +197,7 @@ async def execute_request(
                     estimated_input_tokens + output_tokens,
                 ),
             )
+            await reserve_client_spending(db_pool, client_id, estimated_cost)
             await reserve_budgets(
                 db_pool,
                 client_id=client_id,
@@ -207,7 +210,12 @@ async def execute_request(
             )
         except (ProviderQuotaExceeded, BudgetExceeded) as exc:
             lease.release()
-            event_type = "budget_exceeded" if isinstance(exc, BudgetExceeded) else "provider_quota"
+            if isinstance(exc, ClientSpendingLimitExceeded):
+                event_type = "client_spending_limit"
+            elif isinstance(exc, BudgetExceeded):
+                event_type = "budget_exceeded"
+            else:
+                event_type = "provider_quota"
             await evaluate_alert_rules(
                 db_pool,
                 AlertEvent(
