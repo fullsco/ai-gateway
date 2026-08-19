@@ -18,6 +18,17 @@ class ProbeLimitConfig:
     max_backoff_seconds: int = 86400
     manual_daily_limit: int = 20
     manual_min_interval_seconds: int = 60
+    # Real traffic already reveals credential health, and an Anthropic-protocol
+    # probe is a billable POST /v1/messages. Skip the probe entirely while a
+    # credential has been exercised this recently.
+    passive_signal_window_seconds: int = 7200
+
+
+_RECENT_PASSIVE_SIGNAL = """
+select 1 from public.provider_credentials
+where id = $1 and last_used_at is not null
+  and last_used_at >= now() - make_interval(secs => $2)
+"""
 
 
 class HealthProbeLimiter:
@@ -42,6 +53,17 @@ class HealthProbeLimiter:
         *,
         manual: bool = False,
     ) -> str:
+        if not manual and self._config.passive_signal_window_seconds > 0:
+            recent = await self._pool.fetchval(
+                _RECENT_PASSIVE_SIGNAL,
+                credential_id,
+                self._config.passive_signal_window_seconds,
+            )
+            if recent:
+                await self._record_skip(
+                    provider_id, credential_id, provider_model_id, "recent_passive_signal"
+                )
+                return "recent_passive_signal"
         reason = await self._pool.fetchval(
             "select public.reserve_health_probe($1,$2,$3,$4,$5,$6,$7,$8,$9)",
             provider_id,

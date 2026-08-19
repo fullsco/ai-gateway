@@ -1,10 +1,15 @@
+from decimal import Decimal
+
 import pytest
 
 from gateway.quotas import (
+    BudgetExceeded,
     QuotaExceeded,
     QuotaRequest,
     QuotaUnavailable,
+    UnpricedRouteBlocked,
     estimate_tokens,
+    reserve_budgets,
     reserve_client_quota,
 )
 
@@ -66,3 +71,89 @@ async def test_limited_client_fails_closed_when_database_is_unavailable() -> Non
             "client-1",
             QuotaRequest(1, None, 1),
         )
+
+
+class BudgetScopePool:
+    """Fake pool answering the blocking-budget scope lookup."""
+
+    def __init__(self, blocking_name: str | None) -> None:
+        self.blocking_name = blocking_name
+        self.calls: list[tuple[str, tuple]] = []
+
+    async def fetchval(self, query, *args):
+        self.calls.append((query, args))
+        if "gateway_budgets" in query and "enforcement = 'block'" in query:
+            return self.blocking_name
+        return None
+
+
+def _scopes() -> dict[str, str | None]:
+    return {
+        "client_id": "11111111-1111-1111-1111-111111111111",
+        "provider_id": "22222222-2222-2222-2222-222222222222",
+        "credential_id": "33333333-3333-3333-3333-333333333333",
+        "model_id": "claude-opus-5",
+        "route_id": "44444444-4444-4444-4444-444444444444",
+    }
+
+
+@pytest.mark.asyncio
+async def test_unpriced_route_is_refused_when_a_blocking_budget_applies() -> None:
+    """A spend cap must not be evadable by leaving a route's pricing empty.
+
+    Reservation is driven by estimated cost, so an unpriced route reserved
+    nothing and was invisible to every budget, including a global blocking one.
+    """
+    pool = BudgetScopePool("Global monthly cap")
+
+    with pytest.raises(UnpricedRouteBlocked, match="no pricing configured"):
+        await reserve_budgets(pool, currency=None, estimated_cost=None, **_scopes())
+
+
+@pytest.mark.asyncio
+async def test_unpriced_route_proceeds_when_no_blocking_budget_exists() -> None:
+    """A deployment with no budgets configured must be unaffected."""
+    pool = BudgetScopePool(None)
+
+    await reserve_budgets(pool, currency=None, estimated_cost=None, **_scopes())
+
+    assert pool.calls, "the blocking-budget check must still run"
+
+
+@pytest.mark.asyncio
+async def test_priced_route_reserves_against_the_budget_function() -> None:
+    pool = BudgetScopePool(None)
+
+    await reserve_budgets(pool, currency="USD", estimated_cost=Decimal("0.25"), **_scopes())
+
+    assert any("reserve_gateway_budgets" in query for query, _ in pool.calls)
+
+
+@pytest.mark.asyncio
+async def test_budget_over_limit_raises_budget_exceeded() -> None:
+    class OverLimitPool(BudgetScopePool):
+        async def fetchval(self, query, *args):
+            self.calls.append((query, args))
+            if "reserve_gateway_budgets" in query:
+                return "budget-id-1"
+            return None
+
+    with pytest.raises(BudgetExceeded):
+        await reserve_budgets(
+            OverLimitPool(None), currency="USD", estimated_cost=Decimal("5"), **_scopes()
+        )
+
+
+@pytest.mark.asyncio
+async def test_unpriced_guard_failure_does_not_break_inference() -> None:
+    """A database outage is not an evasion of a spend cap.
+
+    Priced routes still fail closed through reserve_gateway_budgets, so keeping
+    availability here avoids turning a telemetry outage into an inference outage.
+    """
+
+    class BrokenPool:
+        async def fetchval(self, query, *args):
+            raise RuntimeError("database unavailable")
+
+    await reserve_budgets(BrokenPool(), currency=None, estimated_cost=None, **_scopes())

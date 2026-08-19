@@ -126,7 +126,7 @@ async def test_health_probe_is_payload_free_and_records_success():
     await recorder.close()
     await runtime.http_client.aclose()
 
-    assert seen == {"method": "HEAD", "content": b""}
+    assert seen == {"method": "GET", "content": b""}
     assert any("health_checks" in query for query, _ in pool.calls)
     health_args = next(args for query, args in pool.calls if "health_checks" in query)
     assert health_args[-1] == "automatic"

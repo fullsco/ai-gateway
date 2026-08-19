@@ -55,7 +55,9 @@ def test_probe_request_is_authenticated_and_payload_free() -> None:
         Credential(id="credential", secret="provider-secret")
     )
 
-    assert request.method == "HEAD"
+    # GET, not HEAD: relays commonly answer HEAD /v1/models with 404, which made
+    # every OpenAI-protocol probe register as a failure.
+    assert request.method == "GET"
     assert request.url == "https://provider.example/api/v1/models"
     assert request.json_body is None
     assert request.headers["authorization"] == "Bearer provider-secret"

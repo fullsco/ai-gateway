@@ -486,7 +486,14 @@ def estimate_cost(
         return None, None
     if min(input_rate, output_rate, cached_rate) < 0:
         return None, None
-    input_tokens, output_tokens, cached_tokens = (value or 0 for value in usage)
+    input_tokens, output_tokens, cached_tokens = usage
+    # A billable dimension that was never reported cannot be priced. Treating it
+    # as zero produced an immutable, currency-stamped cost that looked measured,
+    # counted toward pricing coverage, and understated the real spend. An absent
+    # cached count is different: no cache read means nothing to discount.
+    if input_tokens is None or output_tokens is None:
+        return None, None
+    cached_tokens = cached_tokens or 0
     uncached_input = max(0, input_tokens - cached_tokens)
     total = (
         Decimal(uncached_input) * input_rate
@@ -553,10 +560,24 @@ class StreamUsageAccumulator:
         if extracted is None:
             return
         current = self._usage or (None, None, None)
+        # Usage is cumulative within a stream, so keep the highest value seen for
+        # each dimension. Merging on "is not None" let a later frame reporting 0
+        # erase a real measurement: AgentRouter attaches a usage object to every
+        # frame and sends all zeros on message_stop, which silently zeroed the
+        # tokens for nearly all streamed Anthropic traffic.
         self._usage = tuple(
-            incoming if incoming is not None else existing
+            _peak(existing, incoming)
             for existing, incoming in zip(current, extracted, strict=True)
         )
+
+
+def _peak(existing: int | None, incoming: int | None) -> int | None:
+    """Highest of two cumulative counters, tolerating either being unreported."""
+    if incoming is None:
+        return existing
+    if existing is None:
+        return incoming
+    return max(existing, incoming)
 
 
 def _integer(value: Any) -> int | None:

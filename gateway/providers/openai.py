@@ -105,7 +105,10 @@ class OpenAICompatibleAdapter(ProviderAdapter):
         model: str | None = None,
     ) -> UpstreamRequest:
         return UpstreamRequest(
-            method="HEAD",
+            # GET rather than HEAD: relays commonly route only GET on /v1/models
+            # and answer HEAD with 404, which made every probe look like a
+            # failure. GET is still free and still authenticates the credential.
+            method="GET",
             url=f"{str(self.config.base_url).rstrip('/')}/v1/models",
             headers={
                 "accept": "application/json",

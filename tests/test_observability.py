@@ -29,12 +29,18 @@ class TelemetryPool:
     def __init__(self) -> None:
         self.execute_calls: list[tuple[str, tuple[object, ...]]] = []
         self.attempt_id = 40
+        # No budgets are configured in these fixtures, so the blocking-budget
+        # lookup must answer "none". Returning a generic truthy id for every
+        # fetchval would make an unpriced route look budget-blocked.
+        self.blocking_budget: str | None = None
 
     async def execute(self, query: str, *args: object) -> None:
         self.execute_calls.append((query, args))
 
-    async def fetchval(self, query: str, *args: object) -> int:
+    async def fetchval(self, query: str, *args: object) -> object:
         self.execute_calls.append((query, args))
+        if "gateway_budgets" in query:
+            return self.blocking_budget
         self.attempt_id += 1
         return self.attempt_id
 
@@ -98,6 +104,29 @@ def test_estimate_cost_rejects_invalid_pricing(pricing: dict[str, object]) -> No
     assert estimate_cost((10, 5, None), pricing) == (None, None)
 
 
+def test_estimate_cost_refuses_to_price_an_unreported_billable_dimension() -> None:
+    """A missing token dimension must yield no cost, not a cost computed from zero.
+
+    Pricing an unreported dimension as zero produced an immutable, currency
+    stamped figure that was indistinguishable from a real measurement and was
+    counted toward the pricing-coverage metric.
+    """
+    pricing = {
+        "input_per_million": 3,
+        "output_per_million": 15,
+        "currency": "USD",
+    }
+
+    assert estimate_cost((900_000, None, None), pricing) == (None, None)
+    assert estimate_cost((None, 500, None), pricing) == (None, None)
+    assert estimate_cost((None, None, None), pricing) == (None, None)
+
+    # An absent cached count is a real "no cache read", so it stays priceable.
+    cost, currency = estimate_cost((1_000_000, 0, None), pricing)
+    assert currency == "USD"
+    assert cost == Decimal("3.00000000")
+
+
 def test_stream_usage_accumulator_reads_split_sse_metadata() -> None:
     accumulator = StreamUsageAccumulator(ClientProtocol.ANTHROPIC_MESSAGES)
 
@@ -106,6 +135,52 @@ def test_stream_usage_accumulator_reads_split_sse_metadata() -> None:
     accumulator.feed(b'tokens":6}}\n\n')
 
     assert accumulator.usage == (9, 6, None)
+
+
+def test_stream_usage_accumulator_keeps_reported_tokens_when_later_frames_zero_them() -> None:
+    """A trailing zero frame must not erase the tokens already reported.
+
+    Captured verbatim from AgentRouter, which attaches a top-level usage object
+    to every SSE frame: the real counts arrive on message_delta and the final
+    message_stop reports zeros. Merging on "not None" let that final frame
+    overwrite the measurement, so 97.9% of streamed Anthropic traffic recorded
+    0 input tokens and cost could never be attributed.
+    """
+    accumulator = StreamUsageAccumulator(ClientProtocol.ANTHROPIC_MESSAGES)
+
+    zeros = (
+        b'{"usage":{"input_tokens":0,"output_tokens":0,'
+        b'"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}'
+    )
+    for event in (b"content_block_start", b"content_block_delta", b"content_block_stop"):
+        accumulator.feed(b"event: " + event + b"\ndata: " + zeros + b"\n\n")
+    accumulator.feed(
+        b"event: message_delta\ndata: "
+        b'{"usage":{"input_tokens":10,"output_tokens":4,'
+        b'"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}\n\n'
+    )
+    assert accumulator.usage == (10, 4, 0), "message_delta must be captured"
+
+    accumulator.feed(b"event: message_stop\ndata: " + zeros + b"\n\n")
+
+    assert accumulator.usage == (10, 4, 0), (
+        "a trailing all-zero frame must not overwrite reported usage"
+    )
+
+
+def test_stream_usage_accumulator_tracks_cumulative_growth() -> None:
+    """Usage is monotonically non-decreasing within a stream, so keep the peak."""
+    accumulator = StreamUsageAccumulator(ClientProtocol.OPENAI_CHAT_COMPLETIONS)
+
+    accumulator.feed(
+        b'data: {"usage":{"prompt_tokens":120,"completion_tokens":5}}\n\n'
+    )
+    accumulator.feed(
+        b'data: {"usage":{"prompt_tokens":120,"completion_tokens":31}}\n\n'
+    )
+
+    assert accumulator.usage == (120, 31, None)
+
 
 
 @pytest.mark.parametrize(
