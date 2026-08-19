@@ -697,3 +697,39 @@ def test_half_open_retry_still_loses_to_a_healthy_credential() -> None:
     overlaid = live.overlay(providers, credentials)
     picks = {eng.select(request(), *overlaid[:2]).credential.credential_id for _ in range(40)}
     assert picks == {"well"}
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        HealthState.RATE_LIMITED,
+        HealthState.AUTH_FAILED,
+        HealthState.QUOTA_EXHAUSTED,
+        HealthState.UNAVAILABLE,
+        HealthState.COOLDOWN,
+    ],
+)
+def test_every_unroutable_state_is_eligible_for_half_open_recovery(state) -> None:
+    """Any state the engine refuses must be retryable, or it deadlocks.
+
+    Regression test: rate_limited was excluded by the engine but missing from the
+    recovery set, so a rate-limited credential could never be tried again and a
+    single-credential model stayed unavailable indefinitely.
+    """
+    clock = FakeClock()
+    live = LiveOperationalState(clock=clock)
+    providers = [ProviderState("p1")]
+    credentials = [CredentialState("c1", "p1")]
+    eng = engine(provider_model("pm1", "p1"))
+
+    runtime = live._credential("c1")  # noqa: SLF001 - test seam
+    runtime.db_health = state
+    runtime.db_unhealthy_since = clock.now
+
+    with pytest.raises(NoRouteAvailable):
+        eng.select(request(), *live.overlay(providers, credentials)[:2])
+
+    clock.advance(61)
+    _, overlaid, _ = live.overlay(providers, credentials)
+    assert overlaid[0].health is HealthState.DEGRADED
+    assert eng.select(request(), providers, overlaid)

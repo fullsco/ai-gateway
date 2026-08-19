@@ -518,3 +518,47 @@ async def test_cancelled_stream_finishes_committed_telemetry() -> None:
     assert attempt_update[1] == "cancelled"
     assert attempt_update[4] is True
     assert request_update[1] == "cancelled"
+
+
+def test_provider_level_failure_does_not_mark_the_credential_unhealthy() -> None:
+    """A provider or edge fault must not park a working credential.
+
+    Regression test: a single upstream 5xx used to set the *credential* health to
+    'unavailable', which removed the only key for a model from rotation even though
+    nothing was wrong with the key itself.
+    """
+    import asyncio
+
+    from gateway.observability import PassiveHealthEvent, PassiveHealthRecorder
+
+    class RecordingPool:
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+
+        async def execute(self, query, *args):
+            self.statements.append(" ".join(query.split()))
+
+    pool = RecordingPool()
+
+    async def run() -> None:
+        recorder = PassiveHealthRecorder(pool)
+        await recorder._persist(  # noqa: SLF001 - exercising the persistence branch
+            PassiveHealthEvent(
+                provider_id="p1",
+                credential_id="c1",
+                provider_model_id="pm1",
+                request_id="req-1",
+                attempt_number=1,
+                observed_at=datetime.now(UTC),
+                latency_ms=12.0,
+                error_category="provider_unavailable",
+                upstream_status=503,
+                credential_at_fault=False,
+            )
+        )
+
+    asyncio.run(run())
+
+    joined = " ".join(pool.statements)
+    assert "insert into public.health_checks" in joined
+    assert "update public.provider_credentials" not in joined

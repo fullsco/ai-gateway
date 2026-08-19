@@ -27,6 +27,10 @@ class PassiveHealthEvent:
     upstream_status: int | None = None
     retry_after_seconds: float | None = None
     source: str = "passive"
+    # False when the failure is a provider/edge problem rather than evidence about
+    # this credential. Such failures are still recorded, but must not mark the
+    # credential unhealthy - otherwise one provider blip parks a working key.
+    credential_at_fault: bool = True
 
 
 @dataclass(frozen=True)
@@ -82,6 +86,26 @@ class PassiveHealthRecorder:
     async def _persist(self, event: PassiveHealthEvent) -> None:
         health = _passive_health(event.error_category)
         if event.source != "passive":
+            await self._pool.execute(
+                """
+                insert into public.health_checks(
+                  provider_id,credential_id,status,latency_ms,error_category,checked_at,source
+                ) select $1,$2,$3::public.gateway_health_state,$4,$5,$6,$7
+                  where $3::text is not null
+                """,
+                event.provider_id,
+                event.credential_id,
+                health,
+                event.latency_ms,
+                event.error_category,
+                event.observed_at,
+                event.source,
+            )
+            if event.error_category is not None:
+                await self._alert(event)
+            return
+        if not event.credential_at_fault:
+            # Observe it, but do not attribute it to the credential.
             await self._pool.execute(
                 """
                 insert into public.health_checks(

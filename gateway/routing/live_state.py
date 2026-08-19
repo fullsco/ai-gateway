@@ -30,18 +30,20 @@ from typing import Any
 
 from gateway.logging import log_event
 from gateway.providers import ErrorCategory
-from gateway.routing.engine import CredentialState, HealthState, ProviderState
+from gateway.routing.engine import (
+    ROUTABLE_HEALTH,
+    CredentialState,
+    HealthState,
+    ProviderState,
+)
 
 logger = logging.getLogger("gateway.routing.live_state")
 
-# Health states that mean "do not route here right now".
-_UNROUTABLE = {
-    HealthState.AUTH_FAILED,
-    HealthState.QUOTA_EXHAUSTED,
-    HealthState.UNAVAILABLE,
-    HealthState.DISABLED,
-    HealthState.COOLDOWN,
-}
+# Health states that mean "do not route here right now". Derived from the engine's
+# own routability rule so the two can never drift apart - if a state is excluded by
+# the engine it must also be eligible for half-open recovery here, otherwise a
+# credential in that state can never be retried.
+_UNROUTABLE = set(HealthState) - ROUTABLE_HEALTH
 
 _FAILURE_WINDOW_SECONDS = 300.0
 # After a persisted non-routable health state has been in place this long, allow one

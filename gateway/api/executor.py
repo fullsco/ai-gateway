@@ -854,5 +854,6 @@ def _submit_health(
             error_category=error.category.value if error else None,
             upstream_status=error.upstream_status if error else upstream_status,
             retry_after_seconds=error.retry_after_seconds if error else None,
+            credential_at_fault=error.credential_at_fault if error else True,
         )
     )
