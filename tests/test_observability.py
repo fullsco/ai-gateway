@@ -637,3 +637,49 @@ def test_provider_level_failure_does_not_mark_the_credential_unhealthy() -> None
     joined = " ".join(pool.statements)
     assert "insert into public.health_checks" in joined
     assert "update public.provider_credentials" not in joined
+
+
+def test_measured_blended_rate_prices_total_tokens() -> None:
+    """A blended rate is what one before/after billing measurement can establish.
+
+    It cannot separate input from output, so it applies to total tokens and must
+    not pretend to discount cache reads it never distinguished.
+    """
+    pricing = {
+        "blended_per_million": "6.307692",
+        "currency": "USD",
+        "pricing_basis": "measured_blended",
+        "sample_count": 1,
+        "confidence": "low",
+    }
+
+    cost, currency = estimate_cost((18, 21, None), pricing)
+
+    assert currency == "USD"
+    # 39 total tokens at the rate measured from the operator's sample.
+    assert cost == Decimal("0.00024600")
+
+
+def test_measured_blended_rate_still_refuses_unreported_dimensions() -> None:
+    pricing = {
+        "blended_per_million": "6.307692",
+        "currency": "USD",
+        "pricing_basis": "measured_blended",
+    }
+
+    assert estimate_cost((18, None, None), pricing) == (None, None)
+    assert estimate_cost((None, 21, None), pricing) == (None, None)
+
+
+def test_blended_rate_ignores_cached_discount_it_cannot_support() -> None:
+    pricing = {
+        "blended_per_million": "1000000",
+        "currency": "USD",
+        "pricing_basis": "measured_blended",
+    }
+
+    # 10 total tokens at 1 unit per token: the cached count must not reduce it,
+    # because a blended measurement never priced cache reads separately.
+    cost, _ = estimate_cost((8, 2, 8), pricing)
+
+    assert cost == Decimal("10.00000000")

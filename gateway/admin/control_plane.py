@@ -132,21 +132,73 @@ class ProviderModelInput(NormalizedStringLists):
     def validate_pricing(cls, pricing: dict[str, Any]) -> dict[str, Any]:
         if not pricing:
             return pricing
-        required = {"input_per_million", "output_per_million", "currency"}
-        if missing := required - pricing.keys():
-            raise ValueError(f"pricing is missing: {', '.join(sorted(missing))}")
-        allowed = required | {"cached_input_per_million", "version", "effective_at"}
-        if extra := pricing.keys() - allowed:
-            raise ValueError(f"pricing contains unsupported fields: {', '.join(sorted(extra))}")
-        currency = pricing["currency"]
+        currency = pricing.get("currency")
         if not isinstance(currency, str) or len(currency.strip()) != 3 or not currency.isalpha():
             raise ValueError("pricing currency must be a three-letter alphabetic code")
-        normalized = {**pricing, "currency": currency.strip().upper()}
-        rate_fields = {
-            "input_per_million",
-            "output_per_million",
-            "cached_input_per_million",
+        # Two shapes are supported. A listed rate card separates input from output.
+        # A measured blended rate is what a before/after billing measurement can
+        # actually establish from a single sample, and must carry its provenance so
+        # it is never presented as a separated rate it cannot support.
+        blended = "blended_per_million" in pricing
+        separated = {"input_per_million", "output_per_million"} & pricing.keys()
+        if blended and separated:
+            raise ValueError(
+                "pricing must use either blended_per_million or input/output rates, not both"
+            )
+        if blended:
+            allowed = {
+                "blended_per_million",
+                "currency",
+                "pricing_basis",
+                "sample_count",
+                "confidence",
+                "version",
+                "effective_at",
+            }
+            rate_fields = {"blended_per_million"}
+        else:
+            required = {"input_per_million", "output_per_million", "currency"}
+            if missing := required - pricing.keys():
+                raise ValueError(f"pricing is missing: {', '.join(sorted(missing))}")
+            allowed = required | {
+                "cached_input_per_million",
+                "pricing_basis",
+                "sample_count",
+                "confidence",
+                "version",
+                "effective_at",
+            }
+            rate_fields = {
+                "input_per_million",
+                "output_per_million",
+                "cached_input_per_million",
+            }
+        if extra := pricing.keys() - allowed:
+            raise ValueError(f"pricing contains unsupported fields: {', '.join(sorted(extra))}")
+        basis = pricing.get("pricing_basis", "measured_blended" if blended else "listed")
+        if basis not in {"listed", "measured_blended", "measured_separated"}:
+            raise ValueError(
+                "pricing_basis must be listed, measured_blended or measured_separated"
+            )
+        if blended and basis != "measured_blended":
+            raise ValueError("a blended rate must declare pricing_basis measured_blended")
+        confidence = pricing.get("confidence", "low" if blended else "high")
+        if confidence not in {"low", "medium", "high"}:
+            raise ValueError("pricing confidence must be low, medium or high")
+        normalized = {
+            **pricing,
+            "currency": currency.strip().upper(),
+            "pricing_basis": basis,
+            "confidence": confidence,
         }
+        if "sample_count" in pricing:
+            try:
+                samples = int(pricing["sample_count"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError("pricing sample_count must be an integer") from exc
+            if samples < 0:
+                raise ValueError("pricing sample_count must be nonnegative")
+            normalized["sample_count"] = samples
         for field in rate_fields & pricing.keys():
             try:
                 rate = Decimal(str(pricing[field]))

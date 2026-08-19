@@ -985,3 +985,68 @@ async def test_publish_refresh_authenticates_issued_gateway_key() -> None:
     assert authenticated is not None
     assert authenticated.client.id == "client-id"
     await manager.close()
+
+
+def test_pricing_accepts_a_measured_blended_rate_with_provenance() -> None:
+    body = ProviderModelInput(
+        provider_id="provider-1",
+        model_id="model-1",
+        upstream_model_id="upstream-1",
+        protocol="anthropic_messages",
+        pricing={
+            "blended_per_million": "6.307692",
+            "currency": "usd",
+            "pricing_basis": "measured_blended",
+            "sample_count": 1,
+            "confidence": "low",
+        },
+    )
+
+    assert body.pricing["currency"] == "USD"
+    assert body.pricing["pricing_basis"] == "measured_blended"
+    assert body.pricing["sample_count"] == 1
+    assert body.pricing["confidence"] == "low"
+
+
+def test_pricing_defaults_basis_and_confidence_for_a_listed_rate_card() -> None:
+    body = ProviderModelInput(
+        provider_id="provider-1",
+        model_id="model-1",
+        upstream_model_id="upstream-1",
+        protocol="anthropic_messages",
+        pricing={"input_per_million": 3, "output_per_million": 15, "currency": "USD"},
+    )
+
+    assert body.pricing["pricing_basis"] == "listed"
+    assert body.pricing["confidence"] == "high"
+
+
+def test_pricing_rejects_mixing_blended_and_separated_rates() -> None:
+    with pytest.raises(ValidationError, match="not both"):
+        ProviderModelInput(
+            provider_id="provider-1",
+            model_id="model-1",
+            upstream_model_id="upstream-1",
+            protocol="anthropic_messages",
+            pricing={
+                "blended_per_million": 6,
+                "input_per_million": 3,
+                "output_per_million": 15,
+                "currency": "USD",
+            },
+        )
+
+
+def test_blended_pricing_must_declare_its_measured_basis() -> None:
+    with pytest.raises(ValidationError, match="measured_blended"):
+        ProviderModelInput(
+            provider_id="provider-1",
+            model_id="model-1",
+            upstream_model_id="upstream-1",
+            protocol="anthropic_messages",
+            pricing={
+                "blended_per_million": 6,
+                "currency": "USD",
+                "pricing_basis": "listed",
+            },
+        )

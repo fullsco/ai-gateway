@@ -478,14 +478,6 @@ def estimate_cost(
     currency = str(currency_value).strip().upper() if currency_value is not None else ""
     if len(currency) != 3 or not currency.isalpha():
         return None, None
-    try:
-        input_rate = Decimal(str(pricing["input_per_million"]))
-        output_rate = Decimal(str(pricing["output_per_million"]))
-        cached_rate = Decimal(str(pricing.get("cached_input_per_million", input_rate)))
-    except (KeyError, InvalidOperation, TypeError, ValueError):
-        return None, None
-    if min(input_rate, output_rate, cached_rate) < 0:
-        return None, None
     input_tokens, output_tokens, cached_tokens = usage
     # A billable dimension that was never reported cannot be priced. Treating it
     # as zero produced an immutable, currency-stamped cost that looked measured,
@@ -494,6 +486,28 @@ def estimate_cost(
     if input_tokens is None or output_tokens is None:
         return None, None
     cached_tokens = cached_tokens or 0
+    if "blended_per_million" in pricing:
+        # A measured blended rate is all a before/after billing measurement can
+        # establish, so it is applied to total tokens and cannot discount cache
+        # reads it never separated.
+        try:
+            blended_rate = Decimal(str(pricing["blended_per_million"]))
+        except (InvalidOperation, TypeError, ValueError):
+            return None, None
+        if not blended_rate.is_finite() or blended_rate < 0:
+            return None, None
+        total = (
+            Decimal(input_tokens + output_tokens) * blended_rate
+        ) / Decimal(1_000_000)
+        return total.quantize(Decimal("0.00000001")), currency
+    try:
+        input_rate = Decimal(str(pricing["input_per_million"]))
+        output_rate = Decimal(str(pricing["output_per_million"]))
+        cached_rate = Decimal(str(pricing.get("cached_input_per_million", input_rate)))
+    except (KeyError, InvalidOperation, TypeError, ValueError):
+        return None, None
+    if min(input_rate, output_rate, cached_rate) < 0:
+        return None, None
     uncached_input = max(0, input_tokens - cached_tokens)
     total = (
         Decimal(uncached_input) * input_rate
