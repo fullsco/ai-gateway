@@ -733,3 +733,34 @@ def test_every_unroutable_state_is_eligible_for_half_open_recovery(state) -> Non
     _, overlaid, _ = live.overlay(providers, credentials)
     assert overlaid[0].health is HealthState.DEGRADED
     assert eng.select(request(), providers, overlaid)
+
+
+def test_a_malformed_client_request_does_not_degrade_the_provider() -> None:
+    """A client sending bad bodies used to lower a healthy provider's score.
+
+    invalid_request is credential_at_fault=False, which routed it to the provider
+    failure list, so repeated client mistakes pushed traffic away from a provider
+    that was working perfectly.
+    """
+    clock = FakeClock()
+    state = LiveOperationalState(clock=clock)
+
+    for _ in range(5):
+        state.record_attempt(
+            provider_id="prov-1",
+            credential_id="cred-1",
+            succeeded=False,
+            error_category=ErrorCategory.INVALID_REQUEST.value,
+            credential_at_fault=False,
+        )
+
+    providers, credentials, _ = state.overlay(
+        [ProviderState("prov-1", enabled=True, health=HealthState.HEALTHY)],
+        [CredentialState("cred-1", "prov-1", health=HealthState.HEALTHY)],
+    )
+    provider = next(p for p in providers if p.provider_id == "prov-1")
+    credential = next(c for c in credentials if c.credential_id == "cred-1")
+
+    assert provider.failure_rate == 0, "a client fault is not a provider fault"
+    assert credential.failure_rate == 0, "a client fault is not a credential fault"
+    assert credential.health is HealthState.HEALTHY

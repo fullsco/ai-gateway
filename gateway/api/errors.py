@@ -10,6 +10,7 @@ ERROR_STATUS = {
     ErrorCategory.RATE_LIMIT: 429,
     ErrorCategory.QUOTA_EXHAUSTED: 429,
     ErrorCategory.MODEL_UNAVAILABLE: 404,
+    ErrorCategory.NO_ELIGIBLE_ROUTE: 503,
     ErrorCategory.PROVIDER_UNAVAILABLE: 503,
     ErrorCategory.TIMEOUT: 504,
     ErrorCategory.INVALID_REQUEST: 400,

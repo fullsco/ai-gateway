@@ -15,6 +15,11 @@ class ErrorCategory(StrEnum):
     RATE_LIMIT = "rate_limit"
     QUOTA_EXHAUSTED = "quota_exhausted"
     MODEL_UNAVAILABLE = "model_unavailable"
+    # The model is configured, but every route or credential that could serve it
+    # was ineligible at this moment: unhealthy, cooling down, out of quota, at its
+    # concurrency limit, or behind an open circuit. Distinct from
+    # MODEL_UNAVAILABLE, which means the provider does not serve the model at all.
+    NO_ELIGIBLE_ROUTE = "no_eligible_route"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
     TIMEOUT = "timeout"
     INVALID_REQUEST = "invalid_request"
@@ -95,6 +100,9 @@ _RETRY_SEMANTICS: dict[ErrorCategory, tuple[bool, RetryScope, bool]] = {
     ErrorCategory.QUOTA_EXHAUSTED: (True, RetryScope.CREDENTIAL, True),
     # This provider does not serve the model; another provider might.
     ErrorCategory.MODEL_UNAVAILABLE: (True, RetryScope.PROVIDER, False),
+    # Nothing was contacted, because nothing was eligible. Retrying inside this
+    # request would re-evaluate the same excluded candidates.
+    ErrorCategory.NO_ELIGIBLE_ROUTE: (False, RetryScope.NONE, False),
     ErrorCategory.PROVIDER_UNAVAILABLE: (True, RetryScope.PROVIDER, False),
     ErrorCategory.TIMEOUT: (True, RetryScope.PROVIDER, False),
     # The request itself is malformed - retrying anywhere returns the same result.

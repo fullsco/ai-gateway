@@ -96,10 +96,23 @@ async def execute_request(
             fallback_count=0, error_category=ErrorCategory.PROVIDER_UNAVAILABLE.value,
         )
         return client_error(ErrorCategory.PROVIDER_UNAVAILABLE, str(exc), 503)
+    # Bound by the routes that can actually serve THIS model. Taking the maximum
+    # across every provider model in the registry meant one route configured with
+    # max_attempts 10 raised the retry budget for every model in the gateway.
+    try:
+        requested_canonical = runtime.model_registry.resolve(normalized.requested_model).id
+    except LookupError:
+        requested_canonical = None
+    candidate_models = [
+        model
+        for model in runtime.model_registry.list_provider_models()
+        if requested_canonical is not None
+        and model.canonical_model_id == requested_canonical
+    ] or runtime.model_registry.list_provider_models()
     max_attempts = max(
         (
             int((model.routing_policy or {}).get("max_attempts", 3))
-            for model in runtime.model_registry.list_provider_models()
+            for model in candidate_models
         ),
         default=3,
     )
@@ -111,6 +124,7 @@ async def execute_request(
     excluded: frozenset[str] = frozenset()
     excluded_routes: frozenset[str] = frozenset()
     last_error: ProviderError | None = None
+    no_candidates = False
 
     traces: list[dict] = []
     while attempts < coordinator.policy.max_attempts:
@@ -144,6 +158,12 @@ async def execute_request(
         except (LookupError, NoRouteAvailable) as exc:
             trace.selected = None
             trace.fallback_reason = trace.fallback_reason or type(exc).__name__
+            # Whether any candidate was even considered separates a configuration
+            # problem from exhausted capacity. Nothing considered means no mapping
+            # matches the request at all, for example the model is not exposed over
+            # the requested protocol. Candidates considered and all excluded means
+            # the model is servable but everything was temporarily ineligible.
+            no_candidates = not trace.considered
             traces.append(trace.as_dict())
             break
         traces.append(trace.as_dict())
@@ -571,6 +591,10 @@ async def execute_request(
         await recorder.record_routing_trace(traces)
         return gateway_error(last_error)
     ended_at = datetime.now(UTC)
+    category = (
+        ErrorCategory.MODEL_UNAVAILABLE if no_candidates
+        else ErrorCategory.NO_ELIGIBLE_ROUTE
+    )
     await recorder.finish_request(
         status="failed",
         resolved_model=None,
@@ -578,9 +602,24 @@ async def execute_request(
         latency_ms=_latency_ms(started_at, ended_at),
         retry_count=0,
         fallback_count=0,
-        error_category=ErrorCategory.MODEL_UNAVAILABLE.value,
+        error_category=category.value,
     )
-    return client_error(ErrorCategory.MODEL_UNAVAILABLE, "No eligible model route exists.", 503)
+    await recorder.record_routing_trace(traces)
+    if category is ErrorCategory.MODEL_UNAVAILABLE:
+        return client_error(
+            category,
+            "No provider is configured to serve this model as requested.",
+            404,
+        )
+    # The model is configured; nothing that could serve it was eligible right now.
+    # Reporting this as model_unavailable told the operator the model was missing,
+    # which sent them to look at mappings instead of at health, quota and cooldown.
+    return client_error(
+        category,
+        "No provider route for this model is currently eligible. The routing trace "
+        "records why each candidate was excluded.",
+        503,
+    )
 
 
 def _transport_error(exc: Exception) -> ProviderError:

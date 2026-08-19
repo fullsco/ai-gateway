@@ -153,3 +153,39 @@ def test_caller_supplied_stream_options_are_respected() -> None:
     upstream = adapter.create_request(request, Credential(id="c", secret="s"))
 
     assert upstream.json_body["stream_options"] == {"include_usage": False}
+
+
+def test_edge_challenge_403_is_not_blamed_on_the_credential() -> None:
+    """A Cloudflare 403 challenge page is not a credential rejection.
+
+    Without this branch every working key on the provider was parked in turn,
+    because each 403 marked the credential auth_failed.
+    """
+    error = make_adapter().normalize_error(
+        httpx.Response(
+            403,
+            headers={"content-type": "text/html"},
+            text="<html><title>Attention Required! | Cloudflare</title></html>",
+        )
+    )
+
+    assert error.category is ErrorCategory.UPSTREAM_WAF_REJECTION
+    assert error.credential_at_fault is False
+
+
+def test_genuine_403_error_envelope_is_still_a_credential_rejection() -> None:
+    error = make_adapter().normalize_error(
+        httpx.Response(403, json={"error": {"message": "invalid api key"}})
+    )
+
+    assert error.category is ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR
+    assert error.credential_at_fault is True
+
+
+def test_payment_required_without_a_marker_is_a_billing_condition() -> None:
+    error = make_adapter().normalize_error(
+        httpx.Response(402, json={"error": {"message": "top up"}})
+    )
+
+    assert error.category is ErrorCategory.QUOTA_EXHAUSTED
+    assert error.retryable is True

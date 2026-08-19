@@ -101,6 +101,11 @@ class AnthropicCompatibleAdapter(ProviderAdapter):
             marker in searchable for marker in QUOTA_MARKERS
         ):
             category = ErrorCategory.QUOTA_EXHAUSTED
+        elif response.status_code == 402:
+            # Payment Required is a billing condition even when the wording does
+            # not match a marker; classifying it as an invalid request made it
+            # non-retryable and returned 400 to the client.
+            category = ErrorCategory.QUOTA_EXHAUSTED
         elif response.status_code == 429:
             category = ErrorCategory.RATE_LIMIT
         elif response.status_code in {408, 504}:

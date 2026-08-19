@@ -171,3 +171,18 @@ def test_non_json_error_does_not_reflect_upstream_body() -> None:
 
     assert error.message == "Upstream provider request failed."
     assert "secret" not in error.message
+
+
+def test_payment_required_without_a_marker_is_still_a_billing_condition() -> None:
+    """402 meant "invalid request" unless the body matched a quota marker.
+
+    That made it non-retryable and returned 400 to the client, instead of failing
+    over to a credential that still has balance.
+    """
+    error = make_adapter().normalize_error(
+        httpx.Response(402, json={"error": {"type": "payment", "message": "top up"}})
+    )
+
+    assert error.category is ErrorCategory.QUOTA_EXHAUSTED
+    assert error.retryable is True
+    assert error.credential_at_fault is True

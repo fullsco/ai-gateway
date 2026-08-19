@@ -198,7 +198,9 @@ def test_stream_usage_accumulator_tracks_cumulative_growth() -> None:
         ("timeout", "degraded"),
         ("provider_unavailable", "unavailable"),
         ("invalid_request", None),
-        ("model_unavailable", None),
+        # A provider that 404s a model it is mapped to is degraded for that route;
+        # returning None suppressed even the health_checks row.
+        ("model_unavailable", "degraded"),
     ],
 )
 def test_passive_health_classification(category, health) -> None:

@@ -206,6 +206,10 @@ def _passive_health(error_category: str | None) -> str | None:
         "rate_limit": "rate_limited",
         "timeout": "degraded",
         "provider_unavailable": "unavailable",
+        # A provider that 404s a model it is mapped to is degraded for that route.
+        # Returning None here suppressed even the health_checks row, so the single
+        # largest failure category was invisible in the Health view.
+        "model_unavailable": "degraded",
     }.get(error_category)
 
 

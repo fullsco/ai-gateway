@@ -246,13 +246,31 @@ function columnLabel(column: string): string {
 }
 
 function explainError(value: unknown): string {
+  // Keys must be the values the gateway actually writes. Two of the previous
+  // entries ("rate_limited", "authentication_failed") are health states, not
+  // error categories, and were never emitted, so the two most operationally
+  // important failures fell through to a raw de-underscored string.
   const explanations: Record<string, string> = {
-    upstream_waf_rejection: "The upstream rejected the request with a WAF response. Other eligible routes may still be used.",
-    rate_limited: "The provider or credential is rate limited. The Gateway may try another eligible credential or provider.",
-    authentication_failed: "The provider credential was rejected. Rotate or disable it before relying on this route.",
-    quota_exhausted: "The configured quota has been reached. Another eligible credential or provider is required.",
+    upstream_waf_rejection:
+      "An edge or bot-protection layer at the provider blocked the request, not the credential. Other eligible routes may still be used.",
+    rate_limit:
+      "The provider rate limited this credential. It is paused briefly and another eligible credential or provider is used.",
+    upstream_authentication_error:
+      "The provider rejected this credential. Rotate or disable it; other credentials on the same provider are tried first.",
+    authentication_error:
+      "The gateway API key sent by the client was rejected. Nothing upstream is wrong.",
+    quota_exhausted:
+      "This credential is out of quota or balance. Another credential or provider with headroom is required.",
     timeout: "The provider did not respond before the configured timeout.",
-    model_unavailable: "The provider cannot currently serve this model.",
+    provider_unavailable:
+      "The provider could not be reached or returned a server error. Traffic moves to another eligible provider.",
+    model_unavailable:
+      "This provider does not serve the requested model, even though it is mapped to it.",
+    no_eligible_route:
+      "The model is configured, but no route could serve it at that moment: every candidate was unhealthy, cooling down, out of quota, or at its concurrency limit. Open the request trace to see which and why.",
+    invalid_request:
+      "The request itself was rejected as malformed. Retrying elsewhere would fail the same way, so no failover was attempted.",
+    internal_error: "The gateway failed to complete the request.",
   };
   return explanations[String(value)] ?? String(value ?? "No reason recorded").replaceAll("_", " ");
 }

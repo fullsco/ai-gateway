@@ -166,6 +166,13 @@ _LOCAL_COOLDOWN_SECONDS: dict[str, float] = {
 # Categories that are conclusive about the credential on the very first failure.
 # Everything else needs repeated failures before we park the credential, so a
 # single upstream blip cannot take the last credential out of rotation.
+_CLIENT_FAULT_CATEGORIES = frozenset(
+    {
+        ErrorCategory.INVALID_REQUEST.value,
+        ErrorCategory.AUTHENTICATION_ERROR.value,
+    }
+)
+
 _IMMEDIATE_COOLDOWN = {
     ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR.value,
     ErrorCategory.RATE_LIMIT.value,
@@ -243,6 +250,12 @@ class LiveOperationalState:
 
         category = error_category or ErrorCategory.INTERNAL_ERROR.value
         cred.last_error_category = category
+        if category in _CLIENT_FAULT_CATEGORIES:
+            # The request itself was bad. Nothing about the provider or the
+            # credential is worse for having been asked, so record neither: a
+            # client sending malformed bodies used to lower a healthy provider's
+            # score and push traffic away from it.
+            return
         if not credential_at_fault:
             # Provider or edge level problem. Penalise the provider's score so it
             # becomes less preferred, but leave the credential usable - it may be

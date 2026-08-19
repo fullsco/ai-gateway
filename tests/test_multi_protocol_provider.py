@@ -1,5 +1,6 @@
 import base64
 import json
+from dataclasses import replace
 
 import httpx
 import pytest
@@ -9,6 +10,7 @@ from gateway.app import create_app
 from gateway.config import Settings
 from gateway.configuration import RuntimeBuilder
 from gateway.health.probes import run_health_probes
+from gateway.routing.engine import HealthState
 from gateway.security import CredentialCipher, GatewayKeyHasher
 
 
@@ -154,7 +156,11 @@ def test_mapping_protocol_is_exact_and_credential_restrictions_still_apply() -> 
             json={"model": "openai-model", "messages": []},
         )
 
-    assert wrong_protocol.status_code == 503
+    # No mapping exposes this model over the Anthropic protocol, so no candidate is
+    # even considered. That is a configuration condition and is reported as 404
+    # model_unavailable, distinct from 503 no_eligible_route, which means the model
+    # is servable but every candidate was temporarily ineligible.
+    assert wrong_protocol.status_code == 404
     assert wrong_protocol.json()["error"]["type"] == "model_unavailable"
     assert allowed.status_code == 200
     assert seen_keys == ["Bearer provider-key-2"]
@@ -200,3 +206,34 @@ async def test_health_probes_are_bounded_to_one_route_per_credential() -> None:
 
     assert len(seen_paths) == 2
     assert set(seen_paths) <= {"/v1/messages", "/v1/models"}
+
+
+def test_exhausted_capacity_is_reported_as_no_eligible_route_not_a_missing_model() -> None:
+    """A model whose credentials are all unusable is servable, just not right now.
+
+    Both conditions used to return model_unavailable, which sent the operator to
+    check mappings when the real cause was credential health.
+    """
+    runtime, key = build_runtime(lambda _: httpx.Response(200, json={"id": "x"}))
+    # Park every credential, exactly as a live failure would.
+    runtime = runtime.__class__(
+        **{
+            **runtime.__dict__,
+            "credential_states": tuple(
+                replace(state, health=HealthState.UNAVAILABLE)
+                for state in runtime.credential_states
+            ),
+        }
+    )
+    app = create_app(Settings(environment="test", _env_file=None), runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": f"Bearer {key}"},
+            json={"model": "openai-model", "messages": []},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["type"] == "no_eligible_route"
+    assert "currently eligible" in response.json()["error"]["message"]

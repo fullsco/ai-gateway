@@ -288,3 +288,46 @@ def test_route_without_pool_allows_provider_credentials() -> None:
     )
 
     assert decision.credential.credential_id == "credential"
+
+
+def test_every_error_category_has_a_client_status() -> None:
+    """A category with no status mapping raises a KeyError mid-response."""
+    from gateway.api.errors import ERROR_STATUS
+    from gateway.providers import ErrorCategory
+
+    missing = [category for category in ErrorCategory if category not in ERROR_STATUS]
+    assert not missing, f"categories with no HTTP status: {missing}"
+
+
+def test_every_error_category_has_retry_semantics() -> None:
+    from gateway.providers import ErrorCategory
+    from gateway.providers.base import _RETRY_SEMANTICS
+
+    missing = [category for category in ErrorCategory if category not in _RETRY_SEMANTICS]
+    assert not missing, f"categories with no retry semantics: {missing}"
+
+
+def test_no_eligible_route_is_distinct_from_a_missing_model() -> None:
+    """"Nothing was eligible" and "this provider lacks the model" are not the same.
+
+    Reporting exhausted capacity as model_unavailable sent the operator to look at
+    mappings when the real cause was health, quota or cooldown.
+    """
+    from gateway.api.errors import ERROR_STATUS
+    from gateway.providers import ErrorCategory
+    from gateway.providers.base import build_provider_error
+
+    assert ERROR_STATUS[ErrorCategory.MODEL_UNAVAILABLE] == 404
+    assert ERROR_STATUS[ErrorCategory.NO_ELIGIBLE_ROUTE] == 503
+
+    # Nothing was contacted, so there is nothing to retry within the request.
+    error = build_provider_error(ErrorCategory.NO_ELIGIBLE_ROUTE, "none eligible")
+    assert error.retryable is False
+    assert error.credential_at_fault is False
+
+
+def test_a_provider_404_is_visible_in_the_health_view() -> None:
+    """model_unavailable previously suppressed even the health_checks row."""
+    from gateway.observability import _passive_health
+
+    assert _passive_health("model_unavailable") == "degraded"

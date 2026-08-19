@@ -33,7 +33,7 @@ describe("control plane", () => {
     render(<ControlPlane />);
     await userEvent.click(screen.getByRole("button", { name: "Health" }));
     expect(await screen.findByText("Degraded")).toBeVisible();
-    expect(screen.getByText(/upstream rejected the request with a WAF response/i)).toBeVisible();
+    expect(screen.getByText(/edge or bot-protection layer at the provider blocked/i)).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "Activity" }));
     expect(await screen.findByText("Credential secret rotated")).toBeVisible();
     expect(document.body.textContent).not.toContain("[object Object]");
@@ -56,7 +56,7 @@ describe("control plane", () => {
       if (path.includes("requests/request-1")) return response({
         request: { id: "request-1", requested_model: "claude-opus-5", resolved_model: "claude-opus-5", status: "succeeded", latency_ms: 1800, retry_count: 0, fallback_count: 1 },
         attempts: [
-          { id: "attempt-1", provider_name: "AgentRouter", credential_name: "Primary", status: "failed", upstream_status: 429, error_category: "rate_limited", latency_ms: 320 },
+          { id: "attempt-1", provider_name: "AgentRouter", credential_name: "Primary", status: "failed", upstream_status: 429, error_category: "rate_limit", latency_ms: 320 },
           { id: "attempt-2", provider_name: "GoRouter", credential_name: "Fallback", status: "succeeded", upstream_status: 200, latency_ms: 1480 },
         ],
         usage: [{ input_tokens: 100, output_tokens: 40, cached_tokens: 10, estimated_cost: null }],
@@ -187,6 +187,39 @@ describe("control plane", () => {
     expect(screen.queryByText(/0\.0000 null/)).not.toBeInTheDocument();
     // The priced attempt is shown, and the unpriced one is declared, not hidden.
     expect(screen.getByText(/0\.0003 USD \(1 unpriced\)/)).toBeVisible();
+  });
+
+  it("explains every failure the gateway can report", async () => {
+    // Two former keys ("rate_limited", "authentication_failed") are health states,
+    // not error categories, so the two most important failures rendered as a raw
+    // de-underscored string while the test passed against the wrong fixture.
+    const expected: [string, RegExp][] = [
+      ["authentication_error", /gateway API key sent by the client/i],
+      ["upstream_authentication_error", /provider rejected this credential/i],
+      ["upstream_waf_rejection", /edge or bot-protection layer/i],
+      ["rate_limit", /rate limited this credential/i],
+      ["quota_exhausted", /out of quota or balance/i],
+      ["model_unavailable", /does not serve the requested model/i],
+      ["no_eligible_route", /every candidate was unhealthy/i],
+      ["provider_unavailable", /could not be reached/i],
+      ["timeout", /did not respond before the configured timeout/i],
+      ["invalid_request", /rejected as malformed/i],
+      ["internal_error", /gateway failed to complete/i],
+    ];
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes("health")) return response({ data: expected.map(([category], index) => ({
+        id: index + 1, provider_name: "AgentRouter", credential_name: `k${index}`,
+        status: "degraded", error_category: category,
+      })) });
+      return response(overview);
+    }));
+    render(<ControlPlane />);
+    await userEvent.click(screen.getByRole("button", { name: "Health" }));
+    await screen.findByText(/edge or bot-protection layer/i);
+    expected.forEach(([category, phrase]) => {
+      expect(screen.getByText(phrase), `no explanation for ${category}`).toBeVisible();
+    });
   });
 
   it("shows a human-readable publish review before publishing", async () => {

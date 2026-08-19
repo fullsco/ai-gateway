@@ -87,12 +87,23 @@ class OpenAICompatibleAdapter(ProviderAdapter):
         searchable = f"{error_type} {error_code} {message}".lower()
         retry_after = self._retry_after(response.headers.get("retry-after"))
 
-        if response.status_code in {401, 403}:
+        if response.status_code == 403 and self._is_waf_rejection(response):
+            # An edge or bot-protection layer answering 403 with a challenge page
+            # is not a credential rejection. Without this branch a Cloudflare 403
+            # parked every working key on the provider in turn.
+            category = ErrorCategory.UPSTREAM_WAF_REJECTION
+        elif response.status_code in {401, 403}:
             # The upstream rejected *this credential*, not the client's gateway key.
             category = ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR
         elif response.status_code in {402, 429} and any(
             marker in searchable for marker in QUOTA_MARKERS
         ):
+            category = ErrorCategory.QUOTA_EXHAUSTED
+        elif response.status_code == 402:
+            # Payment Required is a billing condition even when the wording does
+            # not match a marker. Treating it as an invalid request made it
+            # non-retryable and returned 400 to the client, which is the opposite
+            # of the intended failover to a credential that still has balance.
             category = ErrorCategory.QUOTA_EXHAUSTED
         elif response.status_code == 429:
             category = ErrorCategory.RATE_LIMIT
@@ -133,6 +144,18 @@ class OpenAICompatibleAdapter(ProviderAdapter):
             },
             timeout=httpx.Timeout(min(self.config.timeout_seconds, 10)),
         )
+
+    @staticmethod
+    def _is_waf_rejection(response: httpx.Response) -> bool:
+        """True when the body is not a provider error envelope.
+
+        A challenge or interstitial page is HTML, or JSON without an error object.
+        """
+        try:
+            payload = response.json()
+        except ValueError:
+            return True
+        return not (isinstance(payload, dict) and isinstance(payload.get("error"), dict))
 
     @staticmethod
     def _extract_error(response: httpx.Response) -> tuple[str, str, str]:
