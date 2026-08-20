@@ -222,6 +222,69 @@ describe("control plane", () => {
     });
   });
 
+  it("presents an alert as what happened, why, and what to do", async () => {
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes("alerts")) return response({ data: [{
+        id: 1, severity: "critical", status: "open",
+        title: "Provider is failing most requests: GoRouter",
+        summary: "More than half of the attempts sent to this provider failed.",
+        recommended_action: "Check the provider status, then Health for affected credentials.",
+        observed: { attempts: 20, failures: 18, failure_rate: 0.9 },
+        occurrence_count: 4, last_seen_at: "2026-08-20T00:00:00Z", resolved_reason: null,
+      }] });
+      return response(overview);
+    }));
+    render(<ControlPlane />);
+    await userEvent.click(screen.getByRole("button", { name: "Alerts" }));
+    expect(await screen.findByText(/More than half of the attempts/i)).toBeVisible();
+    expect(screen.getByText(/Check the provider status/i)).toBeVisible();
+    // The measured values read as a sentence, not raw JSON.
+    expect(screen.getByText(/failure rate: 0\.9/i)).toBeVisible();
+    expect(document.body.textContent).not.toContain("[object Object]");
+  });
+
+  it("describes an alert rule without showing raw JSON", async () => {
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes("alert-rules")) return response({ data: [{
+        id: "r1", name: "Provider is failing most requests", severity: "critical",
+        enabled: true, condition_kind: "provider_failure_rate",
+        condition: { window_minutes: 15, at_least: 0.5, min_requests: 10 },
+        description: "More than half of the attempts failed.",
+        cooldown_seconds: 900, updated_at: "2026-08-20T00:00:00Z",
+      }] });
+      return response(overview);
+    }));
+    render(<ControlPlane />);
+    await userEvent.click(screen.getByRole("button", { name: "Alert rules" }));
+    expect(await screen.findByText("Provider failing a share of attempts")).toBeVisible();
+    expect(screen.getByText(/at or above 0\.5, measured over 15 minutes/i)).toBeVisible();
+    expect(document.body.textContent).not.toContain("window_minutes");
+  });
+
+  it("says whether a quota figure is a measurement", async () => {
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes("credentials")) return response({ data: [
+        { id: "c1", name: "measured", provider_name: "P", enabled: true, health: "healthy",
+          quota_used: 5, quota_limit: 10, quota_confidence: "known", balance_amount: null },
+        { id: "c2", name: "no-limit", provider_name: "P", enabled: true, health: "healthy",
+          quota_used: 5, quota_limit: null, quota_confidence: "estimated", balance_amount: 2.5 },
+        { id: "c3", name: "nothing", provider_name: "P", enabled: true, health: "healthy",
+          quota_used: null, quota_limit: null, quota_confidence: "unknown", balance_amount: null },
+      ] });
+      return response(overview);
+    }));
+    render(<ControlPlane />);
+    await userEvent.click(screen.getByRole("button", { name: /Credentials/ }));
+    expect(await screen.findByText(/Measured - a limit and a usage figure/i)).toBeVisible();
+    expect(screen.getByText(/headroom unknown/i)).toBeVisible();
+    expect(screen.getByText(/do not read this as remaining capacity/i)).toBeVisible();
+    // An unobserved balance must not read as zero.
+    expect(screen.getAllByText("Not observed").length).toBeGreaterThan(0);
+  });
+
   it("shows a human-readable publish review before publishing", async () => {
     vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
       const path = String(input);

@@ -54,7 +54,11 @@ const resources: Record<ResourceView, { endpoint: string; title: string; mutable
     endpoint: "credentials",
     title: "Credentials",
     mutable: true,
-    columns: ["name", "provider_name", "masked_hint", "enabled", "health", "quota_used", "quota_limit", "cooldown_until"],
+    columns: [
+      "name", "provider_name", "masked_hint", "enabled", "health",
+      "quota_used", "quota_limit", "quota_confidence", "balance_amount",
+      "balance_observed_at", "cooldown_until",
+    ],
   },
   clients: {
     endpoint: "clients",
@@ -138,25 +142,44 @@ const resources: Record<ResourceView, { endpoint: string; title: string; mutable
     endpoint: "budgets",
     title: "Budgets",
     mutable: true,
-    columns: ["name", "scope_type", "period", "currency", "limit_amount", "used", "enforcement", "enabled"],
+    columns: ["name", "scope_type", "period", "currency", "limit_amount", "used", "requests_this_period", "enforcement", "enabled"],
   },
   alerts: {
     endpoint: "alerts",
     title: "Alerts",
     mutable: false,
-    columns: ["severity", "status", "event_type", "title", "occurrence_count", "last_seen_at"],
+    columns: [
+      "severity", "status", "title", "summary", "recommended_action",
+      "observed", "occurrence_count", "last_seen_at", "resolved_reason",
+    ],
   },
   "alert-rules": {
     endpoint: "alert-rules",
     title: "Alert rules",
     mutable: true,
-    columns: ["name", "event_type", "severity", "enabled", "cooldown_seconds", "updated_at"],
+    columns: [
+      "name", "severity", "enabled", "condition_kind", "condition",
+      "description", "cooldown_seconds", "updated_at",
+    ],
   },
 };
 
 const api = gatewayApi;
 
 function display(value: unknown, key: string, row?: Row) {
+  if (key === "quota_confidence") return QUOTA_CONFIDENCE[String(value)] ?? "No signal";
+  if (key === "summary" || key === "recommended_action" || key === "description") {
+    return value === null || value === undefined || value === "" ? "Not recorded" : String(value);
+  }
+  if (key === "observed" && value && typeof value === "object") {
+    // The measured values that satisfied the condition, read as a sentence.
+    return Object.entries(value as Record<string, unknown>)
+      .map(([name, observed]) => `${name.replaceAll("_", " ")}: ${readable(observed)}`)
+      .join(", ");
+  }
+  if (key === "condition" && value && typeof value === "object") return describeCondition(value as Row);
+  if (key === "condition_kind") return CONDITION_KINDS[String(value)] ?? readable(value);
+  if (key === "balance_amount" && (value === null || value === undefined)) return "Not observed";
   if (key.includes("cost") && (value === null || value === undefined || value === "")) return "Pricing unavailable";
   if (value === null || value === undefined || value === "") {
     if (key.includes("cooldown")) return "Not cooling down";
@@ -244,6 +267,50 @@ const labels: Record<string, string> = {
 function columnLabel(column: string): string {
   return labels[column] ?? column.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
+
+// A rule should be readable without knowing the condition vocabulary.
+const CONDITION_KINDS: Record<string, string> = {
+  credential_quota_low: "Credential quota nearly used up",
+  credential_balance_low: "Credential balance nearly gone",
+  credential_auth_failures: "Credential repeatedly rejected",
+  provider_failure_rate: "Provider failing a share of attempts",
+  provider_unreachable: "Provider cannot be reached",
+  model_no_eligible_route: "Model had nowhere to run",
+  credential_pool_exhausted: "Provider has no usable credentials",
+  request_failure_rate: "Requests failing for a model",
+  cost_spike: "Spend in a window",
+  unpriced_traffic: "Traffic without pricing",
+};
+
+/** Render a rule's condition as a sentence rather than raw JSON. */
+function describeCondition(condition: Row): string {
+  const parts: string[] = [];
+  const window = condition.window_minutes;
+  const threshold = condition.at_least ?? condition.at_most ?? condition.threshold;
+  if (threshold !== undefined && threshold !== null) {
+    const direction = condition.at_most !== undefined ? "at or below" : "at or above";
+    parts.push(`${direction} ${readable(threshold)}`);
+  }
+  if (window) parts.push(`measured over ${readable(window)} minutes`);
+  const floor = condition.min_requests ?? condition.min_samples;
+  if (floor) parts.push(`only once there are ${readable(floor)} or more`);
+  Object.entries(condition).forEach(([key, value]) => {
+    if (["window_minutes", "at_least", "at_most", "threshold", "value", "min_requests", "min_samples"].includes(key)) return;
+    if (value && typeof value === "object") {
+      const [operator, target] = Object.entries(value as Row)[0] ?? [];
+      if (operator) parts.push(`${key.replaceAll("_", " ")} ${String(operator).replaceAll("_", " ")} ${readable(target)}`);
+      return;
+    }
+    parts.push(`${key.replaceAll("_", " ")} is ${readable(value)}`);
+  });
+  return parts.length ? parts.join(", ") : "Always";
+}
+
+const QUOTA_CONFIDENCE: Record<string, string> = {
+  known: "Measured - a limit and a usage figure are both known",
+  estimated: "Spend known, no limit - trend only, headroom unknown",
+  unknown: "No signal - do not read this as remaining capacity",
+};
 
 function explainError(value: unknown): string {
   // Keys must be the values the gateway actually writes. Two of the previous
