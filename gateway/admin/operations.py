@@ -5,7 +5,7 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from gateway.admin.api import _authorize, _pool
 from gateway.health.probes import run_health_probes
@@ -76,15 +76,48 @@ class BudgetInput(BaseModel):
     enabled: bool = True
 
 
+CONDITION_KINDS = (
+    "credential_quota_low",
+    "credential_balance_low",
+    "credential_auth_failures",
+    "provider_failure_rate",
+    "provider_unreachable",
+    "model_no_eligible_route",
+    "credential_pool_exhausted",
+    "request_failure_rate",
+    "cost_spike",
+    "unpriced_traffic",
+)
+
+
 class AlertRuleInput(BaseModel):
+    """A rule fires either from a request-time event or from a monitored condition.
+
+    condition_kind names a condition the monitor knows how to evaluate, so a rule
+    can be written without knowing internal event names. The prose fields are what
+    the operator reads when the alert arrives.
+    """
+
     name: str = Field(min_length=1, max_length=120)
     enabled: bool = True
     severity: Literal["info", "warning", "critical"] = "warning"
-    event_type: str = Field(min_length=1, max_length=120)
+    event_type: str | None = Field(default=None, min_length=1, max_length=120)
+    condition_kind: Literal[CONDITION_KINDS] | None = None  # type: ignore[valid-type]
     scope_type: str | None = None
     scope_id: str | None = None
     condition: dict[str, Any] = Field(default_factory=dict)
     cooldown_seconds: int = Field(ge=0, default=300)
+    description: str | None = Field(default=None, max_length=500)
+    impact: str | None = Field(default=None, max_length=500)
+    recommended_action: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def require_a_trigger(self) -> "AlertRuleInput":
+        if not self.event_type and not self.condition_kind:
+            raise ValueError("a rule needs either an event_type or a condition_kind")
+        if self.event_type and self.condition_kind:
+            raise ValueError("a rule fires from an event_type or a condition_kind, not both")
+        return self
 
 
 async def _authorized_pool(request: Request) -> tuple[Any, Any] | JSONResponse:
@@ -407,8 +440,9 @@ async def create_alert_rule(request: Request, body: AlertRuleInput) -> JSONRespo
     claims, pool = context
     row = await pool.fetchrow(
         """insert into public.alert_rules(
-             name,enabled,severity,event_type,scope_type,scope_id,condition,cooldown_seconds)
-           values($1,$2,$3,$4,$5,$6,$7::jsonb,$8) returning *""",
+             name,enabled,severity,event_type,scope_type,scope_id,condition,cooldown_seconds,
+             condition_kind,description,impact,recommended_action)
+           values($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12) returning *""",
         body.name,
         body.enabled,
         body.severity,
@@ -417,6 +451,10 @@ async def create_alert_rule(request: Request, body: AlertRuleInput) -> JSONRespo
         body.scope_id,
         json.dumps(body.condition),
         body.cooldown_seconds,
+        body.condition_kind,
+        body.description,
+        body.impact,
+        body.recommended_action,
     )
     await pool.execute(
         """insert into public.audit_logs(actor_id,action,resource_type,resource_id,metadata)
@@ -437,6 +475,7 @@ async def update_alert_rule(rule_id: UUID, request: Request, body: AlertRuleInpu
     row = await pool.fetchrow(
         """update public.alert_rules set name=$2,enabled=$3,severity=$4,event_type=$5,
              scope_type=$6,scope_id=$7,condition=$8::jsonb,cooldown_seconds=$9,
+             condition_kind=$10,description=$11,impact=$12,recommended_action=$13,
              updated_at=now() where id=$1 returning *""",
         rule_id,
         body.name,
@@ -447,6 +486,10 @@ async def update_alert_rule(rule_id: UUID, request: Request, body: AlertRuleInpu
         body.scope_id,
         json.dumps(body.condition),
         body.cooldown_seconds,
+        body.condition_kind,
+        body.description,
+        body.impact,
+        body.recommended_action,
     )
     if row is None:
         return JSONResponse({"error": "alert_rule_not_found"}, status_code=404)

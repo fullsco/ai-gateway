@@ -12,6 +12,7 @@ from gateway.admin.auth import SupabaseJWTVerifier
 from gateway.admin.control_plane import router as control_plane_router
 from gateway.admin.operations import router as operations_router
 from gateway.admin.reconcile import router as reconcile_router
+from gateway.alerts_monitor import alert_monitor_loop
 from gateway.api.messages import router as messages_router
 from gateway.api.models import router as models_router
 from gateway.api.openai import router as openai_router
@@ -88,6 +89,7 @@ def create_app(
         probe_task = None
         live_state_task = None
         usage_task = None
+        alert_task = None
         if app_settings.database_url:
             try:
                 if not app_settings.credential_encryption_key or not app_settings.key_pepper:
@@ -169,6 +171,16 @@ def create_app(
                     app_settings.credential_encryption_key,
                 )
             )
+        if (
+            app_settings.alert_monitor_enabled
+            and getattr(app.state, "db_pool", None) is not None
+        ):
+            alert_task = asyncio.create_task(
+                alert_monitor_loop(
+                    app_settings.alert_monitor_interval_seconds,
+                    lambda: getattr(app.state, "db_pool", None),
+                )
+            )
         if app_settings.health_probe_enabled:
             probe_task = asyncio.create_task(
                 health_probe_loop(
@@ -199,6 +211,10 @@ def create_app(
                 live_state_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await live_state_task
+            if alert_task is not None:
+                alert_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await alert_task
             if usage_task is not None:
                 usage_task.cancel()
                 with suppress(asyncio.CancelledError):

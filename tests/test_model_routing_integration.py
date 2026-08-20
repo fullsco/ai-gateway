@@ -388,3 +388,29 @@ async def test_get_routing_payload_round_trips_through_the_put_contract() -> Non
                 await transaction.rollback()
     finally:
         await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_every_alert_condition_query_is_valid_sql() -> None:
+    """Fake-pool tests cannot catch a malformed query or a parameter mismatch.
+
+    Every condition initially failed against real PostgreSQL: some passed a
+    parameter the query never referenced, so asyncpg could not infer its type, and
+    others referenced one that was not passed. The unit tests all passed, because
+    their fake pool ignores the SQL entirely.
+    """
+    from gateway.alerts_monitor import _CONDITIONS
+
+    pool = await create_pool(_database_url())
+    values = {"window": 15, "threshold": 0.5, "floor": 1}
+    failures: list[str] = []
+    try:
+        for kind, (_scope, query, bindings) in sorted(_CONDITIONS.items()):
+            try:
+                await pool.fetch(query, *(values[name] for name in bindings))
+            except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                failures.append(f"{kind}: {type(exc).__name__}: {exc}")
+    finally:
+        await pool.close()
+
+    assert not failures, "invalid alert condition queries:\n" + "\n".join(failures)

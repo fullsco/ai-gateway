@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     # How often live operational state (health, cooldown, quota) is re-read from the
     # database. In-process attempt outcomes apply immediately regardless of this.
     live_state_refresh_seconds: float = Field(default=3, gt=0)
+    alert_monitor_enabled: bool = True
+    alert_monitor_interval_seconds: float = Field(default=60, gt=0)
     credential_usage_poll_enabled: bool = False
     credential_usage_poll_interval_seconds: float = Field(default=900, gt=0)
     quota_soft_threshold: float = Field(default=0.15, ge=0, le=1)
