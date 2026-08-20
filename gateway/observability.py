@@ -11,6 +11,9 @@ from gateway.alerts import AlertEvent, evaluate_alert_rules
 from gateway.logging import log_event
 from gateway.protocols import ClientProtocol
 
+# input total (inclusive of both cached dimensions), output, cache read, cache write
+Usage = tuple[int | None, int | None, int | None, int | None]
+
 logger = logging.getLogger("gateway.observability")
 
 
@@ -384,13 +387,13 @@ class RequestRecorder:
         await self._execute(
             """
             insert into public.usage_records(
-              request_id,attempt_id,input_tokens,output_tokens,cached_tokens,
+              request_id,attempt_id,input_tokens,output_tokens,cached_tokens,cache_write_tokens,
               estimated_cost,currency,is_estimate,provider_id_snapshot,
               provider_name_snapshot,provider_model_id_snapshot,route_id_snapshot,
               canonical_model_snapshot,upstream_model_snapshot,protocol_snapshot,
               attempt_status_snapshot,pricing_context,pricing_context_hash
             ) values(
-              $1,$2,$3,$4,$5,$6,$7,true,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17
+              $1,$2,$3,$4,$5,$6,$7,$8,true,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18
             ) on conflict (attempt_id) do nothing
             """,
             self.request_id,
@@ -398,6 +401,7 @@ class RequestRecorder:
             usage[0],
             usage[1],
             usage[2],
+            usage[3],
             estimated_cost,
             currency,
             attribution.provider_id,
@@ -444,7 +448,7 @@ class RequestRecorder:
 def extract_usage(
     protocol: ClientProtocol,
     content: bytes,
-) -> tuple[int | None, int | None, int | None] | None:
+) -> Usage | None:
     try:
         payload = json.loads(content)
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -471,6 +475,7 @@ def extract_usage(
             total_input,
             _integer(usage.get("output_tokens")),
             cache_read,
+            cache_write,
         )
     else:
         input_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
@@ -479,6 +484,8 @@ def extract_usage(
             usage.get("prompt_tokens", usage.get("input_tokens")),
             usage.get("completion_tokens", usage.get("output_tokens")),
             cached,
+            # Chat Completions does not report a cache write dimension.
+            None,
         )
     if any(value is not None and _integer(value) is None for value in raw_values):
         return None
@@ -487,7 +494,7 @@ def extract_usage(
 
 
 def estimate_cost(
-    usage: tuple[int | None, int | None, int | None],
+    usage: Usage,
     pricing: dict[str, object] | None,
 ) -> tuple[Decimal | None, str | None]:
     if not pricing:
@@ -496,7 +503,7 @@ def estimate_cost(
     currency = str(currency_value).strip().upper() if currency_value is not None else ""
     if len(currency) != 3 or not currency.isalpha():
         return None, None
-    input_tokens, output_tokens, cached_tokens = usage
+    input_tokens, output_tokens, cached_tokens, cache_write_tokens = usage
     # A billable dimension that was never reported cannot be priced. Treating it
     # as zero produced an immutable, currency-stamped cost that looked measured,
     # counted toward pricing coverage, and understated the real spend. An absent
@@ -504,6 +511,7 @@ def estimate_cost(
     if input_tokens is None or output_tokens is None:
         return None, None
     cached_tokens = cached_tokens or 0
+    cache_write_tokens = cache_write_tokens or 0
     if "blended_per_million" in pricing:
         # A measured blended rate is all a before/after billing measurement can
         # establish, so it is applied to total tokens and cannot discount cache
@@ -522,21 +530,31 @@ def estimate_cost(
         input_rate = Decimal(str(pricing["input_per_million"]))
         output_rate = Decimal(str(pricing["output_per_million"]))
         cached_rate = Decimal(str(pricing.get("cached_input_per_million", input_rate)))
+        # A cache write is charged above the base input rate. Absent an explicit
+        # rate, apply the 1.25x premium that Anthropic documents and that was
+        # measured on this deployment, rather than the base rate: defaulting to no
+        # premium silently understated cache-heavy traffic, which is most traffic.
+        cache_write_rate = Decimal(
+            str(pricing.get("cache_write_per_million", input_rate * Decimal("1.25")))
+        )
     except (KeyError, InvalidOperation, TypeError, ValueError):
         return None, None
-    if min(input_rate, output_rate, cached_rate) < 0:
+    if min(input_rate, output_rate, cached_rate, cache_write_rate) < 0:
         return None, None
-    uncached_input = max(0, input_tokens - cached_tokens)
+    # input_tokens is the inclusive total, so both cached dimensions come out of it
+    # and what remains is fresh input charged at the base rate.
+    fresh_input = max(0, input_tokens - cached_tokens - cache_write_tokens)
     total = (
-        Decimal(uncached_input) * input_rate
+        Decimal(fresh_input) * input_rate
         + Decimal(output_tokens) * output_rate
         + Decimal(cached_tokens) * cached_rate
+        + Decimal(cache_write_tokens) * cache_write_rate
     ) / Decimal(1_000_000)
     return total.quantize(Decimal("0.00000001")), currency
 
 
-def _valid_usage(usage: tuple[int | None, int | None, int | None]) -> bool:
-    input_tokens, _, cached_tokens = usage
+def _valid_usage(usage: Usage) -> bool:
+    input_tokens, _, cached_tokens, cache_write_tokens = usage
     return (
         any(value is not None for value in usage)
         and all(
@@ -545,8 +563,7 @@ def _valid_usage(usage: tuple[int | None, int | None, int | None]) -> bool:
         )
         and not (
             input_tokens is not None
-            and cached_tokens is not None
-            and cached_tokens > input_tokens
+            and (cached_tokens or 0) + (cache_write_tokens or 0) > input_tokens
         )
     )
 
@@ -557,7 +574,7 @@ class StreamUsageAccumulator:
     def __init__(self, protocol: ClientProtocol) -> None:
         self._protocol = protocol
         self._buffer = bytearray()
-        self._usage: tuple[int | None, int | None, int | None] | None = None
+        self._usage: Usage | None = None
 
     def feed(self, chunk: bytes) -> None:
         self._buffer.extend(chunk)
@@ -570,7 +587,7 @@ class StreamUsageAccumulator:
             self._buffer.clear()
 
     @property
-    def usage(self) -> tuple[int | None, int | None, int | None] | None:
+    def usage(self) -> Usage | None:
         return self._usage
 
     def _separator(self) -> tuple[int, int] | None:
@@ -591,7 +608,7 @@ class StreamUsageAccumulator:
         extracted = extract_usage(self._protocol, data)
         if extracted is None:
             return
-        current = self._usage or (None, None, None)
+        current = self._usage or (None, None, None, None)
         # Usage is cumulative within a stream, so keep the highest value seen for
         # each dimension. Merging on "is not None" let a later frame reporting 0
         # erase a real measurement: AgentRouter attaches a usage object to every

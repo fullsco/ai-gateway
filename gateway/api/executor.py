@@ -203,8 +203,10 @@ async def execute_request(
             if isinstance(estimated_output_tokens, int) and estimated_output_tokens >= 0
             else 0
         )
+        # Pre-flight reservation: nothing is known about caching yet, so both
+        # cached dimensions are unreported and the whole input is priced fresh.
         estimated_cost, currency = estimate_cost(
-            (estimated_input_tokens, output_tokens, None),
+            (estimated_input_tokens, output_tokens, None, None),
             dict(route.provider_model.pricing or {}),
         )
         try:

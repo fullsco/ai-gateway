@@ -162,6 +162,7 @@ class ProviderModelInput(NormalizedStringLists):
                 raise ValueError(f"pricing is missing: {', '.join(sorted(missing))}")
             allowed = required | {
                 "cached_input_per_million",
+                "cache_write_per_million",
                 "pricing_basis",
                 "sample_count",
                 "confidence",
@@ -172,6 +173,7 @@ class ProviderModelInput(NormalizedStringLists):
                 "input_per_million",
                 "output_per_million",
                 "cached_input_per_million",
+                "cache_write_per_million",
             }
         if extra := pricing.keys() - allowed:
             raise ValueError(f"pricing contains unsupported fields: {', '.join(sorted(extra))}")

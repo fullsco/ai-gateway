@@ -77,14 +77,14 @@ def test_extracts_anthropic_and_openai_usage_without_content() -> None:
     # Anthropic reports input_tokens excluding cache reads; it is normalized to
     # the inclusive convention (12 + 4) so one meaning of "input" holds for both
     # protocols. OpenAI already reports an inclusive prompt total.
-    assert anthropic == (16, 8, 4)
-    assert openai == (10, 5, 2)
+    assert anthropic == (16, 8, 4, None)
+    assert openai == (10, 5, 2, None)
 
 
 def test_estimate_cost_requires_pricing_and_accounts_for_cached_input() -> None:
-    assert estimate_cost((1_000_000, 500_000, 200_000), None) == (None, None)
+    assert estimate_cost((1_000_000, 500_000, 200_000, None), None) == (None, None)
     cost, currency = estimate_cost(
-        (1_000_000, 500_000, 200_000),
+        (1_000_000, 500_000, 200_000, None),
         {
             "input_per_million": 1,
             "output_per_million": 2,
@@ -105,7 +105,7 @@ def test_estimate_cost_requires_pricing_and_accounts_for_cached_input() -> None:
     ],
 )
 def test_estimate_cost_rejects_invalid_pricing(pricing: dict[str, object]) -> None:
-    assert estimate_cost((10, 5, None), pricing) == (None, None)
+    assert estimate_cost((10, 5, None, None), pricing) == (None, None)
 
 
 def test_estimate_cost_refuses_to_price_an_unreported_billable_dimension() -> None:
@@ -121,12 +121,12 @@ def test_estimate_cost_refuses_to_price_an_unreported_billable_dimension() -> No
         "currency": "USD",
     }
 
-    assert estimate_cost((900_000, None, None), pricing) == (None, None)
-    assert estimate_cost((None, 500, None), pricing) == (None, None)
-    assert estimate_cost((None, None, None), pricing) == (None, None)
+    assert estimate_cost((900_000, None, None, None), pricing) == (None, None)
+    assert estimate_cost((None, 500, None, None), pricing) == (None, None)
+    assert estimate_cost((None, None, None, None), pricing) == (None, None)
 
     # An absent cached count is a real "no cache read", so it stays priceable.
-    cost, currency = estimate_cost((1_000_000, 0, None), pricing)
+    cost, currency = estimate_cost((1_000_000, 0, None, None), pricing)
     assert currency == "USD"
     assert cost == Decimal("3.00000000")
 
@@ -138,7 +138,7 @@ def test_stream_usage_accumulator_reads_split_sse_metadata() -> None:
     accumulator.feed(b'event: message_delta\ndata: {"usage":{"output_')
     accumulator.feed(b'tokens":6}}\n\n')
 
-    assert accumulator.usage == (9, 6, None)
+    assert accumulator.usage == (9, 6, None, None)
 
 
 def test_stream_usage_accumulator_keeps_reported_tokens_when_later_frames_zero_them() -> None:
@@ -163,11 +163,11 @@ def test_stream_usage_accumulator_keeps_reported_tokens_when_later_frames_zero_t
         b'{"usage":{"input_tokens":10,"output_tokens":4,'
         b'"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}\n\n'
     )
-    assert accumulator.usage == (10, 4, 0), "message_delta must be captured"
+    assert accumulator.usage == (10, 4, 0, 0), "message_delta must be captured"
 
     accumulator.feed(b"event: message_stop\ndata: " + zeros + b"\n\n")
 
-    assert accumulator.usage == (10, 4, 0), (
+    assert accumulator.usage == (10, 4, 0, 0), (
         "a trailing all-zero frame must not overwrite reported usage"
     )
 
@@ -183,7 +183,7 @@ def test_stream_usage_accumulator_tracks_cumulative_growth() -> None:
         b'data: {"usage":{"prompt_tokens":120,"completion_tokens":31}}\n\n'
     )
 
-    assert accumulator.usage == (120, 31, None)
+    assert accumulator.usage == (120, 31, None, None)
 
 
 
@@ -318,8 +318,8 @@ def test_request_attempt_and_usage_are_persisted_without_payload_content() -> No
     assert "sensitive generated content" not in arguments
     assert "secret" not in arguments
     usage_args = next(args for query, args in pool.execute_calls if "usage_records" in query)
-    assert usage_args[2:7] == (3, 2, None, None, None)
-    assert usage_args[7:15] == (
+    assert usage_args[2:8] == (3, 2, None, None, None, None)
+    assert usage_args[8:16] == (
         "provider-a",
         None,
         "provider-model",
@@ -329,7 +329,8 @@ def test_request_attempt_and_usage_are_persisted_without_payload_content() -> No
         "anthropic_messages",
         "succeeded",
     )
-    assert usage_args[15:] == (None, None)
+    # pricing_context and its hash: absent when no cost could be derived.
+    assert usage_args[16:] == (None, None)
 
 
 def test_quota_rejection_finishes_request_without_creating_attempt() -> None:
@@ -468,8 +469,8 @@ def test_completed_stream_persists_committed_attempt_and_usage() -> None:
     assert attempt_update[1] == "succeeded"
     assert attempt_update[4] is True
     usage_args = next(args for query, args in pool.execute_calls if "usage_records" in query)
-    assert usage_args[2:7] == (7, 4, None, None, None)
-    assert usage_args[14] == "succeeded"
+    assert usage_args[2:8] == (7, 4, None, None, None, None)
+    assert usage_args[15] == "succeeded"
 
 
 @pytest.mark.asyncio
@@ -488,21 +489,33 @@ async def test_repeated_usage_persistence_is_database_idempotent() -> None:
     )
 
     await recorder.record_usage_values(
-        41, (10, 5, None), attribution, attempt_status="succeeded"
+        41, (10, 5, None, None), attribution, attempt_status="succeeded"
     )
     await recorder.record_usage_values(
-        41, (10, 5, None), attribution, attempt_status="succeeded"
+        41, (10, 5, None, None), attribution, attempt_status="succeeded"
     )
 
     inserts = [(query, args) for query, args in pool.execute_calls if "usage_records" in query]
     assert len(inserts) == 2
     assert all("on conflict (attempt_id) do nothing" in query for query, _ in inserts)
-    assert all(args[6] == "EUR" for _, args in inserts)
-    assert all(args[15] is not None and args[16] is not None for _, args in inserts)
+    assert all(args[7] == "EUR" for _, args in inserts)
+    assert all(args[16] is not None and args[17] is not None for _, args in inserts)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("usage", [(-1, 1, None), (1, -1, None), (1, 1, -1), (1, 1, 2)])
+@pytest.mark.parametrize(
+    "usage",
+    [
+        (-1, 1, None, None),
+        (1, -1, None, None),
+        (1, 1, -1, None),
+        # Both cached dimensions live inside the input total, so neither may exceed
+        # it, and together they may not exceed it either.
+        (1, 1, 2, None),
+        (1, 1, None, 2),
+        (10, 1, 6, 6),
+    ],
+)
 async def test_malformed_usage_is_not_persisted(
     usage: tuple[int | None, int | None, int | None],
 ) -> None:
@@ -546,8 +559,8 @@ def test_failed_upstream_response_persists_usage_with_failed_attribution() -> No
 
     assert response.status_code == 429
     usage_args = next(args for query, args in pool.execute_calls if "usage_records" in query)
-    assert usage_args[2:5] == (9, 1, None)
-    assert usage_args[14] == "failed"
+    assert usage_args[2:6] == (9, 1, None, None)
+    assert usage_args[15] == "failed"
 
 
 async def _delayed_stream():
@@ -659,7 +672,7 @@ def test_measured_blended_rate_prices_total_tokens() -> None:
         "confidence": "low",
     }
 
-    cost, currency = estimate_cost((18, 21, None), pricing)
+    cost, currency = estimate_cost((18, 21, None, None), pricing)
 
     assert currency == "USD"
     # 39 total tokens at the rate measured from the operator's sample.
@@ -673,8 +686,8 @@ def test_measured_blended_rate_still_refuses_unreported_dimensions() -> None:
         "pricing_basis": "measured_blended",
     }
 
-    assert estimate_cost((18, None, None), pricing) == (None, None)
-    assert estimate_cost((None, 21, None), pricing) == (None, None)
+    assert estimate_cost((18, None, None, None), pricing) == (None, None)
+    assert estimate_cost((None, 21, None, None), pricing) == (None, None)
 
 
 def test_blended_rate_ignores_cached_discount_it_cannot_support() -> None:
@@ -686,7 +699,7 @@ def test_blended_rate_ignores_cached_discount_it_cannot_support() -> None:
 
     # 10 total tokens at 1 unit per token: the cached count must not reduce it,
     # because a blended measurement never priced cache reads separately.
-    cost, _ = estimate_cost((8, 2, 8), pricing)
+    cost, _ = estimate_cost((8, 2, 8, None), pricing)
 
     assert cost == Decimal("10.00000000")
 
@@ -713,11 +726,16 @@ def test_anthropic_cache_hit_is_recorded_instead_of_discarded() -> None:
     )
 
     # Normalized to the inclusive convention: every billable input token.
-    assert usage == (150_005, 40, 150_000)
+    assert usage == (150_005, 40, 150_000, None)
     assert _valid_usage(usage) is True
 
 
-def test_anthropic_cache_write_counts_as_billable_input() -> None:
+def test_anthropic_cache_write_is_carried_as_its_own_dimension() -> None:
+    """A cache write is billed above the base input rate, so it cannot be folded in.
+
+    Pricing writes as ordinary input understated real traffic by 14.5% against the
+    provider's own billing counter.
+    """
     usage = extract_usage(
         ClientProtocol.ANTHROPIC_MESSAGES,
         json.dumps(
@@ -732,7 +750,7 @@ def test_anthropic_cache_write_counts_as_billable_input() -> None:
         ).encode(),
     )
 
-    assert usage == (2_010, 3, 0)
+    assert usage == (2_010, 3, 0, 2_000)
 
 
 def test_cached_read_is_discounted_once_under_the_normalized_convention() -> None:
@@ -745,6 +763,61 @@ def test_cached_read_is_discounted_once_under_the_normalized_convention() -> Non
 
     # 150,005 total input of which 150,000 was a cache read at zero: only the 5
     # uncached tokens are charged.
-    cost, _ = estimate_cost((150_005, 40, 150_000), pricing)
+    cost, _ = estimate_cost((150_005, 40, 150_000, None), pricing)
 
     assert cost == Decimal("5.00000000")
+
+
+def test_cache_writes_are_priced_at_their_premium_not_the_base_rate() -> None:
+    """Reproduces a real reconciliation against the provider's billing counter.
+
+    Over one window the provider billed $1.712966 while the gateway recorded
+    $1.464815, a 14.5% understatement. Claude Code caches its context on nearly
+    every turn, so almost all of its non-cached input is a cache write, and pricing
+    writes at the base input rate is what caused the gap.
+    """
+    pricing = {
+        "input_per_million": "2.00",
+        "output_per_million": "10.00",
+        "cached_input_per_million": "0.40",
+        "cache_write_per_million": "2.50",
+        "currency": "USD",
+    }
+    total_input, cache_read, cache_write, output = 1_277_201, 780_867, 496_334, 15_980
+
+    cost, currency = estimate_cost(
+        (total_input, output, cache_read, cache_write), pricing
+    )
+
+    assert currency == "USD"
+    # Matches the provider's billed 1.712966 to within a ten-thousandth of a cent.
+    assert abs(cost - Decimal("1.712966")) < Decimal("0.0001")
+
+
+def test_an_absent_cache_write_rate_applies_the_measured_premium() -> None:
+    """Defaulting to the base rate silently understated cache-heavy traffic."""
+    pricing = {
+        "input_per_million": "2.00",
+        "output_per_million": "0",
+        "currency": "USD",
+    }
+
+    # 1,000,000 tokens, all of them cache writes, at the 1.25x premium.
+    cost, _ = estimate_cost((1_000_000, 0, None, 1_000_000), pricing)
+
+    assert cost == Decimal("2.50000000")
+
+
+def test_both_cached_dimensions_come_out_of_the_input_total() -> None:
+    pricing = {
+        "input_per_million": "1000000",
+        "output_per_million": "0",
+        "cached_input_per_million": "0",
+        "cache_write_per_million": "0",
+        "currency": "USD",
+    }
+
+    # 10 input of which 4 were read and 4 written: only 2 are fresh.
+    cost, _ = estimate_cost((10, 0, 4, 4), pricing)
+
+    assert cost == Decimal("2.00000000")
