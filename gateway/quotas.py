@@ -206,3 +206,63 @@ async def reserve_budgets(
         raise QuotaUnavailable("Budget enforcement is unavailable.") from exc
     if result:
         raise BudgetExceeded(str(result))
+
+
+async def settle_budgets(
+    pool: Any,
+    *,
+    client_id: str,
+    provider_id: str,
+    credential_id: str,
+    model_id: str,
+    route_id: str | None,
+    currency: str | None,
+    delta: object | None,
+) -> None:
+    """Correct a reservation to what the request actually cost.
+
+    Reservation happens before dispatch from an estimate whose output side is the
+    client's declared max_tokens, not its outcome. Left uncorrected, reserved spend
+    drifts permanently above real spend and a budget refuses traffic long before
+    its limit is genuinely reached.
+
+    Failures here are logged and swallowed: a correction that does not land leaves
+    the budget conservative, which is the safe direction, and must never fail a
+    request that already succeeded upstream.
+    """
+    if pool is None or currency is None or delta in (None, 0):
+        return
+    try:
+        await pool.execute(
+            "select public.settle_gateway_budgets"
+            "($1::uuid,$2::uuid,$3::uuid,$4,$5::uuid,$6,$7)",
+            client_id,
+            provider_id,
+            credential_id,
+            model_id,
+            route_id,
+            currency,
+            delta,
+        )
+    except Exception:
+        log_event(
+            logger,
+            logging.WARNING,
+            "budget_settlement_failed",
+            provider_id=provider_id,
+            model_id=model_id,
+        )
+
+
+async def settle_client_spending(pool: Any, client_id: str, delta: object | None) -> None:
+    """Correct a client spending reservation to the actual cost."""
+    if pool is None or delta in (None, 0):
+        return
+    try:
+        await pool.execute(
+            "select public.settle_client_spending($1::uuid,$2::numeric)", client_id, delta
+        )
+    except Exception:
+        log_event(
+            logger, logging.WARNING, "client_spend_settlement_failed", client_id=client_id
+        )

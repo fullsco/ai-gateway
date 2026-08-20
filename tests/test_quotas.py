@@ -13,6 +13,8 @@ from gateway.quotas import (
     reserve_budgets,
     reserve_client_quota,
     reserve_client_spending,
+    settle_budgets,
+    settle_client_spending,
 )
 
 
@@ -209,3 +211,60 @@ async def test_client_spending_enforcement_failure_fails_closed() -> None:
 
     with pytest.raises(QuotaUnavailable):
         await reserve_client_spending(BrokenPool(), "client-1", Decimal("0.50"))
+
+
+@pytest.mark.asyncio
+async def test_settlement_corrects_a_reservation_to_the_actual_cost() -> None:
+    """A reservation prices output at the client's max_tokens, not its outcome.
+
+    Measured on live traffic before settlement existed: $9.285266 reserved against
+    $4.931146 spent, a factor of 1.88, which would have made a $4,000 budget refuse
+    requests at roughly $2,124 of real spend.
+    """
+
+    class SettlePool:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple]] = []
+
+        async def execute(self, query, *args):
+            self.calls.append((query, args))
+
+    pool = SettlePool()
+    await settle_budgets(
+        pool, currency="USD", delta=Decimal("-1.20"), **_scopes()
+    )
+
+    assert "settle_gateway_budgets" in pool.calls[0][0]
+    assert pool.calls[0][1][-1] == Decimal("-1.20")
+
+
+@pytest.mark.asyncio
+async def test_settlement_is_skipped_when_there_is_nothing_to_correct() -> None:
+    class SettlePool:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple]] = []
+
+        async def execute(self, query, *args):
+            self.calls.append((query, args))
+
+    pool = SettlePool()
+    await settle_budgets(pool, currency="USD", delta=0, **_scopes())
+    await settle_budgets(pool, currency="USD", delta=None, **_scopes())
+    await settle_budgets(pool, currency=None, delta=Decimal("1"), **_scopes())
+
+    assert pool.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_settlement_never_fails_the_request() -> None:
+    """The request already succeeded upstream; an uncorrected budget is merely
+    conservative, which is the safe direction."""
+
+    class BrokenPool:
+        async def execute(self, query, *args):
+            raise RuntimeError("database unavailable")
+
+    await settle_budgets(
+        BrokenPool(), currency="USD", delta=Decimal("-1"), **_scopes()
+    )
+    await settle_client_spending(BrokenPool(), "client-1", Decimal("-1"))

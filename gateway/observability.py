@@ -344,13 +344,14 @@ class RequestRecorder:
         attribution: UsageAttribution,
         *,
         attempt_status: str,
-    ) -> None:
+    ) -> Decimal | None:
+        """Persist usage and return the cost, so a reservation can be settled."""
         if attempt_id is None:
-            return
+            return None
         usage = extract_usage(protocol, content)
         if usage is None:
-            return
-        await self.record_usage_values(
+            return None
+        return await self.record_usage_values(
             attempt_id,
             usage,
             attribution,
@@ -360,16 +361,16 @@ class RequestRecorder:
     async def record_usage_values(
         self,
         attempt_id: int | None,
-        usage: tuple[int | None, int | None, int | None],
+        usage: Usage,
         attribution: UsageAttribution,
         *,
         attempt_status: str,
-    ) -> None:
+    ) -> Decimal | None:
         if attempt_id is None:
-            return
+            return None
         if not _valid_usage(usage):
             log_event(logger, logging.WARNING, "invalid_usage_rejected")
-            return
+            return None
         estimated_cost, currency = estimate_cost(usage, attribution.pricing)
         pricing_context = dict(attribution.pricing or {}) if estimated_cost is not None else None
         pricing_context_hash = (
@@ -415,6 +416,7 @@ class RequestRecorder:
             json.dumps(pricing_context) if pricing_context is not None else None,
             pricing_context_hash,
         )
+        return estimated_cost
 
     async def _execute(self, query: str, *args: Any) -> None:
         if self._pool is None:

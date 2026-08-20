@@ -162,6 +162,7 @@ async def test_monitor_survives_an_unavailable_database() -> None:
 def test_every_declared_condition_kind_has_a_query() -> None:
     """A rule whose kind has no query would silently never fire."""
     allowed = {
+        "budget_utilization",
         "credential_quota_low",
         "credential_balance_low",
         "credential_auth_failures",

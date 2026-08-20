@@ -1,9 +1,11 @@
 import asyncio
+import functools
 import json
 import logging
 from collections.abc import AsyncIterator, Mapping
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import httpx
 from fastapi.responses import Response, StreamingResponse
@@ -36,6 +38,8 @@ from gateway.quotas import (
     reserve_client_quota,
     reserve_client_spending,
     reserve_provider_quota,
+    settle_budgets,
+    settle_client_spending,
 )
 from gateway.routing import AttemptCoordinator, AttemptPolicy
 from gateway.routing.controls import ConcurrencyLease
@@ -44,6 +48,41 @@ from gateway.routing.live_state import LiveOperationalState
 from gateway.runtime import GatewayRuntime
 
 logger = logging.getLogger("gateway.executor")
+
+
+async def _settle_reservation(
+    db_pool,
+    *,
+    client_id: str,
+    route,
+    currency: str | None,
+    reserved,
+    actual,
+) -> None:
+    """Correct the pre-flight reservation to what the request actually cost.
+
+    The reservation is taken before dispatch, with the output side priced at the
+    client's declared max_tokens rather than its outcome, so it always overstates.
+    Leaving it uncorrected made reserved spend drift permanently above real spend:
+    measured at 1.88x on live traffic, which would have made a $4,000 budget start
+    refusing requests at about $2,124.
+    """
+    if reserved is None or currency is None:
+        return
+    delta = (actual or Decimal(0)) - reserved
+    if delta == 0:
+        return
+    await settle_budgets(
+        db_pool,
+        client_id=client_id,
+        provider_id=route.provider_model.provider_id,
+        credential_id=route.credential.credential_id,
+        model_id=route.canonical_model_id,
+        route_id=route.provider_model.route_id,
+        currency=currency,
+        delta=delta,
+    )
+    await settle_client_spending(db_pool, client_id, delta)
 
 
 async def execute_request(
@@ -344,12 +383,18 @@ async def execute_request(
             if response.status_code >= 400:
                 await response.aread()
                 last_error = adapter.normalize_error(response)
-                await recorder.record_usage(
+                actual_cost = await recorder.record_usage(
                     attempt_id,
                     normalized.protocol,
                     response.content,
                     attribution,
                     attempt_status="failed",
+                )
+                # A rejected attempt still costs whatever the upstream billed, which
+                # is usually nothing. Settle so the reservation does not linger.
+                await _settle_reservation(
+                    db_pool, client_id=client_id, route=route, currency=currency,
+                    reserved=estimated_cost, actual=actual_cost,
                 )
                 await response.aclose()
                 response = None
@@ -395,6 +440,14 @@ async def execute_request(
                             provider_model_id=route.provider_model.id,
                             attempt_number=attempts,
                             attribution=attribution,
+                            settle=functools.partial(
+                                _settle_reservation,
+                                db_pool,
+                                client_id=client_id,
+                                route=route,
+                                currency=currency,
+                                reserved=estimated_cost,
+                            ),
                         )
                         if live_state is not None:
                             live_state.record_attempt(
@@ -454,12 +507,16 @@ async def execute_request(
                         latency_ms=latency_ms,
                         upstream_status=status_code,
                     )
-                    await recorder.record_usage(
+                    actual_cost = await recorder.record_usage(
                         attempt_id,
                         normalized.protocol,
                         content,
                         attribution,
                         attempt_status="succeeded",
+                    )
+                    await _settle_reservation(
+                        db_pool, client_id=client_id, route=route, currency=currency,
+                        reserved=estimated_cost, actual=actual_cost,
                     )
                     await recorder.finish_request(
                         status="succeeded",
@@ -707,6 +764,7 @@ class _StreamFinalizer:
         provider_model_id: str | None = None,
         attempt_number: int = 1,
         attribution: UsageAttribution | None = None,
+        settle=None,
     ) -> None:
         self.recorder = recorder
         self.response = response
@@ -725,6 +783,9 @@ class _StreamFinalizer:
         self.provider_model_id = provider_model_id
         self.attempt_number = attempt_number
         self.attribution = attribution
+        # Called with the actual cost once the stream ends, so the pre-flight
+        # reservation can be corrected. A stream only knows its usage at the end.
+        self.settle = settle
         self.usage = StreamUsageAccumulator(protocol)
         self._task: asyncio.Task[None] | None = None
 
@@ -754,6 +815,7 @@ class _StreamFinalizer:
                     provider_model_id=self.provider_model_id,
                     attempt_number=self.attempt_number,
                     attribution=self.attribution,
+                    settle=self.settle,
                 )
             )
         await asyncio.shield(self._task)
@@ -782,6 +844,7 @@ async def _finalize_stream(
     provider_model_id: str | None = None,
     attempt_number: int = 1,
     attribution: UsageAttribution | None = None,
+    settle=None,
 ) -> None:
     try:
         await response.aclose()
@@ -813,13 +876,17 @@ async def _finalize_stream(
         upstream_status=upstream_status,
         response_committed=True,
     )
+    actual_cost = None
     if completed and usage.usage is not None and attribution is not None:
-        await recorder.record_usage_values(
+        actual_cost = await recorder.record_usage_values(
             attempt_id,
             usage.usage,
             attribution,
             attempt_status="succeeded",
         )
+    if settle is not None:
+        # A cancelled stream reports no usage, so the whole reservation is released.
+        await settle(actual=actual_cost)
     await recorder.finish_request(
         status="succeeded" if completed else "cancelled",
         resolved_model=resolved_model,

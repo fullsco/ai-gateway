@@ -162,6 +162,28 @@ _CONDITIONS: dict[str, tuple[str, str, tuple[str, ...]]] = {
         """,
         ("window", "threshold"),
     ),
+    "budget_utilization": (
+        "global",
+        """
+        select b.id::text as scope_id,
+               b.name || ' (' || b.period || ')' as label,
+               b.limit_amount as limit_amount,
+               b.currency as currency,
+               b.enforcement as enforcement,
+               coalesce(w.reserved_cost, 0) as used,
+               round((coalesce(w.reserved_cost,0) / nullif(b.limit_amount,0))::numeric, 4)
+                 as utilization
+        from public.gateway_budgets b
+        left join public.budget_usage_windows w
+          on w.budget_id = b.id
+         and w.window_started_at = case b.period
+               when 'daily' then date_trunc('day', now())
+               else date_trunc('month', now()) end
+        where b.enabled and b.limit_amount > 0
+          and coalesce(w.reserved_cost,0) / b.limit_amount >= $1::numeric
+        """,
+        ("threshold",),
+    ),
     "unpriced_traffic": (
         "global",
         """

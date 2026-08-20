@@ -77,6 +77,7 @@ class BudgetInput(BaseModel):
 
 
 CONDITION_KINDS = (
+    "budget_utilization",
     "credential_quota_low",
     "credential_balance_low",
     "credential_auth_failures",
