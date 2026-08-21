@@ -331,3 +331,91 @@ def test_a_provider_404_is_visible_in_the_health_view() -> None:
     from gateway.observability import _passive_health
 
     assert _passive_health("model_unavailable") == "degraded"
+
+
+def test_an_unhealthy_credential_earns_a_trial_once_its_cooldown_elapses() -> None:
+    """An expired cooldown must make an unhealthy credential routable again.
+
+    Health only degrades on its own and is restored by observing a success, so a
+    credential that is never selected can never recover. In production this left
+    AgentRouter with one routable credential out of twenty five, because ten
+    rate-limited credentials held cooldowns that had already expired.
+    """
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    decision = make_engine().select(
+        make_request(),
+        [ProviderState("provider-a")],
+        [
+            CredentialState(
+                "rate-limited-but-cooled-off",
+                "provider-a",
+                health=HealthState.RATE_LIMITED,
+                cooldown_until=now - timedelta(minutes=5),
+            )
+        ],
+        now=now,
+    )
+
+    assert decision.credential.credential_id == "rate-limited-but-cooled-off"
+
+
+def test_an_unhealthy_credential_stays_excluded_while_its_cooldown_runs() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    with pytest.raises(NoRouteAvailable):
+        make_engine().select(
+            make_request(),
+            [ProviderState("provider-a")],
+            [
+                CredentialState(
+                    "still-cooling",
+                    "provider-a",
+                    health=HealthState.RATE_LIMITED,
+                    cooldown_until=now + timedelta(minutes=5),
+                )
+            ],
+            now=now,
+        )
+
+
+def test_an_unhealthy_credential_without_a_cooldown_is_not_retried() -> None:
+    """A key that never earned a cooldown gets no trial.
+
+    A revoked or mistyped key fails without a retry-after, so it never receives a
+    cooldown. Trialling those forever would spend an attempt on every request.
+    """
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    with pytest.raises(NoRouteAvailable):
+        make_engine().select(
+            make_request(),
+            [ProviderState("provider-a")],
+            [
+                CredentialState(
+                    "never-worked",
+                    "provider-a",
+                    health=HealthState.AUTH_FAILED,
+                    cooldown_until=None,
+                )
+            ],
+            now=now,
+        )
+
+
+def test_a_healthy_credential_is_preferred_over_one_on_trial() -> None:
+    """Recovery must not cost throughput while a healthy credential exists."""
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    decision = make_engine().select(
+        make_request(),
+        [ProviderState("provider-a")],
+        [
+            CredentialState(
+                "on-trial",
+                "provider-a",
+                health=HealthState.RATE_LIMITED,
+                cooldown_until=now - timedelta(minutes=5),
+            ),
+            CredentialState("healthy", "provider-a"),
+        ],
+        now=now,
+    )
+
+    assert decision.credential.credential_id == "healthy"

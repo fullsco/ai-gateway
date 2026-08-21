@@ -343,9 +343,25 @@ class RoutingEngine:
             return "credential_disabled"
         if credential.provider_id != provider_model.provider_id:
             return "credential_other_provider"
+        in_cooldown = credential.cooldown_until is not None and credential.cooldown_until > now
         if credential.health not in ROUTABLE_HEALTH:
-            return f"credential_health_{credential.health.value}"
-        if credential.cooldown_until is not None and credential.cooldown_until > now:
+            # Health only ever degrades on its own. It is restored by observing a
+            # successful request, so a credential that is never routed can never
+            # recover, and one bad minute strands a working key permanently.
+            # cooldown_until is the recovery signal: a failure sets it from the
+            # provider's retry-after, and once it has elapsed the credential earns
+            # one trial. Success restores it to healthy, failure sets a new
+            # cooldown. A credential that never earned a cooldown is left excluded,
+            # so a key that has never worked is not retried forever.
+            #
+            # This check used to sit above the cooldown check and return
+            # unconditionally, which made the cooldown check below unreachable for
+            # any unhealthy credential. In production that left AgentRouter with one
+            # routable credential out of twenty five, with ten rate-limited and six
+            # auth-failed credentials holding cooldowns that had long since expired.
+            if credential.cooldown_until is None or in_cooldown:
+                return f"credential_health_{credential.health.value}"
+        elif in_cooldown:
             return "credential_in_cooldown"
         if credential.quota_headroom <= 0:
             return "credential_quota_exhausted"

@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from datetime import UTC, datetime
 
 from gateway.config import Settings
 from gateway.configuration.postgres import PostgresSnapshotRepository, create_pool
@@ -41,6 +42,20 @@ MODELS = ("claude-opus-5-thinking", "claude-opus-5", "gpt-5.6-sol", "glm-5.2")
 MAX_ATTEMPTS = 3
 # Mirrors gateway.routing.engine.ROUTABLE_HEALTH.
 ROUTABLE = ("healthy", "degraded")
+
+
+def _is_routable(state, now) -> bool:
+    """Mirror the engine's credential health gate, including recovery trials.
+
+    An unhealthy credential whose cooldown has elapsed is routable again: health
+    is only restored by observing a success, so without a trial it would be
+    stranded permanently.
+    """
+    if not state.enabled:
+        return False
+    if state.health.value in ROUTABLE:
+        return True
+    return state.cooldown_until is not None and state.cooldown_until <= now
 
 
 def _normalized(runtime, model: str) -> NormalizedRequest | None:
@@ -142,6 +157,7 @@ async def main() -> int:
 
     print(f"published snapshot: v{snapshot.version} schema={snapshot.schema_version}\n")
 
+    now = datetime.now(UTC)
     failures = 0
     for model in MODELS:
         normalized = _normalized(runtime, model)
@@ -152,14 +168,11 @@ async def main() -> int:
         after = _walk(runtime, normalized, provider_scoped=True)
 
         routes = runtime.model_registry.eligible_provider_models(normalized)
-        routable = {ROUTABLE[0], ROUTABLE[1]}
         healthy_by_provider = {
             route.provider_id: sum(
                 1
                 for state in runtime.credential_states
-                if state.provider_id == route.provider_id
-                and state.enabled
-                and state.health.value in routable
+                if state.provider_id == route.provider_id and _is_routable(state, now)
             )
             for route in routes
         }
@@ -176,7 +189,7 @@ async def main() -> int:
         print(f"{model}  [{normalized.protocol.value}]")
         primary = label(before[0]) if before else "none, all routes ineligible"
         print(f"  primary provider          : {primary}")
-        print("  credentials routable/total:")
+        print("  credentials routable/total (routable includes recovery trials):")
         for route in sorted(routes, key=lambda r: r.priority):
             ratio = (
                 f"{healthy_by_provider[route.provider_id]:>2}"
