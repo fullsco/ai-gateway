@@ -19,6 +19,7 @@ from typing import Any
 
 from gateway.alerts import condition_matches, raise_alert, resolve_alerts
 from gateway.logging import log_event
+from gateway.routing.engine import ROUTABLE_CREDENTIAL_SQL
 
 logger = logging.getLogger("gateway.alerts.monitor")
 
@@ -107,18 +108,27 @@ _CONDITIONS: dict[str, tuple[str, str, tuple[str, ...]]] = {
     ),
     "credential_pool_exhausted": (
         "provider",
-        """
+        # "Routable" is interpolated from the router's own definition so the alert
+        # counts what the router will actually attempt. Counting only healthy and
+        # degraded credentials understated the pool and would report a provider as
+        # exhausted while the router was still able to use it.
+        f"""
         select p.id::text as scope_id, p.name as label,
                count(c.id) as credentials,
-               count(c.id) filter (where c.health in ('healthy','degraded')) as routable
+               count(c.id) filter (where {ROUTABLE_CREDENTIAL_SQL}) as routable
         from public.providers p
         left join public.provider_credentials c on c.provider_id = p.id and c.enabled
         where p.enabled
         group by 1, 2
-        having count(c.id) > 0
-           and count(c.id) filter (where c.health in ('healthy','degraded')) <= $1::numeric
+        having count(c.id) >= $2::numeric
+           and count(c.id) filter (where {ROUTABLE_CREDENTIAL_SQL}) <= $1::numeric
         """,
-        ("threshold",),
+        # floor is the smallest pool worth judging, from min_samples. It defaults to
+        # 1, which reproduces the original "has any credential at all". A rule that
+        # warns about losing the spares sets it to 2, so a provider deliberately
+        # configured with a single credential does not warn forever about being down
+        # to its last one.
+        ("threshold", "floor"),
     ),
     "model_no_eligible_route": (
         "model",

@@ -124,6 +124,27 @@ RULES = [
         ),
     },
     {
+        "name": "Provider is down to its last credential",
+        "severity": "warning",
+        "condition_kind": "credential_pool_exhausted",
+        # min_samples excludes providers that only ever had one credential: that is
+        # a configuration choice, not a pool that has drained, and warning about it
+        # every hour would be noise. Losing the last one is still critical.
+        "condition": {"at_least": 1, "min_samples": 2},
+        "cooldown_seconds": 3600,
+        "description": "This provider has one usable credential left out of its enabled pool.",
+        "impact": (
+            "There is no spare left. The next rejection, rate limit or quota exhaustion takes the "
+            "provider to nothing, and any model that cannot fall back to another provider goes "
+            "down with it."
+        ),
+        "recommended_action": (
+            "Open Credentials for this provider and clear the backlog before the last one goes. A "
+            "credential is only retried after its cooldown elapses, and one that has never "
+            "succeeded is never retried, so those must be replaced or removed."
+        ),
+    },
+    {
         "name": "A model has nowhere to run",
         "severity": "critical",
         "condition_kind": "model_no_eligible_route",

@@ -43,6 +43,9 @@ class MonitorPool:
         self.open_alerts = open_alerts or []
         self.raised: list[tuple[str, tuple[Any, ...]]] = []
         self.resolved: list[tuple[str, tuple[Any, ...]]] = []
+        # The arguments the monitor bound to the condition query, so a test can
+        # assert which sensitivity values a rule actually resolved to.
+        self.bound_args: tuple[Any, ...] = ()
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
         if "from public.alert_rules" in query:
@@ -52,6 +55,7 @@ class MonitorPool:
         if "update public.alerts set status='resolved'" in query:
             self.resolved.append((query, args))
             return [{"id": 1} for _ in args[0]]
+        self.bound_args = args
         return self.breaches
 
     async def execute(self, query: str, *args: Any) -> None:
@@ -176,3 +180,44 @@ def test_every_declared_condition_kind_has_a_query() -> None:
     }
 
     assert set(_CONDITIONS) == allowed
+
+
+def test_the_credential_pool_query_matches_the_router_definition_of_routable() -> None:
+    """The alert must count what the router can actually use.
+
+    gateway.routing.engine grants an unhealthy credential a trial once its cooldown
+    has elapsed. If this query still counted only healthy and degraded credentials
+    it would call a provider exhausted while the router was still using it, which
+    is how a provider sitting on one usable credential out of twenty five stayed
+    invisible.
+    """
+    from gateway.routing.engine import ROUTABLE_CREDENTIAL_SQL
+
+    _, query, params = _CONDITIONS["credential_pool_exhausted"]
+
+    assert ROUTABLE_CREDENTIAL_SQL in query
+    # Once in the projection the operator can see, once in the having clause.
+    assert query.count(ROUTABLE_CREDENTIAL_SQL) == 2
+    assert params == ("threshold", "floor")
+
+
+@pytest.mark.asyncio
+async def test_losing_the_spares_warns_only_when_there_were_spares() -> None:
+    """A provider configured with one credential must not warn about that forever.
+
+    The pool condition serves two rules. The critical one fires when nothing is
+    usable, and defaults the floor to 1 so any provider counts. The warning one
+    fires when only a single credential is left, and sets min_samples so that a
+    provider which never had a spare is not reported as having lost one.
+    """
+    _, _, bindings = _CONDITIONS["credential_pool_exhausted"]
+
+    critical = MonitorPool([rule(condition_kind="credential_pool_exhausted",
+                                 condition={"at_least": 0})], [])
+    await evaluate_monitored_rules(critical)
+    assert critical.bound_args[: len(bindings)] == (0.0, 1)
+
+    warning = MonitorPool([rule(condition_kind="credential_pool_exhausted",
+                                condition={"at_least": 1, "min_samples": 2})], [])
+    await evaluate_monitored_rules(warning)
+    assert warning.bound_args[: len(bindings)] == (1.0, 2)

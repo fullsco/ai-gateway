@@ -21,6 +21,52 @@ class HealthState(StrEnum):
 
 ROUTABLE_HEALTH = {HealthState.HEALTHY, HealthState.DEGRADED}
 
+# The SQL mirror of the rule below lives in gateway.alerts_monitor under
+# credential_pool_exhausted. Both must agree, or the alert reports a provider as
+# exhausted while the router is still able to use it, or stays quiet while it cannot.
+ROUTABLE_CREDENTIAL_SQL = (
+    "c.health in ('healthy','degraded') "
+    "or (c.cooldown_until is not null and c.cooldown_until <= now())"
+)
+
+
+def _health_gate_allows_trial(credential: "CredentialState", now: datetime) -> bool:
+    """Whether an unhealthy credential has earned one recovery attempt.
+
+    Health only ever degrades on its own. It is restored by observing a successful
+    request, so a credential that is never routed can never recover, and one bad
+    minute strands a working key permanently. cooldown_until is the recovery
+    signal: a failure sets it from the provider's retry-after, and once it has
+    elapsed the credential earns one trial. Success restores it to healthy, failure
+    sets a new cooldown.
+
+    A credential that never earned a cooldown gets no trial, so a revoked or
+    mistyped key is not retried on every request forever.
+
+    The health gate used to sit above the cooldown check and return
+    unconditionally, which made the cooldown check unreachable for any unhealthy
+    credential. In production that left AgentRouter with one routable credential
+    out of twenty five, with ten rate-limited and six auth-failed credentials
+    holding cooldowns that had expired hours or days earlier.
+    """
+    if credential.cooldown_until is None:
+        return False
+    return credential.cooldown_until <= now
+
+
+def credential_is_routable(credential: "CredentialState", now: datetime) -> bool:
+    """Health-and-cooldown view of routability, ignoring quota and rate headroom.
+
+    This is the predicate ROUTABLE_CREDENTIAL_SQL mirrors, so operational counts
+    agree with what the router will actually attempt.
+    """
+    if not credential.enabled:
+        return False
+    if credential.health in ROUTABLE_HEALTH:
+        return credential.cooldown_until is None or credential.cooldown_until <= now
+    return _health_gate_allows_trial(credential, now)
+
+
 # Scores within this fraction of the best are treated as equally good and load balanced.
 _TIE_TOLERANCE = 0.05
 
@@ -345,21 +391,7 @@ class RoutingEngine:
             return "credential_other_provider"
         in_cooldown = credential.cooldown_until is not None and credential.cooldown_until > now
         if credential.health not in ROUTABLE_HEALTH:
-            # Health only ever degrades on its own. It is restored by observing a
-            # successful request, so a credential that is never routed can never
-            # recover, and one bad minute strands a working key permanently.
-            # cooldown_until is the recovery signal: a failure sets it from the
-            # provider's retry-after, and once it has elapsed the credential earns
-            # one trial. Success restores it to healthy, failure sets a new
-            # cooldown. A credential that never earned a cooldown is left excluded,
-            # so a key that has never worked is not retried forever.
-            #
-            # This check used to sit above the cooldown check and return
-            # unconditionally, which made the cooldown check below unreachable for
-            # any unhealthy credential. In production that left AgentRouter with one
-            # routable credential out of twenty five, with ten rate-limited and six
-            # auth-failed credentials holding cooldowns that had long since expired.
-            if credential.cooldown_until is None or in_cooldown:
+            if not _health_gate_allows_trial(credential, now):
                 return f"credential_health_{credential.health.value}"
         elif in_cooldown:
             return "credential_in_cooldown"
