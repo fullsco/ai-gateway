@@ -102,26 +102,35 @@ def _scopes() -> dict[str, str | None]:
 
 
 @pytest.mark.asyncio
-async def test_unpriced_route_is_refused_when_a_blocking_budget_applies() -> None:
-    """A spend cap must not be evadable by leaving a route's pricing empty.
+async def test_unpriced_route_is_refused_once_a_blocking_budget_is_exhausted() -> None:
+    """Unmeasurable spend must not carry a budget past its cap.
 
-    Reservation is driven by estimated cost, so an unpriced route reserved
-    nothing and was invisible to every budget, including a global blocking one.
+    An unpriced route reserves nothing, so it was invisible to every budget
+    including a global blocking one, and a cap could be evaded by leaving pricing
+    empty.
     """
     pool = BudgetScopePool("Global monthly cap")
 
-    with pytest.raises(UnpricedRouteBlocked, match="no pricing configured"):
+    with pytest.raises(UnpricedRouteBlocked, match="reached its limit"):
         await reserve_budgets(pool, currency=None, estimated_cost=None, **_scopes())
 
 
 @pytest.mark.asyncio
-async def test_unpriced_route_proceeds_when_no_blocking_budget_exists() -> None:
-    """A deployment with no budgets configured must be unaffected."""
+async def test_unpriced_route_runs_while_the_budget_still_has_headroom() -> None:
+    """Refusing it outright would take a working model offline to satisfy accounting.
+
+    A provider whose billing units cannot be interpreted would otherwise be
+    permanently unusable. The unpriced_traffic alert is what tells the operator to
+    fix the rate card.
+    """
     pool = BudgetScopePool(None)
 
     await reserve_budgets(pool, currency=None, estimated_cost=None, **_scopes())
 
-    assert pool.calls, "the blocking-budget check must still run"
+    assert pool.calls, "the exhausted-budget check must still run"
+    assert "reserved_cost" in pool.calls[0][0], (
+        "the check must compare spend against the limit, not merely find a budget"
+    )
 
 
 @pytest.mark.asyncio

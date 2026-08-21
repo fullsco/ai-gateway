@@ -13,7 +13,6 @@ import os
 import sys
 import time
 
-import anthropic
 import httpx
 
 sys.path.insert(0, "/root/ai-gateway")
@@ -109,6 +108,8 @@ async def read_counter(base_url: str, secret: str) -> float | None:
 
 
 def send(secret: str, base_url: str, model: str, prompt: str, max_tokens: int) -> dict:
+    import anthropic
+
     client = anthropic.Anthropic(
         api_key=secret, base_url=base_url, max_retries=0, timeout=180
     )

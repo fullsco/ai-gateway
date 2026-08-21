@@ -129,8 +129,20 @@ async def reserve_client_spending(
         )
 
 
-_BLOCKING_BUDGET_FOR_SCOPE = """
+# An unpriced route cannot be charged, so it cannot be held below a limit. Refusing
+# it outright, however, takes a working model offline for an accounting reason: a
+# provider whose billing units cannot be interpreted, or whose rates are not
+# published, would be permanently unusable. The proportionate rule is to let it run
+# while the budget still has headroom - the unpriced_traffic alert tells the operator
+# to fix the rate card - and to refuse it only once a blocking budget is already at
+# its limit, so unmeasurable spend can never carry a budget past its cap.
+_EXHAUSTED_BLOCKING_BUDGET_FOR_SCOPE = """
 select b.name from public.gateway_budgets b
+left join public.budget_usage_windows w
+  on w.budget_id = b.id
+ and w.window_started_at = case b.period
+       when 'daily' then date_trunc('day', now())
+       else date_trunc('month', now()) end
 where b.enabled and b.enforcement = 'block' and (
   b.scope_type = 'global'
   or (b.scope_type = 'client' and b.scope_id = $1)
@@ -139,6 +151,7 @@ where b.enabled and b.enforcement = 'block' and (
   or (b.scope_type = 'model' and b.scope_id = $4)
   or (b.scope_type = 'route' and b.scope_id = $5)
 )
+  and coalesce(w.reserved_cost, 0) >= b.limit_amount
 order by b.id
 limit 1
 """
@@ -164,7 +177,7 @@ async def reserve_budgets(
         # because an unpriced route has no currency to compare.
         try:
             blocking = await pool.fetchval(
-                _BLOCKING_BUDGET_FOR_SCOPE,
+                _EXHAUSTED_BLOCKING_BUDGET_FOR_SCOPE,
                 client_id,
                 provider_id,
                 credential_id,
@@ -187,8 +200,9 @@ async def reserve_budgets(
             return
         if blocking:
             raise UnpricedRouteBlocked(
-                f"Budget '{blocking}' blocks spending on this route because the route "
-                "has no pricing configured, so its cost cannot be measured."
+                f"Budget '{blocking}' has reached its limit, and this route has no "
+                "pricing configured, so its spend cannot be measured or charged "
+                "against the budget."
             )
         return
     try:
