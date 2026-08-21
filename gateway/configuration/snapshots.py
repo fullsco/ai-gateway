@@ -261,6 +261,13 @@ def _route_changes(
         ("allow_model_fallback", "model fallback", _toggle_transition),
         ("pool_strategy", "strategy", _transition),
         ("protocol", "protocol", _transition),
+        # A route timeout changes how long a caller waits and how long a
+        # concurrency slot is held, so a publish must say when it moves. Without
+        # this the section reported as changed with nothing listed under it, which
+        # is worse than silence: the operator is told something changed and not what.
+        ("timeout_seconds", "timeout in seconds", _transition),
+        ("upstream_model_id", "upstream model", _transition),
+        ("max_concurrency", "max concurrency", _transition),
     ]
     for key in sorted(prior.keys() & current.keys()):
         details = _field_changes(prior[key], current[key], specs)

@@ -1530,6 +1530,9 @@ async def _snapshot_payload(pool: Any) -> dict[str, Any]:
                           then pm.settings->>'auth_scheme' end as auth_scheme,
                      case when pm.settings ? 'endpoint_query'
                      then pm.settings->'endpoint_query' end as endpoint_query,
+                     case when pm.settings ? 'timeout_seconds'
+                          then (pm.settings->>'timeout_seconds')::numeric end
+                          as timeout_seconds,
                     pm.pricing,r.allow_model_fallback,r.pool_id::text as pool_id,
                      coalesce(pp.enabled,false) as pool_enabled,
                      case when r.pool_id is null then null else array(

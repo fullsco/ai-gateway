@@ -135,6 +135,11 @@ class SnapshotProviderModel(BaseModel):
     required_betas: frozenset[str] | None = None
     auth_scheme: Literal["default", "bearer", "x-api-key", "both"] | None = None
     endpoint_query: dict[str, str] | None = None
+    # A per-route ceiling on how long one attempt may take. The provider's timeout is
+    # shared by every model it serves, so a single slow route could not be bounded
+    # without slowing the rest. hcnsec answers in anywhere from 6 to 600 seconds, and
+    # at 600 a stalled attempt holds a slot and the client for ten minutes.
+    timeout_seconds: float | None = Field(default=None, gt=0)
     pricing: dict[str, Any] = Field(default_factory=dict)
     route_id: str | None = None
     allowed_credential_ids: frozenset[str] | None = None
@@ -309,7 +314,13 @@ class RuntimeBuilder:
             base_url=provider.base_url,
             protocol=protocol,
             capabilities=capabilities,
-            timeout_seconds=provider.timeout_seconds,
+            # A route may tighten the provider's timeout but not loosen it, so one
+            # slow mapping cannot quietly raise the ceiling for everything else.
+            timeout_seconds=(
+                min(model.timeout_seconds, provider.timeout_seconds)
+                if model.timeout_seconds is not None
+                else provider.timeout_seconds
+            ),
         )
         if protocol is ClientProtocol.ANTHROPIC_MESSAGES:
             return AnthropicCompatibleAdapter(

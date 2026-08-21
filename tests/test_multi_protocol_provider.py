@@ -344,3 +344,49 @@ def test_a_provider_scoped_failure_moves_to_the_next_provider() -> None:
         f"the unreachable provider must be retired after one attempt, got {len(first)}"
     )
     assert second, "the second provider must be reached"
+
+
+def test_a_route_may_tighten_the_provider_timeout_but_not_loosen_it() -> None:
+    """One slow model must be boundable without slowing everything else.
+
+    A provider's timeout is shared by every model it serves. hcnsec answers in
+    anywhere from 6 to 600 seconds, and at 600 a stalled attempt holds a concurrency
+    slot and the caller for ten minutes. Lowering hcnsec's own timeout would also
+    bound its other routes, so the ceiling belongs on the mapping. Raising it must
+    not be possible, or a single mapping could quietly relax the provider's limit.
+    """
+    from gateway.configuration.runtime_builder import (
+        RuntimeBuilder,
+        SnapshotProvider,
+        SnapshotProviderModel,
+    )
+    from gateway.protocols import Capability, ClientProtocol
+
+    provider = SnapshotProvider(
+        id="p",
+        name="P",
+        base_url="https://upstream.example",
+        capabilities=frozenset({Capability.STREAMING}),
+        timeout_seconds=600,
+    )
+
+    def adapter_for(route_timeout: float | None):
+        model = SnapshotProviderModel(
+            id="pm",
+            canonical_model_id="model-x",
+            provider_id="p",
+            upstream_model_id="upstream-x",
+            protocol=ClientProtocol.ANTHROPIC_MESSAGES,
+            capabilities=frozenset({Capability.STREAMING}),
+            timeout_seconds=route_timeout,
+        )
+        import base64
+
+        key = base64.b64encode(b"k" * 32).decode()
+        builder = RuntimeBuilder(encryption_key=key, key_pepper=key)
+        return builder._build_adapter(provider, model)
+
+    assert adapter_for(None).config.timeout_seconds == 600
+    assert adapter_for(120).config.timeout_seconds == 120
+    # Above the provider's ceiling the provider still wins.
+    assert adapter_for(9000).config.timeout_seconds == 600
