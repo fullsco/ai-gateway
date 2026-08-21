@@ -56,13 +56,23 @@ class GatewayKeyHasher:
             raise ValueError("Gateway key has an invalid prefix")
         return hmac.new(self._pepper, token.encode("utf-8"), hashlib.sha256).hexdigest()
 
-    def verify(self, token: str, record: GatewayKey) -> bool:
-        if not record.enabled:
-            return False
-        if record.expires_at is not None and record.expires_at <= datetime.now(UTC):
-            return False
+    def matches(self, token: str, record: GatewayKey) -> bool:
+        """Whether the token is the secret behind this record, ignoring lifecycle.
+
+        Separated from verify so a caller can prove possession first and only then
+        explain a revoked or expired key. Explaining before the secret is proven
+        would let someone holding only a key prefix, which is not secret, learn the
+        state of a key they do not have.
+        """
         try:
             candidate = self.digest(token)
         except ValueError:
             return False
         return hmac.compare_digest(candidate, record.digest)
+
+    def verify(self, token: str, record: GatewayKey) -> bool:
+        if not record.enabled:
+            return False
+        if record.expires_at is not None and record.expires_at <= datetime.now(UTC):
+            return False
+        return self.matches(token, record)

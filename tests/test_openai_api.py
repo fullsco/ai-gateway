@@ -28,13 +28,26 @@ class BytesStream(httpx.AsyncByteStream):
         return None
 
 
-def make_runtime(protocol: ClientProtocol, handler):
+def make_runtime(
+    protocol: ClientProtocol,
+    handler,
+    *,
+    client_protocols: frozenset[ClientProtocol] | None = None,
+):
+    """Build a runtime for one protocol.
+
+    client_protocols lets a test give the client different permissions from the
+    route, which is how a real misconfiguration looks: the mapping serves OpenAI
+    while the calling client is only allowed Anthropic.
+    """
     hasher = GatewayKeyHasher(b"p" * 32)
     issued = hasher.issue(key_id="key-1", client_id="client-1")
     client = GatewayClient(
         id="client-1",
         name="OpenAI client",
-        permissions=ClientPermissions(frozenset({protocol})),
+        permissions=ClientPermissions(
+            client_protocols if client_protocols is not None else frozenset({protocol})
+        ),
     )
     store = InMemoryGatewayKeyStore([issued.record], [client])
     capabilities = frozenset({Capability.STREAMING})
@@ -148,3 +161,59 @@ def test_openai_adapter_applies_default_headers() -> None:
 
     assert request.headers["user-agent"] == "codex_cli_rs/test"
     assert request.headers["originator"] == "codex_cli_rs"
+
+
+def test_a_key_without_the_protocol_is_told_that_and_not_that_it_is_invalid() -> None:
+    """A permission gap must not be reported as a bad secret.
+
+    In production OpenCode was configured with a key whose client only permitted
+    anthropic_messages. Every gateway-openai request failed with 401 "Invalid
+    gateway key", so the key was doubted, rotated and re-checked while the actual
+    cause was one missing entry in the client's allowed protocols.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("upstream must not be called when the client is denied")
+
+    # The route serves OpenAI, but the calling client may only use Anthropic.
+    runtime, key = make_runtime(
+        ClientProtocol.OPENAI_CHAT_COMPLETIONS,
+        handler,
+        client_protocols=frozenset({ClientProtocol.ANTHROPIC_MESSAGES}),
+    )
+    app = create_app(Settings(environment="test", _env_file=None), runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": f"Bearer {key}"},
+            json={"model": "model-x", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert response.status_code == 403
+    body = response.json()["error"]
+    assert body["type"] == "authorization_error"
+    assert "not permitted to use this API" in body["message"]
+    assert "Invalid gateway key" not in body["message"]
+
+
+def test_an_unknown_key_is_still_reported_as_invalid() -> None:
+    """The opposite case must not regress into a permission message."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("upstream must not be called for an unknown key")
+
+    runtime, _ = make_runtime(ClientProtocol.OPENAI_CHAT_COMPLETIONS, handler)
+    app = create_app(Settings(environment="test", _env_file=None), runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": "Bearer gw_live_notarealkey_0000000000"},
+            json={"model": "model-x", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert response.status_code == 401
+    body = response.json()["error"]
+    assert body["type"] == "authentication_error"
+    assert body["message"] == "Invalid gateway key."

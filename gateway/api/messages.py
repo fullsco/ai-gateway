@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Request
 from fastapi.responses import Response
 
-from gateway.api.errors import client_error
+from gateway.api.errors import client_error, denial_error
 from gateway.api.executor import execute_request
-from gateway.auth import authenticate_request
+from gateway.auth import AuthDenial, authenticate_request
 from gateway.protocols import ClientProtocol, normalize_request
 from gateway.providers import ErrorCategory
 from gateway.runtime import GatewayRuntime
@@ -35,8 +35,8 @@ async def messages(request: Request) -> Response:
         store=runtime.key_store,
         hasher=runtime.key_hasher,
     )
-    if authenticated is None:
-        return client_error(ErrorCategory.AUTHENTICATION_ERROR, "Invalid gateway key.", 401)
+    if isinstance(authenticated, AuthDenial):
+        return denial_error(authenticated)
     return await execute_request(
         normalized,
         request.headers,

@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 from gateway.auth import (
+    AuthDenial,
     ClientPermissions,
     GatewayClient,
     InMemoryGatewayKeyStore,
@@ -72,9 +73,12 @@ def test_authentication_rejects_tampered_key_and_disallowed_request() -> None:
         hasher=hasher,
     )
 
-    assert tampered is None
-    assert wrong_protocol is None
-    assert wrong_model is None
+    # The reason matters: a tampered secret and a permission gap are different
+    # problems with different fixes, and reporting both as an invalid key sent
+    # operators hunting for a bad secret when the client simply lacked a protocol.
+    assert tampered is AuthDenial.INVALID_KEY
+    assert wrong_protocol is AuthDenial.PROTOCOL_NOT_PERMITTED
+    assert wrong_model is AuthDenial.MODEL_NOT_PERMITTED
 
 
 def test_key_plaintext_is_not_exposed_by_its_record() -> None:
@@ -110,4 +114,4 @@ def test_authentication_rejects_expired_gateway_key() -> None:
         hasher=hasher,
     )
 
-    assert authenticated is None
+    assert authenticated is AuthDenial.KEY_EXPIRED

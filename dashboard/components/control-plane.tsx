@@ -325,7 +325,9 @@ function explainError(value: unknown): string {
     upstream_authentication_error:
       "The provider rejected this credential. Rotate or disable it; other credentials on the same provider are tried first.",
     authentication_error:
-      "The gateway API key sent by the client was rejected. Nothing upstream is wrong.",
+      "The gateway API key sent by the client was not recognised. Nothing upstream is wrong.",
+    authorization_error:
+      "The client's key is valid, but its client is not allowed this protocol or model, or the key is revoked or expired. Fix it in Clients, not at the provider.",
     quota_exhausted:
       "This credential is out of quota or balance. Another credential or provider with headroom is required.",
     timeout: "The provider did not respond before the configured timeout.",

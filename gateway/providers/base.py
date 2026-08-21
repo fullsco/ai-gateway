@@ -10,6 +10,9 @@ from gateway.protocols import Capability, ClientProtocol, NormalizedRequest
 
 class ErrorCategory(StrEnum):
     AUTHENTICATION_ERROR = "authentication_error"
+    # The key is real, but its client is not allowed this protocol or model. A
+    # configuration decision the operator can see and change, not a bad secret.
+    AUTHORIZATION_ERROR = "authorization_error"
     UPSTREAM_AUTHENTICATION_ERROR = "upstream_authentication_error"
     UPSTREAM_WAF_REJECTION = "upstream_waf_rejection"
     RATE_LIMIT = "rate_limit"
@@ -89,6 +92,8 @@ class ProviderError(BaseModel):
 _RETRY_SEMANTICS: dict[ErrorCategory, tuple[bool, RetryScope, bool]] = {
     # The *client's* gateway key is bad. Nothing upstream is wrong.
     ErrorCategory.AUTHENTICATION_ERROR: (False, RetryScope.NONE, False),
+    # The client is not permitted this protocol or model. No retry can grant it.
+    ErrorCategory.AUTHORIZATION_ERROR: (False, RetryScope.NONE, False),
     # The upstream rejected the credential we sent. Another credential on the same
     # provider may still be accepted, so fail over at credential level.
     ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR: (True, RetryScope.CREDENTIAL, True),

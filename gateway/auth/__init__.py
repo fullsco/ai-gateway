@@ -1,4 +1,5 @@
 from gateway.auth.service import (
+    AuthDenial,
     AuthenticatedClient,
     ClientPermissions,
     GatewayClient,
@@ -9,6 +10,7 @@ from gateway.auth.service import (
 )
 
 __all__ = [
+    "AuthDenial",
     "AuthenticatedClient",
     "ClientPermissions",
     "GatewayClient",
