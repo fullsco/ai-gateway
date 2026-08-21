@@ -26,6 +26,7 @@ from gateway.observability import (
 )
 from gateway.protocols import ClientProtocol, NormalizedRequest
 from gateway.providers import ErrorCategory, ProviderError, build_provider_error
+from gateway.providers.base import RetryScope
 from gateway.quotas import (
     BudgetExceeded,
     ClientSpendingLimitExceeded,
@@ -618,11 +619,35 @@ async def execute_request(
                 credential_at_fault=last_error.credential_at_fault if last_error else True,
             )
 
-        # Always retire the credential that just failed for this request. Provider
-        # level problems additionally penalise the provider's score via live state,
-        # so a sibling credential is still tried first and the configured provider
-        # fallback is used once this provider's pool is exhausted.
+        # Always retire the credential that just failed for this request.
         excluded = excluded | {route.credential.credential_id}
+        # A provider-scoped failure is not the credential's fault, so a sibling key
+        # on the same provider is unlikely to help: the upstream is down, WAF-blocked
+        # or does not serve the model. Prefer a different provider. Without this,
+        # retry_scope was computed and never acted on, so PROVIDER behaved exactly
+        # like CREDENTIAL: a provider with more credentials than the attempt budget
+        # consumed every attempt before any configured fallback was reached.
+        # GoRouter has five credentials against three attempts, which made its
+        # TabiAi fallback unreachable in production.
+        #
+        # Only retire the provider when another provider is actually reachable for
+        # this request. If it is the only route left, whether because nothing else
+        # maps this model or because allow_model_fallback forbids the alternatives,
+        # then a sibling key is the last remaining chance and is worth spending an
+        # attempt on. Retiring the provider unconditionally would convert a
+        # recoverable single-provider failure into a hard error.
+        if last_error is not None and last_error.retry_scope is RetryScope.PROVIDER:
+            sibling_routes = {
+                model.id
+                for model in runtime.model_registry.list_provider_models()
+                if model.provider_id == route.provider_model.provider_id
+            }
+            another_provider_is_reachable = any(
+                candidate.id not in excluded_routes and candidate.id not in sibling_routes
+                for candidate in runtime.model_registry.eligible_provider_models(normalized)
+            )
+            if another_provider_is_reachable:
+                excluded_routes = excluded_routes | sibling_routes
         if (
             not settings.failover_enabled
             or last_error is None

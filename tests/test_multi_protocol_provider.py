@@ -96,6 +96,76 @@ def build_runtime(handler, *, restrict_first_credential: bool = False):
     return runtime, issued.plaintext
 
 
+def build_two_provider_runtime(handler):
+    """One model served by two providers, the first holding several credentials.
+
+    The credential count on the first provider deliberately exceeds the attempt
+    budget, which is the situation that hid the missing provider-scope handling.
+    """
+    encryption_key = base64.b64encode(b"e" * 32).decode()
+    pepper = base64.b64encode(b"p" * 32).decode()
+    cipher = CredentialCipher.from_base64(encryption_key)
+    hasher = GatewayKeyHasher.from_base64(pepper)
+    issued = hasher.issue(key_id="key", client_id="client")
+
+    credentials = []
+    for index in range(1, 6):
+        credential_id = f"first-credential-{index}"
+        envelope = cipher.encrypt(
+            f"first-key-{index}", context=f"provider-credential:{credential_id}"
+        )
+        credentials.append({
+            "id": credential_id, "provider_id": "first",
+            "secret_nonce": envelope.nonce, "secret_ciphertext": envelope.ciphertext,
+            "priority": index,
+        })
+    envelope = cipher.encrypt("second-key", context="provider-credential:second-credential")
+    credentials.append({
+        "id": "second-credential", "provider_id": "second",
+        "secret_nonce": envelope.nonce, "secret_ciphertext": envelope.ciphertext,
+        "priority": 1,
+    })
+
+    def provider(identifier: str, host: str) -> dict:
+        return {
+            "id": identifier, "name": identifier, "provider_type": "anthropic_compatible",
+            "protocol": "anthropic_messages", "base_url": f"https://{host}",
+            "enabled": True, "priority": 100, "capabilities": ["streaming"],
+            "timeout_seconds": 30, "health": "healthy",
+        }
+
+    def mapping(identifier: str, provider_id: str, priority: int) -> dict:
+        return {
+            "id": identifier, "canonical_model_id": "shared-model",
+            "provider_id": provider_id, "upstream_model_id": "shared-model",
+            "protocol": "anthropic_messages", "capabilities": ["streaming"],
+            "priority": priority, "weight": 1, "enabled": True, "max_concurrency": 8,
+        }
+
+    payload = {
+        "clients": [{
+            "id": "client", "name": "client",
+            "allowed_protocols": ["anthropic_messages"],
+        }],
+        "gateway_keys": [{
+            "id": issued.record.id, "client_id": issued.record.client_id,
+            "key_prefix": issued.record.key_prefix, "key_digest": issued.record.digest,
+            "enabled": True,
+        }],
+        "providers": [provider("first", "first.example"), provider("second", "second.example")],
+        "credentials": credentials,
+        "models": [{"id": "shared-model", "enabled": True, "capabilities": ["streaming"]}],
+        "provider_models": [
+            mapping("first-mapping", "first", 100),
+            mapping("second-mapping", "second", 200),
+        ],
+    }
+    runtime = RuntimeBuilder(encryption_key=encryption_key, key_pepper=pepper).build(payload)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    runtime = runtime.__class__(**{**runtime.__dict__, "http_client": client})
+    return runtime, issued.plaintext
+
+
 def test_shared_credentials_route_through_protocol_specific_adapters() -> None:
     seen = []
 
@@ -237,3 +307,40 @@ def test_exhausted_capacity_is_reported_as_no_eligible_route_not_a_missing_model
     assert response.status_code == 503
     assert response.json()["error"]["type"] == "no_eligible_route"
     assert "currently eligible" in response.json()["error"]["message"]
+
+
+def test_a_provider_scoped_failure_moves_to_the_next_provider() -> None:
+    """retry_scope was computed and never acted on.
+
+    A provider-level failure only retired the failing credential, so a provider with
+    more credentials than the attempt budget consumed every attempt before any
+    configured fallback provider was reached. GoRouter has five credentials against
+    three attempts, which made its fallback unreachable in practice.
+    """
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        # The first provider is unreachable at its edge, which is not the fault of
+        # any credential it holds.
+        if "first.example" in str(request.url):
+            return httpx.Response(503, json={"error": {"message": "unavailable"}})
+        return httpx.Response(200, json={"id": "ok", "type": "message"})
+
+    runtime, key = build_two_provider_runtime(handler)
+    app = create_app(Settings(environment="test", _env_file=None), runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": key},
+            json={"model": "shared-model", "messages": []},
+        )
+
+    assert response.status_code == 200, response.text
+    first = [url for url in seen if "first.example" in url]
+    second = [url for url in seen if "second.example" in url]
+    assert len(first) == 1, (
+        f"the unreachable provider must be retired after one attempt, got {len(first)}"
+    )
+    assert second, "the second provider must be reached"

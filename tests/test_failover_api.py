@@ -243,4 +243,8 @@ def test_failed_route_falls_back_to_another_mapping_when_permitted() -> None:
         )
 
     assert response.status_code == 200
-    assert used_hosts == ["upstream.example", "upstream.example", "fallback.example"]
+    # 503 is PROVIDER_UNAVAILABLE, which _RETRY_SEMANTICS scopes to the provider.
+    # A second key against the same dead host cannot help, so the attempt is spent
+    # on the fallback provider instead. This assertion previously expected
+    # upstream twice, which encoded the executor ignoring retry_scope entirely.
+    assert used_hosts == ["upstream.example", "fallback.example"]
