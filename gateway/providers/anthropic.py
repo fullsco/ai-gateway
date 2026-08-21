@@ -94,8 +94,19 @@ class AnthropicCompatibleAdapter(ProviderAdapter):
 
         if response.status_code == 403 and self._is_waf_rejection(response):
             category = ErrorCategory.UPSTREAM_WAF_REJECTION
+        elif response.status_code == 403 and any(
+            marker in searchable for marker in QUOTA_MARKERS
+        ):
+            # Some resellers answer 403 rather than 402 or 429 when a key is out of
+            # quota. Reading that as a rejected credential parked working keys as
+            # auth_failed, which is both wrong and unrecoverable: quota comes back,
+            # a bad secret does not. Two AgentRouter credentials sat like that while
+            # the provider was plainly saying "user quota is not enough".
+            category = ErrorCategory.QUOTA_EXHAUSTED
         elif response.status_code in {401, 403}:
             # The upstream rejected *this credential*, not the client's gateway key.
+            # This also covers a key restricted by IP or not entitled to the model:
+            # both are specific to the credential, so a sibling key may still work.
             category = ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR
         elif response.status_code in {402, 429} and any(
             marker in searchable for marker in QUOTA_MARKERS

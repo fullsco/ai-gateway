@@ -419,3 +419,103 @@ def test_a_healthy_credential_is_preferred_over_one_on_trial() -> None:
     )
 
     assert decision.credential.credential_id == "healthy"
+
+
+def test_a_403_that_says_out_of_quota_is_not_read_as_a_rejected_credential() -> None:
+    """Quota and authentication need opposite responses, so they must not collapse.
+
+    Some resellers answer 403 instead of 402 or 429 when a key is out of quota. The
+    401/403 branch ran first, so those became upstream_authentication_error and the
+    credential's health became auth_failed. That is wrong in a way that costs
+    capacity: quota returns on its own, a rejected secret does not, and the operator
+    is told to rotate a key that is fine. Two AgentRouter credentials sat parked
+    that way while the provider was plainly reporting "user quota is not enough".
+    """
+    import httpx
+
+    from gateway.protocols import ClientProtocol
+    from gateway.providers import ErrorCategory, ProviderConfig
+    from gateway.providers.anthropic import AnthropicCompatibleAdapter
+    from gateway.providers.openai import OpenAICompatibleAdapter
+
+    adapters = (
+        AnthropicCompatibleAdapter(
+            ProviderConfig(
+                id="p", name="P", base_url="https://upstream.example",
+                protocol=ClientProtocol.ANTHROPIC_MESSAGES, capabilities=frozenset(),
+            )
+        ),
+        OpenAICompatibleAdapter(
+            ProviderConfig(
+                id="p", name="P", base_url="https://upstream.example",
+                protocol=ClientProtocol.OPENAI_CHAT_COMPLETIONS, capabilities=frozenset(),
+            )
+        ),
+    )
+    for adapter in adapters:
+        out_of_quota = httpx.Response(
+            403, json={"error": {"message": "user quota is not enough"}}
+        )
+        assert adapter.normalize_error(out_of_quota).category is ErrorCategory.QUOTA_EXHAUSTED
+
+        # A 403 that is genuinely about the credential must still read that way, so
+        # the fix cannot swallow real rejections.
+        rejected = httpx.Response(
+            403, json={"error": {"message": "unauthorized client detected"}}
+        )
+        assert (
+            adapter.normalize_error(rejected).category
+            is ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR
+        )
+
+
+def test_every_failure_state_earns_a_way_back() -> None:
+    """A credential with no cooldown can never recover, so every state needs one.
+
+    Health is restored by observing a success, and an unhealthy credential is never
+    selected, so a cooldown is the only route back into service. Only rate limits
+    used to set one. Everything else was stranded permanently, which is how fourteen
+    AgentRouter credentials came to be parked with no cooldown at all, four of them
+    working perfectly.
+    """
+    from gateway.observability import (
+        _RECOVERY_COOLDOWN_SECONDS,
+        PassiveHealthEvent,
+        _passive_health,
+        _recovery_cooldown,
+    )
+    from gateway.providers import ErrorCategory
+
+    observed_at = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def event(retry_after: float | None = None) -> PassiveHealthEvent:
+        return PassiveHealthEvent(
+            provider_id="p", credential_id="c", provider_model_id="m",
+            request_id="r", attempt_number=1, observed_at=observed_at,
+            latency_ms=1.0, retry_after_seconds=retry_after,
+        )
+
+    # Every health state the gateway can write for a failure must be recoverable.
+    reachable = {
+        _passive_health(category.value)
+        for category in ErrorCategory
+        if _passive_health(category.value) not in (None, "healthy")
+    }
+    missing = reachable - set(_RECOVERY_COOLDOWN_SECONDS)
+    assert not missing, f"these failure states can never be retried: {sorted(missing)}"
+
+    for state in reachable:
+        cooldown = _recovery_cooldown(state, event())
+        assert cooldown is not None and cooldown > observed_at, state
+
+    # A success must not park a working credential.
+    assert _recovery_cooldown("healthy", event()) is None
+    assert _recovery_cooldown(None, event()) is None
+
+    # The provider's own retry-after beats our default, in both directions.
+    assert _recovery_cooldown("rate_limited", event(retry_after=600)) == observed_at + timedelta(
+        seconds=600
+    )
+    assert _recovery_cooldown("auth_failed", event(retry_after=5)) == observed_at + timedelta(
+        seconds=5
+    )

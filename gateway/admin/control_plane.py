@@ -77,6 +77,17 @@ class CredentialUpdateInput(BaseModel):
     quota_threshold: float = Field(default=0.95, gt=0, le=1)
     requests_per_minute: int | None = Field(default=None, gt=0)
     tokens_per_minute: int | None = Field(default=None, gt=0)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class CredentialReinstateInput(BaseModel):
+    """Why this credential is being put back into service.
+
+    A reason is required. Reinstating without one loses the only evidence that the
+    key was actually checked, and the next person to see it fail has to start over.
+    """
+
+    note: str = Field(min_length=1, max_length=2000)
 
 
 class ClientInput(NormalizedStringLists):
@@ -611,7 +622,7 @@ async def update_credential(
         """
         update public.provider_credentials set
           name=$2, enabled=$3, priority=$4, quota_limit=$5, quota_threshold=$6,
-          requests_per_minute=$7, tokens_per_minute=$8, updated_at=now()
+          requests_per_minute=$7, tokens_per_minute=$8, note=$9, updated_at=now()
         where id=$1
         returning id, provider_id, name, masked_hint, enabled, priority,
                   health, quota_limit, quota_used, quota_threshold,
@@ -625,11 +636,55 @@ async def update_credential(
         body.quota_threshold,
         body.requests_per_minute,
         body.tokens_per_minute,
+        body.note,
     )
     if row is None:
         return _not_found("credential")
     await _audit(
         pool, claims, "credential_updated", "credential", credential_id, _audit_fields(body)
+    )
+    return JSONResponse(jsonable_encoder(dict(row)))
+
+
+@router.post("/credentials/{credential_id}/reinstate")
+async def reinstate_credential(
+    credential_id: str,
+    request: Request,
+    body: CredentialReinstateInput,
+) -> JSONResponse:
+    """Return a credential to service after checking it works.
+
+    Health only ever degrades by itself and is restored by observing a success, but
+    an unhealthy credential is never selected, so it cannot earn that success. A
+    credential whose cooldown has elapsed gets a trial, yet one that failed without
+    a retry-after never received a cooldown and so was stranded permanently. Four
+    working AgentRouter keys were sitting in exactly that state.
+
+    This clears health and cooldown so the router will use the credential again. It
+    does not verify anything: the operator asserts the key works and records how
+    they know, which is why the note is required.
+    """
+    context = await _context(request)
+    if isinstance(context, JSONResponse):
+        return context
+    claims, pool = context
+    row = await pool.fetchrow(
+        """
+        update public.provider_credentials set
+          health='healthy', cooldown_until=null, failure_count=0,
+          note=$2, updated_at=now()
+        where id=$1
+        returning id, provider_id, name, enabled, health, cooldown_until,
+                  failure_count, success_count, note
+        """,
+        credential_id,
+        body.note,
+    )
+    if row is None:
+        return _not_found("credential")
+    await _audit(
+        pool, claims, "credential_reinstated", "credential", credential_id,
+        {"note": body.note},
     )
     return JSONResponse(jsonable_encoder(dict(row)))
 

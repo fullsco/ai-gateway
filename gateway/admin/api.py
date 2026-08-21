@@ -194,7 +194,7 @@ async def credentials(request: Request) -> JSONResponse:
                  else 'unknown'
                end as quota_confidence,
                c.balance_amount, c.balance_currency, c.balance_observed_at,
-               c.balance_source
+               c.balance_source, c.note
         from public.provider_credentials c
         join public.providers p on p.id = c.provider_id
         order by p.priority, c.priority, c.name

@@ -127,11 +127,7 @@ class PassiveHealthRecorder:
             if event.error_category is not None:
                 await self._alert(event)
             return
-        cooldown_until = (
-            event.observed_at + timedelta(seconds=event.retry_after_seconds or 30)
-            if event.error_category == "rate_limit"
-            else None
-        )
+        cooldown_until = _recovery_cooldown(health, event)
         await self._pool.execute(
             """
             with previous as (
@@ -198,6 +194,42 @@ class PassiveHealthRecorder:
                 },
             ),
         )
+
+
+# How long to wait before letting a credential in this state try again. A cooldown
+# is the only route back: health is restored by observing a success, an unhealthy
+# credential is not selected, so without a cooldown it can never earn one. Only
+# rate_limited used to get one, which stranded every other failure state
+# permanently. Fourteen AgentRouter credentials sat parked with no cooldown, four of
+# which turned out to work.
+#
+# The durations are deliberately unequal. A rate limit clears in seconds. Quota
+# clears on the provider's billing window, which is long, but retrying every quarter
+# hour costs one wasted attempt and recovers without anyone watching. A rejection is
+# usually permanent, yet not always: several "rejections" here were the provider
+# refusing a client fingerprint, so an hourly retry is worth the single attempt.
+_RECOVERY_COOLDOWN_SECONDS = {
+    "rate_limited": 30,
+    "degraded": 120,
+    "unavailable": 300,
+    "quota_exhausted": 900,
+    "auth_failed": 3600,
+}
+
+
+def _recovery_cooldown(health: str | None, event: PassiveHealthEvent) -> datetime | None:
+    """When this credential may next be tried, or None to leave the cooldown alone.
+
+    A provider-supplied retry-after always wins, because it is the only figure that
+    reflects the provider's actual state rather than our guess.
+    """
+    if health is None or health == "healthy":
+        return None
+    default = _RECOVERY_COOLDOWN_SECONDS.get(health)
+    if default is None:
+        return None
+    seconds = event.retry_after_seconds or default
+    return event.observed_at + timedelta(seconds=seconds)
 
 
 def _passive_health(error_category: str | None) -> str | None:
