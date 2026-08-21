@@ -122,13 +122,54 @@ class FakePool:
 
 
 class SnapshotPool(FakePool):
+    """Answers snapshot queries by what they ask for, not by call order.
+
+    A positional queue was consumed by the background live-state refresh before
+    publish ever ran, so the canned rows arrived at the wrong queries. The rows are
+    keyed on a distinguishing fragment of each snapshot query instead.
+    """
+
+    # Order matters: the provider_models query also selects a provider's
+    # default_headers, so it must be matched before the providers query.
+    SECTIONS = (
+        ("keys", "from public.gateway_client_keys"),
+        ("clients", "from public.gateway_clients"),
+        ("provider_models", "from public.provider_models pm"),
+        ("providers", "settings->'default_headers'"),
+        ("credentials", "from public.provider_credentials pc"),
+        ("aliases", "from public.model_aliases"),
+        ("models", "from public.models"),
+    )
+
     def __init__(self) -> None:
         super().__init__()
         self.fetch_queries: list[str] = []
+        self.sections: dict[str, list[dict[str, Any]]] = {}
+
+    def section(self, name: str, rows: list[dict[str, Any]]) -> "SnapshotPool":
+        self.sections[name] = rows
+        return self
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
         self.fetch_queries.append(query)
-        return await super().fetch(query, *args)
+        if not self.sections:
+            # Tests that call _snapshot_payload directly still queue results in
+            # order, which is safe because nothing else is querying the pool.
+            return await super().fetch(query, *args)
+        for name, marker in self.SECTIONS:
+            if marker in query:
+                return self.sections.get(name, [])
+        # Anything else, such as the live-state refresh, is not part of a snapshot.
+        return []
+
+    def query_for(self, section: str) -> str:
+        """The snapshot query for a section, matched precisely.
+
+        Selecting by "from public.providers" alone now finds the live-state query
+        first, which is a different statement entirely.
+        """
+        marker = dict(self.SECTIONS)[section]
+        return next(query for query in self.fetch_queries if marker in query)
 
 
 class RequestDetailPool(FakePool):
@@ -787,7 +828,6 @@ def test_gateway_key_is_stored_as_digest_and_returned_once() -> None:
 
 def test_publishing_empty_valid_snapshot_is_transactional_and_audited() -> None:
     pool = SnapshotPool()
-    pool.fetch_results = [[], [], [], [], [], []]
     pool.fetchrow_result = {"id": 7, "published_at": datetime(2026, 8, 13, tzinfo=UTC)}
 
     with client(pool) as test_client:
@@ -805,28 +845,22 @@ def test_publishing_empty_valid_snapshot_is_transactional_and_audited() -> None:
         "config_version",
         "7",
     )
-    provider_model_query = next(
-        query for query in pool.fetch_queries if "from public.provider_models" in query
-    )
+    provider_model_query = pool.query_for("provider_models")
     assert "join public.model_routes" in provider_model_query
     assert "where pm.enabled and r.enabled" in provider_model_query
     assert "r.priority" in provider_model_query
     assert "max_concurrency" in provider_model_query
-    client_query = next(
-        query for query in pool.fetch_queries if "from public.gateway_clients" in query
-    )
+    client_query = pool.query_for("clients")
     assert "requests_per_minute" in client_query
     assert "tokens_per_minute" in client_query
     assert "spending_limit" in client_query
-    provider_query = next(query for query in pool.fetch_queries if "from public.providers" in query)
+    provider_query = pool.query_for("providers")
     assert "settings->'default_headers'" in provider_query
     assert "settings->>'auth_scheme'" in provider_query
     assert "settings->'endpoint_query'" in provider_query
     key_query = next(query for query in pool.fetch_queries if "gateway_client_keys" in query)
     assert "expires_at" in key_query
-    credential_query = next(
-        query for query in pool.fetch_queries if "from public.provider_credentials" in query
-    )
+    credential_query = pool.query_for("credentials")
     assert "credential_model_access" in credential_query
     assert "supported_provider_model_ids" in credential_query
 
@@ -869,9 +903,8 @@ def test_rollback_publishes_new_monotonic_snapshot_and_audits_atomically() -> No
 
 def test_publishing_decodes_provider_json_settings_from_asyncpg() -> None:
     pool = SnapshotPool()
-    pool.fetch_results = [
-        [],
-        [],
+    pool.section(
+        "providers",
         [
             {
                 "id": "provider-id",
@@ -889,10 +922,7 @@ def test_publishing_decodes_provider_json_settings_from_asyncpg() -> None:
                 "endpoint_query": '{"beta":"true"}',
             }
         ],
-        [],
-        [],
-        [],
-    ]
+    )
     pool.fetchrow_result = {"id": 8, "published_at": datetime(2026, 8, 14, tzinfo=UTC)}
 
     with client(pool) as test_client:
@@ -926,7 +956,8 @@ def test_client_rejects_unknown_protocol_before_database_write() -> None:
 
 def test_publish_returns_structured_validation_error() -> None:
     pool = SnapshotPool()
-    pool.fetch_results = [
+    pool.section(
+        "clients",
         [
             {
                 "id": "client-id",
@@ -936,13 +967,7 @@ def test_publish_returns_structured_validation_error() -> None:
                 "allowed_models": [],
             }
         ],
-        [],
-        [],
-        [],
-        [],
-        [],
-        [],
-    ]
+    )
 
     with client(pool) as test_client:
         response = test_client.post("/api/admin/v1/config/publish", headers=auth())
@@ -963,7 +988,8 @@ async def test_publish_refresh_authenticates_issued_gateway_key() -> None:
         client_id="client-id",
     )
     pool = SnapshotPool()
-    pool.fetch_results = [
+    pool.section(
+        "clients",
         [
             {
                 "id": "client-id",
@@ -973,6 +999,8 @@ async def test_publish_refresh_authenticates_issued_gateway_key() -> None:
                 "allowed_models": [],
             }
         ],
+    ).section(
+        "keys",
         [
             {
                 "id": issued.record.id,
@@ -982,12 +1010,7 @@ async def test_publish_refresh_authenticates_issued_gateway_key() -> None:
                 "enabled": True,
             }
         ],
-        [],
-        [],
-        [],
-        [],
-        [],
-    ]
+    )
     pool.fetchrow_result = {"id": 8, "published_at": datetime(2026, 8, 14, tzinfo=UTC)}
 
     with client(pool) as test_client:
