@@ -71,10 +71,13 @@ implying otherwise. That is the correct behaviour, not a gap.
 | # | Action | Expected result | Pass |
 |---|---|---|---|
 | D1 | Open **Models and routing**, select `claude-opus-5` | AgentRouter is shown as primary, GoRouter as fallback | ☐ |
-| D2 | Select `claude-opus-5-thinking` | GoRouter is the only provider | ☐ |
+| D2 | Select `claude-opus-5-thinking` | GoRouter is primary, TabiAi is the fallback | ☐ |
 | D3 | Read the "What will happen" sentence | It names the primary and the fallbacks in plain language | ☐ |
 | D4 | **Do not change anything.** Press **Save working changes** | It saves without error | ☐ |
 | D5 | Open **Configuration** | Either no pending changes, or only changes you recognise. It must **not** report that routes were removed or disabled | ☐ |
+
+| D6 | Run `env -u GATEWAY_DATABASE_URL .venv/bin/python deploy/verify_provider_failover.py` | For `claude-opus-5-thinking` the attempted providers are `GoRouter, TabiAi`. No model reports STILL BROKEN | ☐ |
+| D7 | In the same output, read the routable/total column | If any provider shows 1 routable, its spare credentials need attention before launch. See Known conditions | ☐ |
 
 **D4 and D5 together are the single most important safety check in this document.**
 Loading routing and saving it back without touching anything must not alter your
@@ -121,9 +124,10 @@ tripped near $2,124. You will be warned at 75% and again at 90%.
 | G1 | Open **Alerts** | Any current alerts, most severe first | ☐ |
 | G2 | For each alert, read the four fields | It tells you **what happened**, **why it matters**, **what to do**, and the **measured values** | ☐ |
 | G3 | Confirm you can act on it without asking anyone | If an alert leaves you unsure what to do, that is a failure — tell me which one | ☐ |
-| G4 | Open **Alert rules** | Twelve rules, each with a readable name | ☐ |
+| G4 | Open **Alert rules** | Thirteen rules, each with a readable name | ☐ |
 | G5 | Read one rule's condition | A sentence such as "at or above 0.5, measured over 15 minutes". Not raw JSON | ☐ |
 | G6 | Check the currently open alerts | You should see the two GoRouter credentials flagged for low balance, and a spend alert | ☐ |
+| G7 | Find **Provider is down to its last credential** in the rules | Present and enabled. It warns while one credential is left, where **Provider has no usable credentials left** only fires once nothing is usable | ☐ |
 
 ---
 
@@ -280,9 +284,20 @@ These are already understood. Seeing them is not a failure.
 
 - **GoRouter is intermittently unreachable.** Its Cloudflare edge alternates
   between rejecting connections and returning a challenge page, for all five
-  credentials, independent of key or balance. `claude-opus-5-thinking` has GoRouter
-  as its only provider, so it will fail while that persists. The Dashboard should
-  attribute this to the provider, not to your keys.
+  credentials, independent of key or balance. The Dashboard should attribute this
+  to the provider, not to your keys.
+- **`claude-opus-5-thinking` has GoRouter primary and TabiAi as fallback.** Both
+  edges block this host, so it will fail while that persists, but it must now
+  attempt both. Run `deploy/verify_provider_failover.py` and check the attempted
+  providers are `GoRouter, TabiAi`, not GoRouter three times.
+- **AgentRouter holds 24 enabled credentials and only one is healthy.** Ten are
+  rate limited and fourteen were rejected. Sixteen of those hold cooldowns that
+  have elapsed, so the router will trial them and each success restores it. Eight
+  never succeeded at all and hold no cooldown, so they are never retried: they are
+  either revoked or mistyped and should be replaced or removed. Until that is done,
+  `claude-opus-5` and `gpt-5.6-sol` depend on a pool with very little headroom, and
+  neither may fall back to another provider because every mapping sets
+  `allow_model_fallback` false.
 - **Two GoRouter credentials show a low balance alert** from an observation of
   $0.061184. Balance is only as fresh as its last observation; the alert states
   when it was taken.
@@ -291,6 +306,14 @@ These are already understood. Seeing them is not a failure.
 - **`claude-sonnet-5` and `kimi-k3` do not resolve.** They are different models
   from anything configured. They fail with a clear 404 on purpose; aliasing them to
   an Opus mapping would answer with a model you did not ask for.
+- **`glm-5.2`, and every GoRouter and TabiAi route, are deliberately unpriced.**
+  `hcnsec` bills a flat 640.94 counter units per request regardless of token count,
+  and its unit is ambiguous by a factor of five thousand, so the true price is
+  either $6.4094 or $0.00128188 per request. GoRouter and TabiAi block this host on
+  every path including their billing counters, so nothing could be measured. The
+  readings are recorded against those routes with an explanation. They are left
+  unpriced rather than recorded as free, so cost views under-report those routes
+  instead of quietly claiming they cost nothing.
 - **Some older usage records show zero tokens.** Those predate the streaming fix
   and cannot be re-costed. Records from 2026-08-19 22:20 onwards are correct.
 
