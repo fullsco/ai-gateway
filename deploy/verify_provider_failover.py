@@ -38,7 +38,7 @@ from gateway.protocols import ClientProtocol
 from gateway.protocols.models import NormalizedRequest
 from gateway.routing.engine import NoRouteAvailable, RoutingTrace
 
-MODELS = ("claude-opus-5-thinking", "claude-opus-5", "gpt-5.6-sol", "glm-5.2")
+MODELS = ("claude-opus-5-thinking", "claude-opus-5", "gpt-5.6-sol", "nemotron-3-ultra")
 MAX_ATTEMPTS = 3
 # Mirrors gateway.routing.engine.ROUTABLE_HEALTH.
 ROUTABLE = ("healthy", "degraded")

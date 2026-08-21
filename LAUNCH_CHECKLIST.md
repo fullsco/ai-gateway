@@ -158,7 +158,7 @@ be visible to you.
 | I1 | In OpenCode, ask a question using `claude-opus-5` | A normal answer | ☐ |
 | I2 | In OpenCode, ask something that produces a long streamed answer | Text streams smoothly, no stall or truncation | ☐ |
 | I3 | In OpenCode, switch to `gpt-5.6-sol` and ask again | A normal answer | ☐ |
-| I4 | In OpenCode, try `glm-5.2` | A normal answer | ☐ |
+| I4 | In OpenCode, try `nemotron-3-ultra` | A normal answer, but be patient: measured latency ranges from 6s to over 300s and can hit the 600s provider timeout | ☐ |
 | I5 | In Claude Code, run a multi-step task that reads files and makes edits | Completes normally | ☐ |
 | I6 | In Claude Code, interrupt a long response part-way | The client recovers; the next request works | ☐ |
 | I7 | Run ten requests in a row in either client | All succeed. No manual intervention needed | ☐ |
@@ -204,11 +204,11 @@ provider problem, **not** as a bad credential.
 | Step | Action | Expected result | Pass |
 |---|---|---|---|
 | a | Disable **all** hcnsec credentials. Publish | — | ☐ |
-| b | Send a `glm-5.2` request | Fails with "no route currently eligible" | ☐ |
+| b | Send a `nemotron-3-ultra` request | Fails with "no route currently eligible" | ☐ |
 | c | Wait about a minute, open **Alerts** | An alert appears saying the provider has no usable credentials, with what to do | ☐ |
 | d | **Restore:** re-enable them. Publish | — | ☐ |
 | e | Wait about a minute, open **Alerts** | The alert has moved to **resolved**, reason *recovered* | ☐ |
-| f | Send a `glm-5.2` request | Succeeds | ☐ |
+| f | Send a `nemotron-3-ultra` request | Succeeds | ☐ |
 
 **Step e is the important one.** An alerting system that never closes an alert
 cannot tell you whether a problem is live.
@@ -306,14 +306,36 @@ These are already understood. Seeing them is not a failure.
 - **`claude-sonnet-5` and `kimi-k3` do not resolve.** They are different models
   from anything configured. They fail with a clear 404 on purpose; aliasing them to
   an Opus mapping would answer with a model you did not ask for.
-- **`glm-5.2`, and every GoRouter and TabiAi route, are deliberately unpriced.**
-  `hcnsec` bills a flat 640.94 counter units per request regardless of token count,
-  and its unit is ambiguous by a factor of five thousand, so the true price is
-  either $6.4094 or $0.00128188 per request. GoRouter and TabiAi block this host on
-  every path including their billing counters, so nothing could be measured. The
-  readings are recorded against those routes with an explanation. They are left
+- **`glm-5.2` has been retired.** api.hcnsec.cn no longer serves it and returns 503
+  model_not_found. Both the mapping and the canonical model are disabled rather than
+  deleted, so the 72 historical requests and 32 attempts naming it keep their
+  meaning, and it can be re-enabled untouched if the channel returns. Requesting it
+  now fails with a clean 404, "No provider is configured to serve this model as
+  requested."
+- **`nemotron-3-ultra` is what hcnsec actually serves, and it is slow.** The mapping
+  asks hcnsec for `DeepSeek-V4-Pro`, because that is the only string it routes, and
+  every response identifies itself as `nvidia/nemotron-3-ultra-550b-a55b`. The
+  canonical model is named for what answers rather than for what the provider
+  accepts. hcnsec substitutes across its whole catalogue this way: Kimi-K2.6 returns
+  thinkingmachines/inkling, Qwen3.8-27B returns meta/muse-glimmer-30b. About one
+  streaming request in ten instead returns Anthropic protocol events claiming to be
+  claude-opus-5, so the backend is not stable even for one name. Measured latency
+  was 6s, 116s, 303s, 303s, 531s and one 600s timeout, so treat it as a batch route,
+  not an interactive one. It also reports about 1049 tokens of hidden prompt on
+  every request.
+- **`nemotron-3-ultra`, and every GoRouter and TabiAi route, are deliberately
+  unpriced.** `hcnsec` bills a flat 640.94 counter units per request regardless of
+  token count, and its unit is ambiguous by a factor of five thousand, so the true
+  price is either $6.4094 or $0.00128188 per request. GoRouter and TabiAi block this
+  host on every path including their billing counters, so nothing could be measured.
+  The readings are recorded against those routes with an explanation. They are left
   unpriced rather than recorded as free, so cost views under-report those routes
   instead of quietly claiming they cost nothing.
+- **OpenCode's `gateway-openai` models need a key that permits the OpenAI protocol.**
+  The `Claude Code Cli` client only permits `anthropic_messages`, so a key from it
+  fails every `gateway-openai/*` request with "Invalid gateway key", which reads as a
+  bad key rather than a denied protocol. Use a key from the `Opencode` client, which
+  permits both protocols and therefore serves both providers in the OpenCode config.
 - **Some older usage records show zero tokens.** Those predate the streaming fix
   and cannot be re-costed. Records from 2026-08-19 22:20 onwards are correct.
 
