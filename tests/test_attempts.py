@@ -143,7 +143,11 @@ def test_a_route_level_exclusion_reports_no_credential() -> None:
     labelled = _label_trace(
         [{
             "considered": [
-                {"provider": "GoRouter", "eligible": False, "reason": "route_excluded_this_request"},
+                {
+                    "provider": "GoRouter",
+                    "eligible": False,
+                    "reason": "route_excluded_this_request",
+                },
                 {"provider": "AgentRouter", "credential_id": "c-1", "eligible": True},
             ],
             "selected": None,
