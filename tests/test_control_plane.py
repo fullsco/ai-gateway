@@ -1117,3 +1117,55 @@ def test_blended_pricing_must_declare_its_measured_basis() -> None:
                 "pricing_basis": "listed",
             },
         )
+
+
+def test_a_key_can_be_named_without_exposing_its_secret() -> None:
+    """A key could be created, revoked or rotated, but never named.
+
+    Keys issued without a label stayed anonymous, so an operator could not tell
+    which client or purpose each one served.
+    """
+    pool = FakePool()
+    pool.fetchrow_result = {
+        "id": "key-1",
+        "client_id": "client-1",
+        "key_prefix": "gw_live_abcd",
+        "label": "opencode primary",
+        "enabled": True,
+        "created_at": None,
+    }
+    test_settings = settings().model_copy(update={"database_url": None})
+
+    with TestClient(
+        create_app(test_settings, admin_verifier=AdminVerifier(), db_pool=pool),
+        raise_server_exceptions=False,
+    ) as test_client:
+        response = test_client.patch(
+            "/api/admin/v1/client-keys/key-1",
+            headers=auth(),
+            json={"label": "opencode primary"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["label"] == "opencode primary"
+    query, args = pool.fetchrow_calls[0]
+    assert "set label=$2" in query
+    # The statement touches nothing else, so no secret can be altered by a rename.
+    assert "key_digest" not in query
+    assert args == ("key-1", "opencode primary")
+
+
+def test_naming_an_unknown_key_is_a_not_found() -> None:
+    pool = FakePool()
+    pool.fetchrow_result = None
+    test_settings = settings().model_copy(update={"database_url": None})
+
+    with TestClient(
+        create_app(test_settings, admin_verifier=AdminVerifier(), db_pool=pool),
+        raise_server_exceptions=False,
+    ) as test_client:
+        response = test_client.patch(
+            "/api/admin/v1/client-keys/missing", headers=auth(), json={"label": "x"}
+        )
+
+    assert response.status_code == 404

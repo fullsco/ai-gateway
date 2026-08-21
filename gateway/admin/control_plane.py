@@ -800,6 +800,42 @@ async def client_keys(client_id: str, request: Request) -> JSONResponse:
     return JSONResponse(jsonable_encoder({"data": [dict(row) for row in rows]}))
 
 
+class ClientKeyLabelInput(BaseModel):
+    """Only the label. A key's secret is never reachable through an update."""
+
+    label: str | None = Field(default=None, max_length=120)
+
+
+@router.patch("/client-keys/{key_id}")
+async def relabel_client_key(
+    key_id: str, request: Request, body: ClientKeyLabelInput
+) -> JSONResponse:
+    """Name an existing key.
+
+    There was no way to do this: a key could be created, revoked or rotated, but
+    never named, so keys issued without a label stayed anonymous forever and an
+    operator could not tell which client or purpose each one served.
+    """
+    context = await _context(request)
+    if isinstance(context, JSONResponse):
+        return context
+    claims, pool = context
+    row = await pool.fetchrow(
+        """
+        update public.gateway_client_keys set label=$2
+        where id=$1 returning id,client_id,key_prefix,label,enabled,created_at
+        """,
+        key_id,
+        body.label,
+    )
+    if row is None:
+        return _not_found("client_key")
+    await _audit(
+        pool, claims, "gateway_key_relabelled", "client_key", key_id, {"label": body.label}
+    )
+    return JSONResponse(jsonable_encoder(dict(row)))
+
+
 @router.post("/client-keys/{key_id}/revoke")
 async def revoke_client_key(
     key_id: str,
