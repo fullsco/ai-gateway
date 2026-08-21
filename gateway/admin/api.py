@@ -6,6 +6,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
 from gateway.admin.auth import AdminClaims, SupabaseJWTVerifier
+from gateway.routing.engine import ROUTABLE_CREDENTIAL_SQL
 
 router = APIRouter(prefix="/api/admin/v1", tags=["admin"])
 
@@ -110,7 +111,12 @@ async def providers(request: Request) -> JSONResponse:
                p.priority, p.capabilities, p.health, p.timeout_seconds, p.settings,
                p.created_at, p.updated_at,
                count(c.id) as credential_count,
-               count(c.id) filter (where c.enabled and c.health = 'healthy') as healthy_credentials
+               count(c.id) filter (where c.enabled and c.health = 'healthy') as healthy_credentials,
+               -- What the router can actually use, which includes an unhealthy
+               -- credential whose cooldown has elapsed. Counting only healthy ones
+               -- made a pool of 17 usable credentials read as 1.
+               count(c.id) filter (where c.enabled and (""" + ROUTABLE_CREDENTIAL_SQL + """))
+                 as routable_credentials
         from public.providers p
         left join public.provider_credentials c on c.provider_id = p.id
         group by p.id
@@ -163,6 +169,23 @@ async def credentials(request: Request) -> JSONResponse:
                -- is not. Without a limit there is no denominator and headroom is
                -- unknowable, however precise quota_used looks.
                c.quota_source, c.quota_observed_at, c.quota_note,
+               -- Whether the router will actually try this credential, evaluated with
+               -- the router's own predicate so the two cannot disagree. Health alone
+               -- understated the pool badly: one provider read as 1 healthy out of 25
+               -- while the router could use 17, because an unhealthy credential whose
+               -- cooldown has elapsed earns a recovery attempt.
+               (c.enabled and (""" + ROUTABLE_CREDENTIAL_SQL + """)) as routable,
+               -- What the operator should do about it, which health cannot express.
+               -- The important distinction is between a credential that will come
+               -- back on its own and one that never will.
+               case
+                 when not c.enabled then 'disabled'
+                 when c.cooldown_until is not null and c.cooldown_until > now()
+                   then 'cooling down'
+                 when c.health in ('healthy','degraded') then 'in service'
+                 when c.cooldown_until is not null then 'on trial'
+                 else 'needs attention'
+               end as routing_state,
                case
                  when c.quota_limit is not null and c.quota_limit <> 0
                       and c.quota_used is not null then 'known'
@@ -222,6 +245,9 @@ async def provider_workspace(provider_id: str, request: Request) -> JSONResponse
                count(distinct c.id) as credential_count,
                count(distinct c.id) filter (where c.enabled and c.health='healthy')
                  as healthy_credentials,
+               count(distinct c.id)
+                 filter (where c.enabled and (""" + ROUTABLE_CREDENTIAL_SQL + """))
+                 as routable_credentials,
                count(distinct c.id) filter (where c.cooldown_until > now())
                  as cooling_credentials,
                count(distinct pm.id) as mapping_count,

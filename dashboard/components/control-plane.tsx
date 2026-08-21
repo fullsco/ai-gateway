@@ -48,14 +48,18 @@ const resources: Record<ResourceView, { endpoint: string; title: string; mutable
     endpoint: "providers",
     title: "Providers",
     mutable: true,
-    columns: ["name", "provider_type", "base_url", "enabled", "health", "healthy_credentials", "credential_count"],
+    columns: ["name", "provider_type", "base_url", "enabled", "health", "routable_credentials", "healthy_credentials", "credential_count"],
   },
   credentials: {
     endpoint: "credentials",
     title: "Credentials",
     mutable: true,
     columns: [
-      "name", "provider_name", "masked_hint", "enabled", "health",
+      // routing_state comes before health deliberately. Health says what happened
+      // last; routing_state says whether the router will use the credential now,
+      // and whether it will recover on its own. Reading health alone made a
+      // provider with 17 usable credentials look like it had 1.
+      "name", "provider_name", "masked_hint", "enabled", "routing_state", "health",
       "quota_used", "quota_limit", "quota_confidence", "balance_amount",
       "balance_observed_at", "cooldown_until",
     ],
@@ -168,6 +172,7 @@ const api = gatewayApi;
 
 function display(value: unknown, key: string, row?: Row) {
   if (key === "quota_confidence") return QUOTA_CONFIDENCE[String(value)] ?? "No signal";
+  if (key === "routing_state") return ROUTING_STATE[String(value)] ?? String(value ?? "Unknown");
   if (key === "summary" || key === "recommended_action" || key === "description") {
     return value === null || value === undefined || value === "" ? "Not recorded" : String(value);
   }
@@ -305,6 +310,16 @@ function describeCondition(condition: Row): string {
   });
   return parts.length ? parts.join(", ") : "Always";
 }
+
+// What to do about a credential, which "health" cannot express. The distinction
+// that matters is between one that will come back by itself and one that will not.
+const ROUTING_STATE: Record<string, string> = {
+  "in service": "In service - the router is using it",
+  "on trial": "On trial - unhealthy, but its cooldown has passed so the next attempt may use it and a success restores it",
+  "cooling down": "Cooling down - paused until its cooldown expires, then it is tried again",
+  "needs attention": "Needs attention - it has never succeeded and holds no cooldown, so it is never retried. Replace or remove it",
+  disabled: "Disabled - excluded by configuration, not by health",
+};
 
 const QUOTA_CONFIDENCE: Record<string, string> = {
   known: "Measured - a limit and a usage figure are both known",

@@ -12,3 +12,44 @@ def test_admin_api_requires_authentication() -> None:
 
     assert response.status_code == 401
     assert response.json() == {"error": "admin_authentication_required"}
+
+
+def test_credential_views_count_what_the_router_can_use() -> None:
+    """Operational counts must use the router's own definition of routable.
+
+    Health alone understated the pool badly. One provider read as 1 healthy
+    credential out of 25 while the router could actually use 17, because an
+    unhealthy credential whose cooldown has elapsed earns a recovery attempt. An
+    operator looking at that view would conclude they were one failure from an
+    outage when they were not, or miss that 7 other credentials will never be
+    retried at all.
+    """
+    import inspect
+
+    from gateway.admin import api
+
+    # The queries interpolate the router's constant rather than restating the
+    # predicate, so the only way they can drift is by dropping the reference.
+    for endpoint in (api.credentials, api.providers, api.provider_workspace):
+        source = inspect.getsource(endpoint)
+        assert "ROUTABLE_CREDENTIAL_SQL" in source, (
+            f"{endpoint.__name__} counts credentials without the router's definition"
+        )
+        assert "routable_credentials" in source or "as routable" in source
+
+
+def test_the_credentials_view_separates_recoverable_from_hopeless() -> None:
+    """routing_state must distinguish a credential that returns from one that cannot.
+
+    "unhealthy" covers both a key pausing after a rate limit, which comes back by
+    itself, and a key that has never once succeeded and holds no cooldown, which is
+    never retried and needs replacing. Those need opposite responses, so they must
+    not render the same.
+    """
+    import inspect
+
+    from gateway.admin import api
+
+    source = inspect.getsource(api.credentials)
+    for state in ("in service", "on trial", "cooling down", "needs attention", "disabled"):
+        assert f"'{state}'" in source, f"routing_state is missing {state!r}"
