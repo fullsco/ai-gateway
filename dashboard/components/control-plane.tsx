@@ -68,7 +68,9 @@ const resources: Record<ResourceView, { endpoint: string; title: string; mutable
     endpoint: "clients",
     title: "Gateway clients",
     mutable: true,
-    columns: ["name", "allowed_protocols", "allowed_models", "enabled", "active_keys"],
+    // live_access sits next to enabled because access is enforced from the
+    // published snapshot. A client can read as disabled here and still be serving.
+    columns: ["name", "allowed_protocols", "allowed_models", "enabled", "live_access", "active_keys"],
   },
   models: {
     endpoint: "models",
@@ -173,6 +175,7 @@ const api = gatewayApi;
 function display(value: unknown, key: string, row?: Row) {
   if (key === "quota_confidence") return QUOTA_CONFIDENCE[String(value)] ?? "No signal";
   if (key === "routing_state") return ROUTING_STATE[String(value)] ?? String(value ?? "Unknown");
+  if (key === "live_access") return LIVE_ACCESS[String(value)] ?? String(value ?? "Unknown");
   if (key === "summary" || key === "recommended_action" || key === "description") {
     return value === null || value === undefined || value === "" ? "Not recorded" : String(value);
   }
@@ -310,6 +313,17 @@ function describeCondition(condition: Row): string {
   });
   return parts.length ? parts.join(", ") : "Always";
 }
+
+// Access is enforced from the published configuration, so what an operator sets
+// here and what the gateway does can differ until they publish. Saying so is the
+// difference between believing a key is revoked and it actually being revoked.
+const LIVE_ACCESS: Record<string, string> = {
+  serving: "Serving - enabled here and in the published configuration",
+  "STILL SERVING until you publish": "Still serving - you disabled it, but the published configuration has not caught up. Its keys keep working until you publish",
+  "not serving until you publish": "Not serving yet - you enabled it, but the published configuration has not caught up. Publish to let its keys work",
+  "not serving yet, publish to activate": "Not serving yet - this client has never been published. Publish to activate it",
+  "not serving": "Not serving - disabled here and in the published configuration",
+};
 
 // What to do about a credential, which "health" cannot express. The distinction
 // that matters is between one that will come back by itself and one that will not.

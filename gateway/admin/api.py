@@ -210,10 +210,33 @@ async def clients(request: Request) -> JSONResponse:
         select c.id, c.name, c.enabled, c.allowed_protocols, c.allowed_models,
                c.requests_per_minute, c.tokens_per_minute, c.spending_limit,
                count(k.id) filter (where k.enabled and k.revoked_at is null) as active_keys,
+               -- Access is enforced from the published snapshot, not from this table,
+               -- so a client edited here is unchanged in practice until a publish.
+               -- Disabling a client and seeing "disabled" in this list, while its keys
+               -- keep working, is the most dangerous version of that gap, so the
+               -- effective state is reported next to the configured one.
+               case
+                 when pub.published_enabled is null and c.enabled
+                   then 'not serving yet, publish to activate'
+                 when pub.published_enabled is null then 'not serving'
+                 when pub.published_enabled and c.enabled then 'serving'
+                 when pub.published_enabled and not c.enabled
+                   then 'STILL SERVING until you publish'
+                 when not pub.published_enabled and c.enabled
+                   then 'not serving until you publish'
+                 else 'not serving'
+               end as live_access,
                c.created_at, c.updated_at
         from public.gateway_clients c
         left join public.gateway_client_keys k on k.client_id = c.id
-        group by c.id
+        left join lateral (
+          select (element->>'enabled')::boolean as published_enabled
+          from public.config_versions v,
+               lateral jsonb_array_elements(v.payload->'clients') as element
+          where v.status = 'published' and element->>'id' = c.id::text
+          limit 1
+        ) pub on true
+        group by c.id, pub.published_enabled
         order by c.name
         """,
     )

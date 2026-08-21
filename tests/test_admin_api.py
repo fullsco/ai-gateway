@@ -53,3 +53,23 @@ def test_the_credentials_view_separates_recoverable_from_hopeless() -> None:
     source = inspect.getsource(api.credentials)
     for state in ("in service", "on trial", "cooling down", "needs attention", "disabled"):
         assert f"'{state}'" in source, f"routing_state is missing {state!r}"
+
+
+def test_the_clients_view_reports_effective_access_not_just_configuration() -> None:
+    """A client can read as disabled here and still be serving traffic.
+
+    Access is enforced from the published snapshot, so editing gateway_clients
+    changes nothing until a publish. An operator who disables a client, sees
+    "disabled" in the list and walks away has revoked nothing: verified in
+    production, a staged disable still returned 200 on the client's key.
+    """
+    import inspect
+
+    from gateway.admin import api
+
+    source = inspect.getsource(api.clients)
+    assert "live_access" in source
+    # The effective state has to come from the published snapshot, not the table.
+    assert "config_versions" in source and "status = 'published'" in source
+    # The dangerous direction must be called out explicitly, not merely implied.
+    assert "STILL SERVING until you publish" in source
