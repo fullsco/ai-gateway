@@ -248,3 +248,49 @@ def test_failed_route_falls_back_to_another_mapping_when_permitted() -> None:
     # on the fallback provider instead. This assertion previously expected
     # upstream twice, which encoded the executor ignoring retry_scope entirely.
     assert used_hosts == ["upstream.example", "fallback.example"]
+
+
+def test_an_upstream_that_truncates_a_stream_is_blamed_for_it() -> None:
+    """A stream cut short by the provider must not read as a client cancellation.
+
+    The response is already committed with 200 when this happens, so there is no
+    status code left to tell the truth with. The exception used to escape the
+    streaming generator and reach uvicorn as an unhandled ASGI error: it logged a
+    traceback that implied a fault in the gateway, recorded the attempt as merely
+    "cancelled", and submitted nothing to health, so a provider that habitually cuts
+    streams short was never scored for it and looked exactly like a user pressing
+    Ctrl-C. Eleven of these were sitting in the production log.
+    """
+
+    class TruncatedStream(httpx.AsyncByteStream):
+        """Sends a first event, so the response commits, then dies mid-body."""
+
+        async def __aiter__(self):
+            yield b"event: message_start\ndata: {}\n\n"
+            raise httpx.RemoteProtocolError(
+                "peer closed connection without sending complete message body"
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, stream=TruncatedStream()
+        )
+
+    runtime, key = make_runtime(handler)
+    app = create_app(Settings(environment="test", _env_file=None), runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": key},
+            json={"model": "model-x", "stream": True, "messages": []},
+        )
+
+    # The committed 200 stands, but the client is told the stream did not finish
+    # rather than being left to treat a truncated answer as a complete one.
+    assert response.status_code == 200
+    assert b"upstream_truncated" in response.content
+    assert b"message_start" in response.content

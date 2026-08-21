@@ -750,12 +750,27 @@ async def _close_response(response: httpx.Response | None) -> None:
         await response.aclose()
 
 
+def _terminal_stream_error(protocol: ClientProtocol, message: str) -> bytes:
+    """A last event telling the client the stream ended abnormally.
+
+    The response was committed with 200 before the upstream died, so the status
+    code cannot say anything. Without a terminal event the client sees a stream that
+    simply stops, which is indistinguishable from a complete one: it will treat a
+    truncated answer as the whole answer.
+    """
+    payload = {"type": "error", "error": {"type": "upstream_truncated", "message": message}}
+    if protocol is ClientProtocol.ANTHROPIC_MESSAGES:
+        return f"event: error\ndata: {json.dumps(payload)}\n\n".encode()
+    return f"data: {json.dumps(payload)}\n\ndata: [DONE]\n\n".encode()
+
+
 async def _stream_response(
     first_chunk: bytes,
     iterator: AsyncIterator[bytes],
     finalizer: "_StreamFinalizer",
 ) -> AsyncIterator[bytes]:
     completed = False
+    error: ProviderError | None = None
     try:
         finalizer.usage.feed(first_chunk)
         yield first_chunk
@@ -763,8 +778,28 @@ async def _stream_response(
             finalizer.usage.feed(chunk)
             yield chunk
         completed = True
+    except (httpx.StreamError, httpx.HTTPError) as exc:
+        # The upstream stopped mid-body. This used to escape the generator and reach
+        # uvicorn as an unhandled ASGI exception, which logged a traceback implying a
+        # fault here, recorded the attempt as merely "cancelled", and told the health
+        # system nothing at all, so a provider that truncates streams was never
+        # penalised and looked identical to a client pressing Ctrl-C.
+        error = build_provider_error(
+            ErrorCategory.PROVIDER_UNAVAILABLE,
+            "The provider closed the stream before it was complete.",
+        )
+        log_event(
+            logger,
+            logging.WARNING,
+            "upstream_stream_truncated",
+            provider_id=finalizer.provider_id,
+            provider_model_id=finalizer.provider_model_id,
+            attempt_number=finalizer.attempt_number,
+            error_type=type(exc).__name__,
+        )
+        yield _terminal_stream_error(finalizer.protocol, error.message)
     finally:
-        await finalizer.finish(completed)
+        await finalizer.finish(completed, error=error)
 
 
 class _StreamFinalizer:
@@ -808,13 +843,14 @@ class _StreamFinalizer:
         self.provider_model_id = provider_model_id
         self.attempt_number = attempt_number
         self.attribution = attribution
+        self.protocol = protocol
         # Called with the actual cost once the stream ends, so the pre-flight
         # reservation can be corrected. A stream only knows its usage at the end.
         self.settle = settle
         self.usage = StreamUsageAccumulator(protocol)
         self._task: asyncio.Task[None] | None = None
 
-    async def finish(self, completed: bool) -> None:
+    async def finish(self, completed: bool, *, error: ProviderError | None = None) -> None:
         if self._task is None:
             ended_at = datetime.now(UTC)
             self._task = asyncio.create_task(
@@ -823,6 +859,7 @@ class _StreamFinalizer:
                     response=self.response,
                     attempt_id=self.attempt_id,
                     completed=completed,
+                    error=error,
                     usage=self.usage,
                     resolved_model=self.resolved_model,
                     started_at=self.started_at,
@@ -853,6 +890,7 @@ async def _finalize_stream(
     attempt_id: int | None,
     completed: bool,
     usage: StreamUsageAccumulator,
+    error: ProviderError | None = None,
     resolved_model: str,
     started_at: datetime,
     attempt_started_at: datetime,
@@ -876,12 +914,18 @@ async def _finalize_stream(
     finally:
         if lease is not None:
             lease.release()
+    # A stream can end three ways, and they are not interchangeable. It completed;
+    # the client went away, which is nobody's fault; or the upstream truncated it,
+    # which is the provider's fault and has to reach health, or a provider that
+    # habitually cuts streams short is never scored for it.
     if route_controls is not None and route_id is not None:
         if completed:
             await route_controls.record_success(route_id)
+        elif error is not None:
+            await route_controls.record_failure(route_id)
         else:
             await route_controls.abandon(route_id)
-    if completed and provider_id and credential_id and provider_model_id:
+    if (completed or error is not None) and provider_id and credential_id and provider_model_id:
         _submit_health(
             health_recorder,
             recorder,
@@ -892,13 +936,21 @@ async def _finalize_stream(
             ended_at,
             _latency_ms(attempt_started_at, ended_at),
             upstream_status=upstream_status,
+            error=error,
         )
+    if completed:
+        attempt_status = "succeeded"
+    elif error is not None:
+        attempt_status = "failed"
+    else:
+        attempt_status = "cancelled"
     await recorder.finish_attempt(
         attempt_id,
-        status="succeeded" if completed else "cancelled",
+        status=attempt_status,
         ended_at=ended_at,
         latency_ms=_latency_ms(attempt_started_at, ended_at),
         upstream_status=upstream_status,
+        error_category=error.category.value if error is not None else None,
         response_committed=True,
     )
     actual_cost = None
@@ -913,12 +965,13 @@ async def _finalize_stream(
         # A cancelled stream reports no usage, so the whole reservation is released.
         await settle(actual=actual_cost)
     await recorder.finish_request(
-        status="succeeded" if completed else "cancelled",
+        status=attempt_status,
         resolved_model=resolved_model,
         ended_at=ended_at,
         latency_ms=_latency_ms(started_at, ended_at),
         retry_count=attempts - 1,
         fallback_count=fallback_count,
+        error_category=error.category.value if error is not None else None,
     )
 
 
