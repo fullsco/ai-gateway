@@ -293,3 +293,14 @@ td .value { display: block; overflow: hidden; text-overflow: ellipsis; white-spa
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
+
+/* Routing decision: why a request went where it went. */
+.routing-decision { display: flex; flex-direction: column; gap: 0.85rem; }
+.routing-attempt { border: 1px solid var(--border, #e2e2e5); border-radius: 8px; padding: 0.75rem 0.9rem; }
+.routing-attempt header { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.4rem; }
+.routing-attempt .badge { font-size: 0.75rem; padding: 0.1rem 0.45rem; border-radius: 999px; background: #f1f1f4; color: #55555f; }
+.routing-selected { margin: 0 0 0.5rem; }
+.routing-excluded { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.routing-excluded caption { text-align: left; color: #6a6a75; padding-bottom: 0.3rem; }
+.routing-excluded th, .routing-excluded td { text-align: left; padding: 0.2rem 0.5rem 0.2rem 0; border-bottom: 1px solid #f0f0f2; }
+.routing-excluded th { color: #6a6a75; font-weight: 500; }

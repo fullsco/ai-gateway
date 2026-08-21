@@ -285,6 +285,72 @@ describe("control plane", () => {
     expect(screen.getAllByText("Not observed").length).toBeGreaterThan(0);
   });
 
+  it("explains why a request was routed the way it was", async () => {
+    // The routing trace records every candidate and why each was skipped, but it
+    // was recorded and never shown, so the operator could not answer "why did this
+    // go there" without reading the database.
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes("requests/request-1")) return response({
+        request: { id: "request-1", requested_model: "claude-opus-5", status: "succeeded", latency_ms: 900, retry_count: 1, fallback_count: 1 },
+        attempts: [{ id: "a1", attempt_number: 1, provider_name: "GoRouter", credential_name: "k1", status: "failed", error_category: "provider_unavailable" }],
+        usage: [],
+        routing: [
+          {
+            attempt_number: 1, is_fallback: false, strategy: "priority",
+            selected: { provider: "AgentRouter", credential_name: "primary", score: 7.83 },
+            considered: [
+              { provider: "AgentRouter", credential_name: "primary", eligible: true, score: 7.83 },
+              { provider: "AgentRouter", credential_name: "spare", eligible: true, score: 6.33 },
+              { provider: "GoRouter", credential_name: "gr-1", eligible: false, reason: "credential_health_auth_failed" },
+              { provider: "TabiAi", credential_name: "t-1", eligible: false, reason: "provider_disabled" },
+              { provider: "AgentRouter", credential_name: "cooling", eligible: false, reason: "credential_in_cooldown" },
+              { provider: "AgentRouter", credential_name: "spent", eligible: false, reason: "credential_quota_exhausted" },
+            ],
+          },
+        ],
+      });
+      if (path.includes("requests")) return response({ data: [{ id: "request-1", requested_model: "claude-opus-5", status: "succeeded", latency_ms: 900, retry_count: 1, fallback_count: 1 }] });
+      return response(overview);
+    }));
+    render(<ControlPlane />);
+    await userEvent.click(screen.getByRole("button", { name: "Requests" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Trace request" }));
+    expect(await screen.findByRole("dialog", { name: "Request trace" })).toBeVisible();
+
+    // What was chosen, and that it beat the other eligible candidate.
+    expect(screen.getByText(/Chose/)).toBeVisible();
+    expect(screen.getByText(/the best of 2 eligible/)).toBeVisible();
+    // Each skip reason reads as a sentence, never as a raw enum value.
+    expect(screen.getByText("The credential is rejected by the provider")).toBeVisible();
+    expect(screen.getByText("The provider is turned off")).toBeVisible();
+    expect(screen.getByText("Cooling down after a recent failure")).toBeVisible();
+    expect(screen.getByText("Out of quota")).toBeVisible();
+    expect(screen.getByText(/4 candidates skipped/)).toBeVisible();
+    expect(document.body.textContent).not.toContain("credential_health_auth_failed");
+    expect(document.body.textContent).not.toContain("provider_disabled");
+  });
+
+  it("says so when nothing was eligible", async () => {
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes("requests/request-1")) return response({
+        request: { id: "request-1", requested_model: "glm-5.2", status: "failed", error_category: "no_eligible_route" },
+        attempts: [], usage: [],
+        routing: [{ attempt_number: 1, selected: null, considered: [
+          { provider: "hcnsec", credential_name: "h1", eligible: false, reason: "credential_health_unavailable" },
+        ] }],
+      });
+      if (path.includes("requests")) return response({ data: [{ id: "request-1", requested_model: "glm-5.2", status: "failed" }] });
+      return response(overview);
+    }));
+    render(<ControlPlane />);
+    await userEvent.click(screen.getByRole("button", { name: "Requests" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Trace request" }));
+    expect(await screen.findByText(/Nothing was eligible, so no provider was contacted/)).toBeVisible();
+    expect(screen.getByText("The credential is unreachable")).toBeVisible();
+  });
+
   it("shows a human-readable publish review before publishing", async () => {
     vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
       const path = String(input);

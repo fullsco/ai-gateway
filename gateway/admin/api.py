@@ -320,15 +320,83 @@ async def request_detail(request_id: str, request: Request) -> JSONResponse:
         "select * from public.usage_records where request_id=$1 order by id",
         request_id,
     )
+    # The routing trace records every candidate and why it was excluded, but it
+    # identifies credentials by id. Resolve those to names so the decision can be
+    # read without looking anything up.
+    trace = _decode_trace(row.get("routing_trace"))
+    credential_names = await _credential_names(pool, _trace_credential_ids(trace))
     return JSONResponse(
         jsonable_encoder(
             {
                 "request": dict(row),
                 "attempts": [dict(item) for item in attempts],
                 "usage": [dict(item) for item in usage_rows],
+                "routing": _label_trace(trace, credential_names),
             }
         )
     )
+
+
+def _decode_trace(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return []
+    return value if isinstance(value, list) else []
+
+
+def _trace_credential_ids(trace: list[dict[str, Any]]) -> set[str]:
+    ids: set[str] = set()
+    for attempt in trace:
+        for candidate in attempt.get("considered") or []:
+            if candidate.get("credential_id"):
+                ids.add(str(candidate["credential_id"]))
+        selected = attempt.get("selected") or {}
+        if selected.get("credential_id"):
+            ids.add(str(selected["credential_id"]))
+    return ids
+
+
+async def _credential_names(pool: Any, ids: set[str]) -> dict[str, str]:
+    if not ids:
+        return {}
+    rows = await pool.fetch(
+        "select id::text as id, name from public.provider_credentials where id = any($1::uuid[])",
+        sorted(ids),
+    )
+    return {row["id"]: row["name"] for row in rows}
+
+
+def _credential_label(entry: dict[str, Any], names: dict[str, str]) -> str | None:
+    """None when the exclusion was route wide and no credential was involved."""
+    credential_id = entry.get("credential_id")
+    if not credential_id:
+        return None
+    return names.get(str(credential_id), "Unavailable")
+
+
+def _label_trace(
+    trace: list[dict[str, Any]], names: dict[str, str]
+) -> list[dict[str, Any]]:
+    labelled = []
+    for attempt in trace:
+        candidates = []
+        for candidate in attempt.get("considered") or []:
+            entry = dict(candidate)
+            entry["credential_name"] = _credential_label(candidate, names)
+            candidates.append(entry)
+        item = dict(attempt)
+        item["considered"] = candidates
+        selected = attempt.get("selected")
+        if selected:
+            chosen = dict(selected)
+            chosen["credential_name"] = _credential_label(selected, names)
+            item["selected"] = chosen
+        labelled.append(item)
+    return labelled
 
 
 @router.get("/requests")

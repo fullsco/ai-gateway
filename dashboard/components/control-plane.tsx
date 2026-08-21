@@ -1415,10 +1415,116 @@ function KeyManager({ value, busy, onClose, onRevoke, onRotate }: { value: { cli
   );
 }
 
+
+// Every reason the routing engine can give for skipping a candidate, said plainly.
+// Two are prefixes because the health state is appended to them.
+const EXCLUSION_REASONS: Record<string, string> = {
+  route_excluded_this_request: "Already tried and failed earlier in this same request",
+  provider_missing_from_snapshot: "The provider is not in the published configuration",
+  provider_disabled: "The provider is turned off",
+  provider_circuit_open: "Paused after repeated failures, and not yet retried",
+  credential_excluded_this_request: "Already tried and failed earlier in this same request",
+  credential_disabled: "The credential is turned off",
+  credential_other_provider: "Belongs to a different provider",
+  credential_in_cooldown: "Cooling down after a recent failure",
+  credential_quota_exhausted: "Out of quota",
+  credential_rpm_exhausted: "At its requests-per-minute limit",
+  credential_tpm_exhausted: "At its tokens-per-minute limit",
+  credential_concurrency_exhausted: "At its concurrent-request limit",
+  credential_not_permitted_for_route: "Not permitted to serve this model",
+  credential_not_in_route_pool: "Not a member of the credential pool this route restricts to",
+  credential_not_in_policy_allow_list: "Not on the routing policy's allow list",
+  latency_above_policy_limit: "Slower than the routing policy allows",
+  quota_headroom_below_policy_minimum: "Less quota headroom than the policy requires",
+  rpm_headroom_below_policy_minimum: "Less request headroom than the policy requires",
+  tpm_headroom_below_policy_minimum: "Less token headroom than the policy requires",
+};
+
+const HEALTH_REASONS: Record<string, string> = {
+  rate_limited: "rate limited by the provider",
+  auth_failed: "rejected by the provider",
+  quota_exhausted: "out of quota",
+  unavailable: "unreachable",
+  cooldown: "cooling down",
+  disabled: "turned off",
+};
+
+function explainExclusion(reason: unknown): string {
+  const key = String(reason ?? "");
+  if (!key) return "Eligible";
+  const known = EXCLUSION_REASONS[key];
+  if (known) return known;
+  for (const prefix of ["credential_health_", "provider_health_"]) {
+    if (key.startsWith(prefix)) {
+      const state = key.slice(prefix.length);
+      const subject = prefix.startsWith("credential") ? "credential" : "provider";
+      return `The ${subject} is ${HEALTH_REASONS[state] ?? state.replaceAll("_", " ")}`;
+    }
+  }
+  return key.replaceAll("_", " ");
+}
+
+/** Why this request went where it went, one block per attempt. */
+function RoutingDecision({ attempts }: { attempts: Row[] }) {
+  if (!attempts.length) {
+    return <p className="muted">No routing decision was recorded for this request.</p>;
+  }
+  return (
+    <div className="routing-decision">
+      {attempts.map((attempt, index) => {
+        const considered = (attempt.considered as Row[] | undefined) ?? [];
+        const selected = attempt.selected as Row | undefined;
+        const eligible = considered.filter((row) => row.eligible === true);
+        const excluded = considered.filter((row) => row.eligible !== true);
+        return (
+          <section key={index} className="routing-attempt">
+            <header>
+              <strong>Attempt {String(attempt.attempt_number ?? index + 1)}</strong>
+              {attempt.is_fallback === true ? (
+                <span className="badge">Fallback after {explainError(attempt.fallback_reason)}</span>
+              ) : null}
+            </header>
+            {selected ? (
+              <p className="routing-selected">
+                Chose <strong>{readable(selected.provider)}</strong> using credential{" "}
+                <strong>{readable(selected.credential_name)}</strong>
+                {selected.score !== undefined ? ` (score ${Number(selected.score).toFixed(2)})` : ""}
+                {eligible.length > 1 ? `, the best of ${eligible.length} eligible` : ""}.
+              </p>
+            ) : (
+              <p className="routing-selected">
+                Nothing was eligible, so no provider was contacted.
+              </p>
+            )}
+            {excluded.length ? (
+              <table className="routing-excluded">
+                <caption>{excluded.length} candidate{excluded.length === 1 ? "" : "s"} skipped</caption>
+                <thead>
+                  <tr><th>Provider</th><th>Credential</th><th>Why it was skipped</th></tr>
+                </thead>
+                <tbody>
+                  {excluded.map((row, position) => (
+                    <tr key={position}>
+                      <td>{readable(row.provider)}</td>
+                      <td>{row.credential_name ? readable(row.credential_name) : "Whole route"}</td>
+                      <td>{explainExclusion(row.reason)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : null}
+          </section>
+        );
+      })}
+    </div>
+  );
+}
+
 function RequestDetail({ value, onClose }: { value: Row; onClose: () => void }) {
   const request = (value.request as Row | undefined) ?? {};
   const attempts = (value.attempts as Row[] | undefined) ?? [];
   const usage = (value.usage as Row[] | undefined) ?? [];
+  const routing = (value.routing as Row[] | undefined) ?? [];
   const totals = usage.reduce<{ input: number; output: number; cached: number }>(
     (result, row) => ({
       input: result.input + Number(row.input_tokens ?? 0),
@@ -1451,6 +1557,8 @@ function RequestDetail({ value, onClose }: { value: Row; onClose: () => void }) 
           {Boolean(attempt.error_category) && <p className="trace-error">{explainError(attempt.error_category)}</p>}
           {Boolean(attempt.response_committed) && <p>The response had already started, so the Gateway could not safely retry.</p>}
         </li>)}</ol> : <div className="empty-state"><strong>No provider attempts recorded</strong><span>The request ended before an upstream attempt was persisted.</span></div>}
+        <h3>Why this routing was chosen</h3>
+        <RoutingDecision attempts={routing} />
         <h3>Token usage</h3>
         <div className="trace-summary">
           <div><span>Input tokens</span><strong>{totals.input.toLocaleString()}</strong></div>

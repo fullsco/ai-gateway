@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# AI Gateway + Cloudflare Tunnel supervisor.
+#
+#   gateway            start both (detached) and report status
+#   gateway start      same as above
+#   gateway status     report what is running, on which port, and whether it is ready
+#   gateway stop       stop both
+#   gateway restart    stop then start
+#   gateway logs       follow the gateway log
+#   gateway tunnel-logs follow the cloudflared log
+#
+# Services are started detached with setsid, so closing the shell - or a tool
+# whose command times out - can never take the gateway down with it.
+set -euo pipefail
+
+# Resolve the repository from this script's own location so the tracked copy is
+# not tied to one machine. Every path stays overridable from the environment.
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+AI_GATEWAY_DIR="${AI_GATEWAY_DIR:-$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)}"
+PYTHON="${GATEWAY_PYTHON:-$AI_GATEWAY_DIR/.venv/bin/python}"
+CLOUDFLARED="${CLOUDFLARED_BIN:-/usr/local/bin/cloudflared}"
+TOKEN_FILE="${CLOUDFLARED_TOKEN_FILE:-$HOME/.cloudflared-ai-gateway.token}"
+
+RUN_DIR="/tmp/ai-gateway"
+GATEWAY_LOG="$RUN_DIR/gateway.log"
+CLOUDFLARED_LOG="$RUN_DIR/cloudflared.log"
+GATEWAY_PID="$RUN_DIR/gateway.pid"
+CLOUDFLARED_PID="$RUN_DIR/cloudflared.pid"
+
+mkdir -p "$RUN_DIR"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# The port the gateway actually binds comes from .env, so status checks and the
+# tunnel target cannot drift apart.
+gateway_host() {
+    sed -nE 's/^GATEWAY_HOST=([^ #]+).*/\1/p' "$AI_GATEWAY_DIR/.env" 2>/dev/null | tail -1 || true
+}
+gateway_port() {
+    sed -nE 's/^GATEWAY_PORT=([0-9]+).*/\1/p' "$AI_GATEWAY_DIR/.env" 2>/dev/null | tail -1 || true
+}
+
+HOST="${GATEWAY_HOST:-$(gateway_host)}"; HOST="${HOST:-127.0.0.1}"
+PORT="${GATEWAY_PORT:-$(gateway_port)}"; PORT="${PORT:-8320}"
+
+is_ready() { curl -fsS --max-time 3 "http://$HOST:$PORT/ready" >/dev/null 2>&1; }
+is_healthy() { curl -fsS --max-time 3 "http://$HOST:$PORT/health" >/dev/null 2>&1; }
+
+# Match on the real command line rather than a stale pid file.
+gateway_pids() { pgrep -f "$PYTHON -m gateway" 2>/dev/null || true; }
+tunnel_pids() { pgrep -f "cloudflared tunnel .*$TOKEN_FILE" 2>/dev/null || true; }
+
+start_gateway() {
+    if [[ -n "$(gateway_pids)" ]] && is_healthy; then
+        echo "Gateway already running on $HOST:$PORT (pid $(gateway_pids | tr '\n' ' '))"
+        return 0
+    fi
+    # Refuse to fight for the port instead of silently exiting like before.
+    if ! [[ -n "$(gateway_pids)" ]] && (curl -fsS --max-time 2 "http://$HOST:$PORT/health" >/dev/null 2>&1); then
+        die "Port $PORT is already serving something that is not this gateway. Free it or change GATEWAY_PORT."
+    fi
+    [[ -x "$PYTHON" ]] || die "Gateway Python not found: $PYTHON"
+
+    echo "Starting Gateway on $HOST:$PORT ..."
+    cd "$AI_GATEWAY_DIR"
+    setsid nohup "$PYTHON" -m gateway >>"$GATEWAY_LOG" 2>&1 < /dev/null &
+    echo $! >"$GATEWAY_PID"
+
+    for _ in $(seq 1 60); do
+        is_ready && { echo "Gateway is ready."; return 0; }
+        sleep 1
+    done
+    echo "Gateway did not become ready. Last log lines:" >&2
+    tail -30 "$GATEWAY_LOG" >&2
+    return 1
+}
+
+start_tunnel() {
+    if [[ -n "$(tunnel_pids)" ]]; then
+        echo "Tunnel already running (pid $(tunnel_pids | tr '\n' ' '))"
+        return 0
+    fi
+    [[ -x "$CLOUDFLARED" ]] || die "cloudflared not found: $CLOUDFLARED"
+    [[ -r "$TOKEN_FILE" ]] || die "Cloudflare token file not found: $TOKEN_FILE"
+    echo "Starting Cloudflare Tunnel ..."
+    setsid nohup "$CLOUDFLARED" tunnel --no-autoupdate --loglevel info \
+        --logfile "$CLOUDFLARED_LOG" run --token-file "$TOKEN_FILE" \
+        >>"$CLOUDFLARED_LOG" 2>&1 < /dev/null &
+    echo $! >"$CLOUDFLARED_PID"
+}
+
+stop_all() {
+    local stopped=0
+    for pid in $(gateway_pids); do kill "$pid" 2>/dev/null && stopped=1; done
+    for pid in $(tunnel_pids); do kill "$pid" 2>/dev/null && stopped=1; done
+    rm -f "$GATEWAY_PID" "$CLOUDFLARED_PID"
+    sleep 2
+    # Anything that ignored SIGTERM gets SIGKILL.
+    for pid in $(gateway_pids) $(tunnel_pids); do kill -9 "$pid" 2>/dev/null || true; done
+    [[ "$stopped" == "1" ]] && echo "Stopped." || echo "Nothing was running."
+}
+
+status() {
+    local gpids tpids
+    gpids="$(gateway_pids | tr '\n' ' ')"
+    tpids="$(tunnel_pids | tr '\n' ' ')"
+
+    echo "=========================================="
+    echo " AI Gateway status"
+    echo "=========================================="
+    printf " Gateway process : %s\n" "${gpids:-not running}"
+    printf " Address         : http://%s:%s\n" "$HOST" "$PORT"
+    if is_ready; then
+        printf " Readiness       : ready (/ready 200)\n"
+    elif is_healthy; then
+        printf " Readiness       : alive but NOT ready (no active runtime configuration)\n"
+    else
+        printf " Readiness       : not responding\n"
+    fi
+    printf " Tunnel process  : %s\n" "${tpids:-not running}"
+    printf " Gateway log     : %s\n" "$GATEWAY_LOG"
+    printf " Tunnel log      : %s\n" "$CLOUDFLARED_LOG"
+
+    local version
+    version="$(grep -o '"message":"runtime_configured","version":[0-9]*' "$GATEWAY_LOG" 2>/dev/null \
+        | tail -1 | grep -o '[0-9]*$' || true)"
+    [[ -n "$version" ]] && printf " Config version  : v%s\n" "$version"
+    echo "=========================================="
+}
+
+case "${1:-start}" in
+    start|"")   start_gateway && start_tunnel && status ;;
+    stop)       stop_all ;;
+    restart)    stop_all; start_gateway && start_tunnel && status ;;
+    status)     status ;;
+    logs)       tail -f "$GATEWAY_LOG" ;;
+    tunnel-logs) tail -f "$CLOUDFLARED_LOG" ;;
+    *)          die "Unknown command: $1 (use start|stop|restart|status|logs|tunnel-logs)" ;;
+esac
