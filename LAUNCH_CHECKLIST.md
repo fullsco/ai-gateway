@@ -282,22 +282,23 @@ Launch when all of these are true:
 
 These are already understood. Seeing them is not a failure.
 
-- **GoRouter is intermittently unreachable.** Its Cloudflare edge alternates
-  between rejecting connections and returning a challenge page, for all five
-  credentials, independent of key or balance. The Dashboard should attribute this
-  to the provider, not to your keys.
-- **`claude-opus-5-thinking` has GoRouter primary and TabiAi as fallback.** Both
-  edges block this host, so it will fail while that persists, but it must now
-  attempt both. Run `deploy/verify_provider_failover.py` and check the attempted
-  providers are `GoRouter, TabiAi`, not GoRouter three times.
-- **AgentRouter holds 24 enabled credentials and only one is healthy.** Ten are
-  rate limited and fourteen were rejected. Sixteen of those hold cooldowns that
-  have elapsed, so the router will trial them and each success restores it. Eight
-  never succeeded at all and hold no cooldown, so they are never retried: they are
-  either revoked or mistyped and should be replaced or removed. Until that is done,
-  `claude-opus-5` and `gpt-5.6-sol` depend on a pool with very little headroom, and
-  neither may fall back to another provider because every mapping sets
-  `allow_model_fallback` false.
+- **GoRouter and TabiAi were never IP-blocked.** That was a misdiagnosis, twice. The
+  gateway's OpenAI adapter sent no user-agent, so httpx supplied its own, and
+  Cloudflare refuses generic library user-agents; probes with curl and urllib were
+  refused for the same reason, which made the wrong answer look consistent. With a
+  user-agent set, both providers answer. Ablation from this host: the httpx default,
+  python-requests and curl are all refused, `ai-gateway/0.1` is accepted.
+- **GoRouter is intermittently unreachable, and that is now handled.** Connection
+  resets interleave with successful requests from the same host and credential, so it
+  works often enough to be a fallback but not to be a primary.
+  `claude-opus-5-thinking` is configured GoRouter first, TabiAi second, and in
+  production now records exactly that: GoRouter fails with provider_unavailable and
+  TabiAi serves the request. Seeing one failed attempt followed by a success is the
+  system working, not a fault.
+- **`gpt-5.6-sol` occasionally fails with "no route currently eligible".** It has one
+  provider, AgentRouter, and `allow_model_fallback` is false, so when every AgentRouter
+  credential is momentarily out of quota or rate limited there is nowhere to go. Seen
+  once during acceptance, failing in 244ms rather than hanging.
 - **Two GoRouter credentials show a low balance alert** from an observation of
   $0.061184. Balance is only as fresh as its last observation; the alert states
   when it was taken.
@@ -323,14 +324,15 @@ These are already understood. Seeing them is not a failure.
   was 6s, 116s, 303s, 303s, 531s and one 600s timeout, so treat it as a batch route,
   not an interactive one. It also reports about 1049 tokens of hidden prompt on
   every request.
-- **`nemotron-3-ultra`, and every GoRouter and TabiAi route, are deliberately
-  unpriced.** `hcnsec` bills a flat 640.94 counter units per request regardless of
-  token count, and its unit is ambiguous by a factor of five thousand, so the true
-  price is either $6.4094 or $0.00128188 per request. GoRouter and TabiAi block this
-  host on every path including their billing counters, so nothing could be measured.
-  The readings are recorded against those routes with an explanation. They are left
-  unpriced rather than recorded as free, so cost views under-report those routes
-  instead of quietly claiming they cost nothing.
+- **Three of four providers bill a flat fee per request, and are unpriced because of
+  it.** Measured with a control read confirming the counter is otherwise still: hcnsec
+  moves its counter 640.94 per request, TabiAi exactly 80, GoRouter exactly 30, in each
+  case regardless of token count. All three also report a per-request cost that does
+  vary with tokens, contradicting their own counter by between 412x and 931x. The unit
+  cannot be resolved from outside, and the pricing model has no shape for a
+  per-request fee, only per-million-token rates. So the readings are recorded and the
+  routes stay unpriced. Cost views under-report those routes rather than claiming they
+  are free. See PUNCH_LIST.md for what would unblock it.
 - **OpenCode's `gateway-openai` models need a key that permits the OpenAI protocol.**
   The `Claude Code Cli` client only permits `anthropic_messages`, so a key from it
   fails every `gateway-openai/*` request with "Invalid gateway key", which reads as a
