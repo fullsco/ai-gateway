@@ -146,17 +146,37 @@ class ProviderModelInput(NormalizedStringLists):
         currency = pricing.get("currency")
         if not isinstance(currency, str) or len(currency.strip()) != 3 or not currency.isalpha():
             raise ValueError("pricing currency must be a three-letter alphabetic code")
-        # Two shapes are supported. A listed rate card separates input from output.
+        # Three shapes are supported. A listed rate card separates input from output.
         # A measured blended rate is what a before/after billing measurement can
         # actually establish from a single sample, and must carry its provenance so
         # it is never presented as a separated rate it cannot support.
+        #
+        # A flat per-request fee is how some resellers actually charge, and no
+        # per-token rate can describe it. TabiAi moved its billing counter by exactly
+        # the same amount for 7,185 and 246,190 input tokens: a 34x increase in size
+        # for no change in charge. Recording that as a per-million rate would be
+        # inventing a number that misstates the cost of every request, in one
+        # direction for small ones and the other for large.
+        per_request = "per_request" in pricing
         blended = "blended_per_million" in pricing
         separated = {"input_per_million", "output_per_million"} & pricing.keys()
-        if blended and separated:
+        if sum((per_request, blended, bool(separated))) > 1:
             raise ValueError(
-                "pricing must use either blended_per_million or input/output rates, not both"
+                "pricing must use exactly one of per_request, blended_per_million, "
+                "or input/output rates"
             )
-        if blended:
+        if per_request:
+            allowed = {
+                "per_request",
+                "currency",
+                "pricing_basis",
+                "sample_count",
+                "confidence",
+                "version",
+                "effective_at",
+            }
+            rate_fields = {"per_request"}
+        elif blended:
             allowed = {
                 "blended_per_million",
                 "currency",
@@ -195,6 +215,11 @@ class ProviderModelInput(NormalizedStringLists):
             )
         if blended and basis != "measured_blended":
             raise ValueError("a blended rate must declare pricing_basis measured_blended")
+        if per_request and basis == "measured_blended":
+            raise ValueError(
+                "a per-request fee is not a blended token rate; use listed or "
+                "measured_separated"
+            )
         confidence = pricing.get("confidence", "low" if blended else "high")
         if confidence not in {"low", "medium", "high"}:
             raise ValueError("pricing confidence must be low, medium or high")

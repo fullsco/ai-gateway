@@ -70,7 +70,7 @@ implying otherwise. That is the correct behaviour, not a gap.
 
 | # | Action | Expected result | Pass |
 |---|---|---|---|
-| D1 | Open **Models and routing**, select `claude-opus-5` | AgentRouter is shown as primary, GoRouter as fallback | ☐ |
+| D1 | Open **Models and routing**, select `claude-opus-5` | AgentRouter primary, then GoRouter, then TabiAi. Model fallback is on for the first two | ☐ |
 | D2 | Select `claude-opus-5-thinking` | GoRouter is primary, TabiAi is the fallback | ☐ |
 | D3 | Read the "What will happen" sentence | It names the primary and the fallbacks in plain language | ☐ |
 | D4 | **Do not change anything.** Press **Save working changes** | It saves without error | ☐ |
@@ -324,15 +324,17 @@ These are already understood. Seeing them is not a failure.
   was 6s, 116s, 303s, 303s, 531s and one 600s timeout, so treat it as a batch route,
   not an interactive one. It also reports about 1049 tokens of hidden prompt on
   every request.
-- **Three of four providers bill a flat fee per request, and are unpriced because of
-  it.** Measured with a control read confirming the counter is otherwise still: hcnsec
-  moves its counter 640.94 per request, TabiAi exactly 80, GoRouter exactly 30, in each
-  case regardless of token count. All three also report a per-request cost that does
-  vary with tokens, contradicting their own counter by between 412x and 931x. The unit
-  cannot be resolved from outside, and the pricing model has no shape for a
-  per-request fee, only per-million-token rates. So the readings are recorded and the
-  routes stay unpriced. Cost views under-report those routes rather than claiming they
-  are free. See PUNCH_LIST.md for what would unblock it.
+- **Three of four providers bill a flat fee per request, and that is now priced.**
+  TabiAi charges $0.80 per request for `claude-opus-5` and `claude-opus-5-thinking`,
+  GoRouter $0.30 for the same and $0.20 for `claude-opus-4-8`, regardless of size.
+  Proven flat rather than merely coarse: 7,185 and 246,190 input tokens moved TabiAi's
+  counter by the identical amount. Each provider's published `/api/pricing` card agrees
+  with the measured counter at cent scale, so a flat-fee request records its real cost.
+  Do not read a large request on these routes as expensive; size does not affect price.
+- **`nemotron-3-ultra` is the one route still unpriced.** hcnsec publishes an empty
+  rate card, so its flat 640.94 counter delta cannot be corroborated. Its spend is
+  recorded as absent rather than as zero, so cost views under-report that one route
+  instead of claiming it is free.
 - **OpenCode's `gateway-openai` models need a key that permits the OpenAI protocol.**
   The `Claude Code Cli` client only permits `anthropic_messages`, so a key from it
   fails every `gateway-openai/*` request with "Invalid gateway key", which reads as a

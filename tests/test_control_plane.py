@@ -1089,7 +1089,9 @@ def test_pricing_defaults_basis_and_confidence_for_a_listed_rate_card() -> None:
 
 
 def test_pricing_rejects_mixing_blended_and_separated_rates() -> None:
-    with pytest.raises(ValidationError, match="not both"):
+    # The wording changed from "not both" when a third shape, a flat per-request fee,
+    # was added: with three mutually exclusive shapes "both" no longer describes it.
+    with pytest.raises(ValidationError, match="exactly one of"):
         ProviderModelInput(
             provider_id="provider-1",
             model_id="model-1",

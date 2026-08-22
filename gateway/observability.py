@@ -538,6 +538,18 @@ def estimate_cost(
     if len(currency) != 3 or not currency.isalpha():
         return None, None
     input_tokens, output_tokens, cached_tokens, cache_write_tokens = usage
+    if "per_request" in pricing:
+        # A flat fee does not depend on tokens, so it is priced even when the
+        # provider reported no usage at all. That is the point of the shape: TabiAi
+        # charges the same for 7,185 tokens as for 246,190, so a request whose usage
+        # never arrived still cost exactly this much and must not be recorded as free.
+        try:
+            fee = Decimal(str(pricing["per_request"]))
+        except (InvalidOperation, TypeError, ValueError):
+            return None, None
+        if not fee.is_finite() or fee < 0:
+            return None, None
+        return fee.quantize(Decimal("0.00000001")), currency
     # A billable dimension that was never reported cannot be priced. Treating it
     # as zero produced an immutable, currency-stamped cost that looked measured,
     # counted toward pricing coverage, and understated the real spend. An absent

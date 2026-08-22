@@ -60,7 +60,7 @@ Statuses are **fixed**, **decided** (deliberately not changed, with a reason),
 | Only rate limits set a cooldown, so every other failure state was stranded permanently | fixed | `87e3c84` |
 | Eight AgentRouter credentials were parked as auth failures; four of them worked | fixed | `87e3c84` |
 | The pool alert fired only at zero routable credentials, which is already an outage | fixed | `8cafbc9` |
-| `claude-opus-5` has no cross-provider fallback | blocked | see "Blocked" below |
+| `claude-opus-5` has no cross-provider fallback | fixed | pricing first, then fallback; see "Blocked" |
 
 ### Robustness
 
@@ -87,8 +87,9 @@ Statuses are **fixed**, **decided** (deliberately not changed, with a reason),
   successful sample. The canonical model is named for what answers; the upstream id
   stays `DeepSeek-V4-Pro` because that is the only string hcnsec routes. Commit
   `a3988f4`.
-- **GoRouter, TabiAi and hcnsec routes are unpriced, not priced at zero.** See
-  "Blocked". A missing cost is visible as missing; a zero is a lie.
+- **`nemotron-3-ultra` is unpriced, not priced at zero.** hcnsec publishes no rate
+  card, so its flat fee cannot be corroborated. A missing cost is visible as missing;
+  a zero is a lie. GoRouter and TabiAi are now priced from their published cards.
 - **Credential recovery is lazy, not proactive.** A credential on trial is only tried
   when the healthy one is unavailable, so the pool heals under pressure rather than
   in advance. Scoring already ranks a trial below a healthy credential, so recovery
@@ -99,40 +100,56 @@ Statuses are **fixed**, **decided** (deliberately not changed, with a reason),
 
 ## Blocked
 
-### Pricing for GoRouter, TabiAi and hcnsec
+Nothing is currently blocked. The two items that were, pricing for the flat-fee
+providers and the `claude-opus-5` fallback that waited on it, are recorded below.
 
-Three of four providers bill a **flat fee per request**, not per token. Measured with
-a control read confirming the counter is otherwise still:
+### Resolved: pricing for the flat-fee providers
 
-| Provider | Counter delta per request | Token counts across samples |
-|---|---|---|
-| hcnsec | 640.94 | 138, 5,963, 413 total |
-| TabiAi | 80 | 7185/1, 8783/2, 7412/82 |
-| GoRouter | 30 | 7117/1, 8716/2, 7432/188 |
+Three of four providers bill a **flat fee per request**. This was first read as
+unpriceable, on two grounds that both turned out to be answerable.
 
-Two things stop this becoming a price:
+The first was whether the fee is genuinely flat or merely a coarse minimum. Every
+early sample was small, 138 to 8,783 input tokens, and a minimum charge looks
+identical inside a narrow range. Widening it settled the question: 7,185 and 246,190
+input tokens moved TabiAi's counter by exactly the same 80, a 34x increase in size
+for no change in charge. It is flat, so a per-token rate cannot describe it, which is
+why `per_request` now exists as a third pricing shape. 
 
-1. **The unit is ambiguous.** `/v1/dashboard/billing/subscription` reports
-   `soft_limit_usd: 100000000` with no scale, and `credit_grants` is 404. TabiAi and
-   hcnsec return byte-identical subscription payloads, so they are the same reseller
-   software. Both also report a per-request `cost` that varies with tokens, which
-   contradicts their own flat counter by between 412x and 931x.
-2. **The pricing model cannot express a per-request fee.** `validate_pricing` accepts
-   `blended_per_million`, or `input_per_million` with `output_per_million`, and
-   nothing else. Recording a flat fee as a per-token rate would misdescribe how the
-   provider charges.
+The second was the unit. All three providers publish a rate card at `/api/pricing`
+using the one-api convention: `quota_type` 1 is a flat `model_price` in USD with
+`model_ratio` 0, and `quota_type` 0 is a per-token ratio. The listed prices match the
+measured counter deltas exactly at cent scale:
 
-Unblocking needs one of: a per-request fee shape in the pricing model plus a resolved
-unit; the providers stating their unit; or accepting these routes stay unpriced.
+| Provider | Listed | Measured delta | Agrees at cent scale |
+|---|---|---|---|
+| TabiAi `claude-opus-5` | 0.8 | 80 | yes |
+| GoRouter `claude-opus-5` | 0.3 | 30 | yes |
 
-### `claude-opus-5` cross-provider fallback
+The same convention independently validates the AgentRouter rates measured months
+earlier: its card lists `claude-opus-5` at ratio 1 with completion ratio 5, which at
+the family's $2 per million base is $2 in and $10 out, exactly as measured, and
+`gpt-5.6-sol` at ratio 2, so $4 and $20, also exactly as measured. Two independent
+derivations agreeing is the strongest evidence this project holds for any rate.
 
-`allow_model_fallback` is false on all three of its routes. TabiAi now serves
-`claude-opus-5` correctly and GoRouter serves it intermittently, so a fallback path
-exists for the first time. It stays off because both are unpriced, and the standing
-decision is to price a route before sending flagship traffic to it. AgentRouter's
-depth went from 1 usable credential to 19, which removed the single point of failure
-that made this urgent.
+`nemotron-3-ultra` on hcnsec is still unpriced: its `/api/pricing` returns an empty
+catalogue, so there is nothing to corroborate its 640.94 counter delta against.
+
+### Resolved: `claude-opus-5` cross-provider fallback
+
+`allow_model_fallback` is now true on the AgentRouter and GoRouter routes and false on
+TabiAi, which is last and has nothing after it. This mirrors how
+`claude-opus-5-thinking` was already configured. Routing now attempts
+`AgentRouter, GoRouter, TabiAi` instead of AgentRouter three times.
+
+It was gated on pricing by standing decision, and that gate held: the routes were
+priced first, so a flat-fee fallback records $0.80 rather than nothing. Verified on
+live traffic, where GoRouter failed and TabiAi served the request at exactly
+$0.80000000 USD.
+
+Note that the high-level `PUT /models/{id}/routing` endpoint cannot set this field. It
+writes `allow_model_fallback` false on insert and does not update it on conflict, so
+the low-level `/routes/{id}` endpoint is the only way, and `policy_id` and `pool_id`
+must be read back and preserved or a routing policy is silently lost.
 
 ---
 
@@ -143,4 +160,5 @@ that made this urgent.
 | Seven AgentRouter credentials still need a human | Two are out of quota and will clear. One needs this host's egress IP on the token's allow list. One needs model entitlement. Each carries a `note` saying which. |
 | GoRouter is intermittently unreachable | Connection resets interleave with successful requests from the same host and credential. It works often enough to serve as a fallback, but not reliably enough to be a primary. |
 | Credential recovery is unproven end to end | The mechanism is proven at engine level and by tests, but no trial has been observed completing on live traffic, because the healthy credential keeps succeeding. |
-| The pricing model has no per-request fee shape | Three of four providers bill that way, so this is a gap in the model rather than an edge case. See "Blocked". |
+| `nemotron-3-ultra` is still unpriced | hcnsec publishes an empty `/api/pricing`, so its flat 640.94 counter delta cannot be corroborated. It is the only unpriced route left. |
+| `gpt-5.6-sol` has one provider and no fallback | AgentRouter only. It can report no eligible route when that pool is momentarily exhausted. GoRouter and TabiAi do not list it. |

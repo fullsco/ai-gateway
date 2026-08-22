@@ -519,3 +519,61 @@ def test_every_failure_state_earns_a_way_back() -> None:
     assert _recovery_cooldown("auth_failed", event(retry_after=5)) == observed_at + timedelta(
         seconds=5
     )
+
+
+def test_a_flat_per_request_fee_is_priced_independently_of_tokens() -> None:
+    """Some providers charge per request, and no per-token rate can describe that.
+
+    Measured against TabiAi: 7,185 input tokens and 246,190 input tokens moved its
+    billing counter by exactly the same amount, a 34x increase in size for no change
+    in charge. Its published rate card agrees, listing claude-opus-5 at
+    quota_type 1 with model_price 0.8 and model_ratio 0, and the counter delta of 80
+    confirms the counter is in cents. Recording that as a per-million rate would
+    misstate every request: too high for small ones, far too low for large ones.
+    """
+    from decimal import Decimal
+
+    from gateway.observability import estimate_cost
+
+    pricing = {"per_request": "0.80", "currency": "USD", "pricing_basis": "listed"}
+
+    small, currency = estimate_cost((7185, 1, None, None), pricing)
+    large, _ = estimate_cost((246190, 4000, None, None), pricing)
+    assert currency == "USD"
+    assert small == Decimal("0.80000000")
+    assert large == small, "a flat fee must not vary with tokens"
+
+    # A flat fee is owed even when the provider reported no usage, which is the
+    # whole point: the request was charged for regardless, so recording it as free
+    # would understate spend on exactly the requests that failed to report.
+    unreported, _ = estimate_cost((None, None, None, None), pricing)
+    assert unreported == Decimal("0.80000000")
+
+
+def test_a_per_request_fee_cannot_be_mixed_with_token_rates() -> None:
+    """The three pricing shapes describe incompatible billing models."""
+    import pytest as _pytest
+
+    from gateway.admin.control_plane import ProviderModelInput
+
+    def build(pricing: dict) -> ProviderModelInput:
+        return ProviderModelInput(
+            provider_id="p",
+            model_id="m",
+            upstream_model_id="u",
+            protocol="anthropic_messages",
+            pricing=pricing,
+        )
+
+    accepted = build({"per_request": "0.30", "currency": "USD"})
+    assert accepted.pricing["per_request"] == "0.30"
+    assert accepted.pricing["pricing_basis"] == "listed"
+
+    with _pytest.raises(ValueError):
+        build({"per_request": "0.30", "input_per_million": "2", "output_per_million": "10",
+               "currency": "USD"})
+    with _pytest.raises(ValueError):
+        build({"per_request": "0.30", "blended_per_million": "5", "currency": "USD"})
+    # A flat fee is not a blended token rate, so it must not borrow that provenance.
+    with _pytest.raises(ValueError):
+        build({"per_request": "0.30", "currency": "USD", "pricing_basis": "measured_blended"})
