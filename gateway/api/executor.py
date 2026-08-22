@@ -421,6 +421,23 @@ async def execute_request(
                         last_error = _unexpected_upstream_response(response.status_code)
                         await _close_response(response)
                         response = None
+                    elif _stream_is_foreign_protocol(normalized.protocol, first_chunk):
+                        last_error = build_provider_error(
+                            ErrorCategory.MODEL_UNAVAILABLE,
+                            "The provider answered in a different protocol than this route "
+                            "declares, so the stream cannot be relayed or measured.",
+                            upstream_status=response.status_code,
+                        )
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "upstream_stream_protocol_mismatch",
+                            provider_id=route.provider_model.provider_id,
+                            provider_model_id=route.provider_model.id,
+                            expected_protocol=normalized.protocol.value,
+                        )
+                        await _close_response(response)
+                        response = None
                     else:
                         finalizer = _StreamFinalizer(
                             recorder,
@@ -729,6 +746,41 @@ def _valid_upstream_stream(response: httpx.Response, chunk: bytes) -> bool:
         return True
     first_line = chunk.lstrip().splitlines()[0] if chunk.strip() else b""
     return first_line.startswith((b"data:", b"event:", b"id:", b"retry:", b":"))
+
+
+# Positive markers for each protocol's stream. Only the other protocol's markers are
+# looked for, never the absence of one's own, so an unfamiliar but valid stream is
+# never rejected on suspicion.
+_OPENAI_STREAM_MARKERS = (
+    b'"object":"chat.completion.chunk"',
+    b'"object": "chat.completion.chunk"',
+)
+_ANTHROPIC_STREAM_MARKERS = (
+    b'"type":"message_start"',
+    b'"type": "message_start"',
+    b"event: message_start",
+)
+_FOREIGN_STREAM_MARKERS = {
+    ClientProtocol.ANTHROPIC_MESSAGES: _OPENAI_STREAM_MARKERS,
+    ClientProtocol.OPENAI_CHAT_COMPLETIONS: _ANTHROPIC_STREAM_MARKERS,
+    ClientProtocol.OPENAI_RESPONSES: _ANTHROPIC_STREAM_MARKERS,
+}
+
+
+def _stream_is_foreign_protocol(protocol: ClientProtocol, chunk: bytes) -> bool:
+    """Whether the first event belongs to a different protocol than the client asked for.
+
+    hcnsec multiplexes across backends, and about one streaming request in ten came
+    back as Anthropic protocol events on a route declared as OpenAI. Relaying that is
+    worse than failing: the client cannot parse it, and usage extraction is keyed on
+    the declared protocol, so the tokens silently come back as none and the request
+    is recorded as having cost nothing.
+
+    Checked before the response is committed, so the attempt can still fail over.
+    """
+    markers = _FOREIGN_STREAM_MARKERS.get(protocol, ())
+    head = bytes(chunk[:2048])
+    return any(marker in head for marker in markers)
 
 
 def _unexpected_upstream_response(status_code: int) -> ProviderError:

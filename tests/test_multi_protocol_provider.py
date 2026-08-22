@@ -390,3 +390,45 @@ def test_a_route_may_tighten_the_provider_timeout_but_not_loosen_it() -> None:
     assert adapter_for(120).config.timeout_seconds == 120
     # Above the provider's ceiling the provider still wins.
     assert adapter_for(9000).config.timeout_seconds == 600
+
+
+def test_a_stream_in_the_wrong_protocol_is_refused_before_committing() -> None:
+    """Relaying a foreign protocol is worse than failing the attempt.
+
+    hcnsec multiplexes across backends. About one streaming request in ten on a route
+    declared as OpenAI came back as Anthropic protocol events, identifying itself as
+    claude-opus-5 with a Bedrock message id. The client cannot parse that, and usage
+    extraction is keyed on the declared protocol, so the tokens silently resolve to
+    none and the request is recorded as having cost nothing. Caught before the
+    response is committed, the attempt can still fail rather than mislead.
+    """
+    from gateway.api.executor import _stream_is_foreign_protocol
+    from gateway.protocols import ClientProtocol
+
+    anthropic_frame = (
+        b'event: message_start\ndata: {"type":"message_start","message":'
+        b'{"id":"msg_bdrk_abc","model":"claude-opus-5"}}\n\n'
+    )
+    openai_frame = (
+        b'data: {"id":"chatcmpl-abc","object":"chat.completion.chunk",'
+        b'"choices":[{"delta":{"content":"hi"}}]}\n\n'
+    )
+
+    # Each protocol rejects the other's stream.
+    assert _stream_is_foreign_protocol(
+        ClientProtocol.OPENAI_CHAT_COMPLETIONS, anthropic_frame
+    )
+    assert _stream_is_foreign_protocol(ClientProtocol.ANTHROPIC_MESSAGES, openai_frame)
+
+    # And accepts its own, so a working route is never refused on suspicion.
+    assert not _stream_is_foreign_protocol(
+        ClientProtocol.OPENAI_CHAT_COMPLETIONS, openai_frame
+    )
+    assert not _stream_is_foreign_protocol(
+        ClientProtocol.ANTHROPIC_MESSAGES, anthropic_frame
+    )
+    # An unfamiliar but plausible stream is not rejected either: only positive
+    # evidence of the other protocol counts.
+    assert not _stream_is_foreign_protocol(
+        ClientProtocol.OPENAI_CHAT_COMPLETIONS, b'data: {"something":"else"}\n\n'
+    )
