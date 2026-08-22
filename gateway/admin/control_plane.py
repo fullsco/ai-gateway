@@ -1665,8 +1665,22 @@ async def config_status(request: Request) -> JSONResponse:
         has_changes = working_projection != published_projection
     changes = summarize_configuration_changes(published_payload, payload) if has_changes else []
     change_limit = 100
+    # "Published" and "running" are not the same thing, and the gap between them is
+    # invisible from the database alone. A hung snapshot load once froze the running
+    # configuration at version 245 for hours while this endpoint reported 248 as
+    # active, which is true and yet the opposite of what the operator needed to know.
+    manager = getattr(request.app.state, "runtime_manager", None)
+    serving_version = getattr(manager, "version", None) if manager is not None else None
+    cache = getattr(manager, "_cache", None) if manager is not None else None
+    refresh_error = getattr(cache, "last_refresh_error", None) if cache is not None else None
+    published_id = published["id"] if published else None
+    stale = (
+        serving_version is not None
+        and published_id is not None
+        and serving_version != published_id
+    )
     return JSONResponse(jsonable_encoder({
-        "active_version": published["id"] if published else None,
+        "active_version": published_id,
         "active_checksum": published["checksum"] if published else None,
         "working_checksum": working_checksum,
         "has_unpublished_changes": has_changes,
@@ -1674,6 +1688,10 @@ async def config_status(request: Request) -> JSONResponse:
         "changes": changes[:change_limit],
         "change_count": len(changes),
         "published_at": published["published_at"] if published else None,
+        # What the gateway is actually serving right now.
+        "serving_version": serving_version,
+        "serving_published_version": not stale,
+        "last_refresh_error": refresh_error,
     }))
 
 

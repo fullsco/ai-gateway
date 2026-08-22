@@ -1,11 +1,16 @@
 import asyncio
 import hashlib
 import json
+import logging
 from collections import Counter
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from gateway.logging import log_event
+
+logger = logging.getLogger("gateway.configuration")
 
 
 def _strip_runtime_state(payload: dict[str, Any]) -> dict[str, Any]:
@@ -416,10 +421,21 @@ class CachedConfiguration:
     def last_refresh_error(self) -> str | None:
         return self._last_refresh_error
 
+    # A snapshot load that never returns is worse than one that fails. The lock below
+    # serialises refreshes, so a single hung database connection holds it forever and
+    # every later refresh blocks behind it. That happened in production: a DNS outage
+    # left a connection hanging, configuration froze at version 245, and the gateway
+    # went on serving it for hours while the dashboard correctly showed 248 as
+    # published. Nothing logged, because a hung await is not an error.
+    LOAD_TIMEOUT_SECONDS = 20.0
+
     async def refresh(self) -> ConfigSnapshot:
         async with self._lock:
             try:
-                candidate = await self._repository.load_published()
+                candidate = await asyncio.wait_for(
+                    self._repository.load_published(),
+                    timeout=self.LOAD_TIMEOUT_SECONDS,
+                )
                 if candidate is None:
                     raise ConfigurationUnavailable("No published configuration exists")
                 if not candidate.verify_checksum():
@@ -433,6 +449,17 @@ class CachedConfiguration:
                     raise ConfigurationUnavailable(
                         "Configuration refresh failed and no cached snapshot is available"
                     ) from exc
+                # Serving the cached snapshot is the right behaviour during an outage,
+                # but doing it silently is not: the operator sees a published version
+                # the gateway is not running and has no way to tell. This is the only
+                # place that knows, so it has to say so.
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "configuration_refresh_failed_serving_cached",
+                    error_type=type(exc).__name__,
+                    cached_version=self._snapshot.version,
+                )
             return self.snapshot
 
 def stranded_models(payload: dict[str, Any]) -> list[str]:

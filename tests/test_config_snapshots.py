@@ -200,3 +200,72 @@ def test_summarize_changes_never_exposes_secrets_or_digests() -> None:
 def test_summarize_changes_is_empty_for_identical_payloads() -> None:
     payload = {"providers": [{"id": "p1", "name": "AgentRouter", "health": "healthy"}]}
     assert summarize_configuration_changes(payload, payload) == []
+
+
+@pytest.mark.asyncio
+async def test_a_hung_snapshot_load_cannot_freeze_configuration_forever() -> None:
+    """A load that never returns must time out, not hold the lock indefinitely.
+
+    refresh serialises on a lock, so one hung database connection blocks every later
+    refresh behind it. That happened in production: a DNS outage left a connection
+    hanging, the running configuration froze at version 245, and the gateway served it
+    for hours while the dashboard correctly reported 248 as published. Nothing logged,
+    because an await that never returns is not an error.
+    """
+    import asyncio
+
+    from gateway.configuration.snapshots import CachedConfiguration
+
+    class HangingRepository:
+        def __init__(self, first: ConfigSnapshot) -> None:
+            self._first = first
+            self.calls = 0
+
+        async def load_published(self):
+            self.calls += 1
+            if self.calls == 1:
+                return self._first
+            await asyncio.sleep(3600)  # never returns
+
+    good = snapshot(version=245)
+    repository = HangingRepository(good)
+    cache = CachedConfiguration(repository)
+    cache.LOAD_TIMEOUT_SECONDS = 0.05
+
+    assert (await cache.refresh()).version == 245
+
+    # The hung load must give up and fall back to the cached snapshot, and the
+    # failure must be recorded rather than swallowed.
+    served = await asyncio.wait_for(cache.refresh(), timeout=5)
+    assert served.version == 245
+    assert cache.last_refresh_error == "TimeoutError"
+
+    # And crucially, a later refresh must not be stuck behind the abandoned one.
+    served = await asyncio.wait_for(cache.refresh(), timeout=5)
+    assert served.version == 245
+    assert repository.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_serving_the_cached_snapshot_is_reported_not_silent() -> None:
+    """Serving stale configuration is correct during an outage; hiding it is not."""
+    from gateway.configuration.snapshots import CachedConfiguration
+
+    class FailingRepository:
+        def __init__(self, first: ConfigSnapshot) -> None:
+            self._first = first
+            self.calls = 0
+
+        async def load_published(self):
+            self.calls += 1
+            if self.calls == 1:
+                return self._first
+            raise OSError("name resolution failed")
+
+    cache = CachedConfiguration(FailingRepository(snapshot(version=245)))
+    assert (await cache.refresh()).version == 245
+    assert cache.last_refresh_error is None
+
+    served = await cache.refresh()
+    assert served.version == 245, "the cached snapshot must still be served"
+    assert cache.last_refresh_error == "OSError", "the reason must be retained"

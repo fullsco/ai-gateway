@@ -25,7 +25,16 @@ export async function gatewayApi(path: string, init?: RequestInit) {
   if (!response.ok) {
     const details = Array.isArray(data.details) ? data.details.map((item: GatewayRow) => `${item.location}: ${item.message}`).join(". ") : "";
     const validation = Array.isArray(data.detail) ? data.detail.map((item: GatewayRow) => `${(item.loc as unknown[]).slice(-1)[0]}: ${item.msg}`).join(". ") : "";
-    throw new Error(details || validation || readable(data.error) || "Provider setup failed");
+    // FastAPI returns a plain string detail for routing failures, most often
+    // {"detail":"Not Found"}. That matched none of the shapes above, so a real cause
+    // was replaced by the generic fallback and the operator was told nothing at all.
+    // A model id containing a slash produces exactly this, because it does not match
+    // the path pattern of the admin endpoints.
+    const plain = typeof data.detail === "string" ? data.detail : "";
+    const status = response.status === 404
+      ? `${plain || "Not found"} (${path}). A model id containing "/" cannot be addressed by these endpoints; rename it without a slash and keep the provider's name as the upstream model id.`
+      : plain;
+    throw new Error(details || validation || readable(data.error) || status || `Request failed with status ${response.status}`);
   }
   return data;
 }
