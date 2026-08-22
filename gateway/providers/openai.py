@@ -19,6 +19,14 @@ ENDPOINTS = {
     ClientProtocol.OPENAI_RESPONSES: "/v1/responses",
 }
 QUOTA_MARKERS = ("quota", "insufficient_quota", "billing", "credit balance")
+# Sending no user-agent lets httpx supply its own, and "python-httpx/x.y" is on
+# Cloudflare's generic-library blocklist. The Anthropic adapter has always set this;
+# this one did not, so the same provider answered anthropic_messages normally and
+# met a Cloudflare challenge page on openai_chat_completions. The HTML then failed
+# the JSON check and surfaced as a 502, which read as a provider outage rather than
+# a header we control. Measured against gorouter.app and tabitoken.com: the httpx
+# default, python-requests and curl are all refused, this value is accepted.
+DEFAULT_USER_AGENT = "ai-gateway/0.1"
 
 
 class OpenAICompatibleAdapter(ProviderAdapter):
@@ -32,7 +40,8 @@ class OpenAICompatibleAdapter(ProviderAdapter):
         if config.protocol not in ENDPOINTS:
             raise ValueError("OpenAI adapter requires Chat Completions or Responses protocol")
         self.config = config
-        self.default_headers = dict(default_headers or {})
+        # A provider or mapping may still override it; only the absence is fixed.
+        self.default_headers = {"user-agent": DEFAULT_USER_AGENT, **(default_headers or {})}
         self.endpoint_query = dict(endpoint_query or {})
 
     def validate_request(self, request: NormalizedRequest) -> None:
