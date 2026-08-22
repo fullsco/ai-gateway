@@ -3,7 +3,6 @@ import binascii
 from datetime import datetime
 from typing import Any, Literal
 
-import httpx
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from gateway.auth import ClientPermissions, GatewayClient, InMemoryGatewayKeyStore
@@ -11,6 +10,7 @@ from gateway.models import CanonicalModel, ModelRegistry, ProviderModel
 from gateway.protocols import Capability, ClientProtocol
 from gateway.providers import Credential, ProviderConfig
 from gateway.providers.anthropic import AnthropicCompatibleAdapter
+from gateway.providers.egress import build_upstream_client
 from gateway.providers.openai import OpenAICompatibleAdapter
 from gateway.routing import (
     CredentialState,
@@ -295,7 +295,7 @@ class RuntimeBuilder:
             credential_states=credential_states,
             provider_model_adapters=adapters,
             credentials=credentials,
-            http_client=httpx.AsyncClient(),
+            http_client=build_upstream_client(),
             route_controls=RouteControls(
                 {model.id: model.max_concurrency for model in snapshot.provider_models}
             ),

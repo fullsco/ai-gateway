@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     quota_hard_threshold: float = Field(default=0.02, ge=0, le=1)
     request_timeout_seconds: float = Field(default=600, gt=0)
     first_event_timeout_seconds: float = Field(default=60, gt=0)
+    # Some provider edges challenge on the caller's source IP, so a datacenter
+    # egress range can be refused no matter what the request looks like. Routing
+    # upstream traffic through a proxy with a clean reputation fixes that without
+    # changing any provider or protocol behaviour.
+    upstream_proxy_url: str | None = None
+    upstream_proxy_verify_tls: bool = True
     concurrency_acquire_timeout_seconds: float = Field(default=1, gt=0)
     failover_enabled: bool = True
     health_probe_enabled: bool = True
@@ -56,6 +62,21 @@ class Settings(BaseSettings):
         normalized = value.strip().lower()
         if not normalized or any(char.isspace() for char in normalized):
             raise ValueError("request_id_header must be a valid single HTTP header name")
+        return normalized
+
+    @field_validator("upstream_proxy_url")
+    @classmethod
+    def validate_upstream_proxy_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        allowed = ("http://", "https://", "socks5://", "socks5h://")
+        if not normalized.startswith(allowed):
+            raise ValueError(
+                "upstream_proxy_url must start with one of: " + ", ".join(allowed)
+            )
         return normalized
 
 
