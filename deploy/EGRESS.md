@@ -1,5 +1,40 @@
 # Upstream Egress: WAF / Cloudflare Challenge Recovery
 
+## Correction, measured 2026-08-23
+
+The root cause below names two layers. **Only the second one is currently real.**
+
+Re-measured on the AWS host with the same credential and the headers the gateway
+actually sends, alternating direct and proxied, three samples each:
+
+| Request | Direct from AWS | Via WARP |
+|---|---|---|
+| `GET /v1/models`, mapping headers | `200 200 200` | `200 200 200` |
+| `POST /v1/messages`, mapping headers | `200 200 200` | `200 200 200` |
+| `POST /v1/messages`, no `user-agent` | **200 with Aliyun WAF HTML** | `401` |
+
+So the WAF page appears **direct and without the user-agent**, and disappears
+**direct and with it**. The egress IP is not what is being challenged; the client
+presentation is. The reproduction command below sends neither a user-agent nor
+credentials, which is why it reproduced the challenge and pointed at the IP.
+
+This is the same misdiagnosis made three times on this deployment. GoRouter and TabiAi
+were also read as IP-blocked; an ablation later showed the httpx default,
+python-requests and curl user-agents are all refused while `ai-gateway/0.1` is
+accepted. The gateway's OpenAI adapter was sending no user-agent at all, which is now
+fixed, and that fix is what keeps the WAF away.
+
+**The proxy is therefore insurance, not the remedy.** It is deliberately left enabled
+on the AWS host: Aliyun rules are reputation-based, so a datacenter range can be
+challenged later, and having the path already configured is worth ~12ms (0.057s to
+0.069s to openrouter.ai). But it must not be relied on as the thing preventing the
+WAF error, and removing the user-agent would not be survivable because the proxy is
+configured globally. If the goal ever becomes proxying only the provider that needs
+it, `build_upstream_client` already accepts a Settings instance for that.
+
+Do not repeat the reproduction below without the mapping's `default_headers`, or it
+will point at the IP again.
+
 ## Symptom
 
 Every inference request fails with HTTP 502 and category

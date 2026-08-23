@@ -153,6 +153,25 @@ must be read back and preserved or a routing policy is silently lost.
 
 ---
 
+## Decided during production preparation
+
+- **The AWS host runs under systemd, keeps its WARP proxy, and shares one control
+  plane with development.** A single Supabase project serves both, on the current plan,
+  so a configuration publish is live in both places within seconds and both spend the
+  same budget. Accepted deliberately. The consequence is that both hosts must run
+  compatible code, which is why unknown snapshot fields are now ignored rather than
+  rejected.
+- **The Aliyun WAF challenge on AgentRouter is caused by the missing user-agent, not by
+  the egress IP.** Measured direct from AWS with the mapping's headers: three of three
+  clean JSON responses. Without a user-agent, direct: a 15,999 byte Aliyun WAF page
+  returned as HTTP 200. The WARP proxy is kept as insurance, because Aliyun rules are
+  reputation-based and a datacenter range can be challenged later, but it is not the
+  remedy and must not be relied on as one. See deploy/EGRESS.md.
+- **A user-agent problem has now been misread as an IP block three times**, on
+  AgentRouter, GoRouter and TabiAi, because curl and urllib are refused for the same
+  reason the gateway was. Any future "provider blocks our IP" claim should be tested
+  with the mapping's own default_headers before the network is blamed.
+
 ## Open
 
 | Item | Why it matters |
