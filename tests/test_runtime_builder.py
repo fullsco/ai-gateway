@@ -121,12 +121,34 @@ def test_runtime_builder_preserves_route_fallback_and_provider_operational_state
     assert runtime.provider_states[0].failure_rate == 0.25
 
 
-def test_runtime_builder_rejects_unknown_snapshot_fields() -> None:
+def test_runtime_builder_tolerates_unknown_snapshot_fields_and_names_them() -> None:
+    """An unknown field means a newer publisher, not a mistake, so it must not stop us.
+
+    This test previously asserted the opposite, that an unknown field is rejected. That
+    expectation was wrong in a way that took a production instance down for a day:
+    adding timeout_seconds to provider_models made every older build refuse the entire
+    snapshot, so one froze on version 242 while 249 was published, logging fifteen
+    thousand validation errors and changing nothing. These payloads come from the
+    control plane rather than from hand, so the realistic cause of an unknown field is
+    version skew, and the only safe response to skew is to keep running without the
+    part you do not understand.
+
+    What is still required is that it not be silent, so the field is named in the log
+    and returned for inspection.
+    """
+    from gateway.configuration.runtime_builder import unknown_snapshot_fields
+
     builder, payload = make_payload()
     payload["unknown"] = True
+    payload["provider_models"][0]["a_knob_from_the_future"] = 1
 
-    with pytest.raises(ValueError, match="unknown"):
-        builder.build(payload)
+    runtime = builder.build(payload)
+    assert runtime is not None, "an older build must still come up"
+
+    assert unknown_snapshot_fields(payload) == {
+        "provider_models": ["a_knob_from_the_future"],
+        "snapshot": ["unknown"],
+    }
 
 
 def test_runtime_builder_rejects_envelope_with_wrong_context() -> None:

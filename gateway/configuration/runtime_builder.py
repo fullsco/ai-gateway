@@ -1,11 +1,13 @@
 import base64
 import binascii
+import logging
 from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from gateway.auth import ClientPermissions, GatewayClient, InMemoryGatewayKeyStore
+from gateway.logging import log_event
 from gateway.models import CanonicalModel, ModelRegistry, ProviderModel
 from gateway.protocols import Capability, ClientProtocol
 from gateway.providers import Credential, ProviderConfig
@@ -22,9 +24,23 @@ from gateway.routing import (
 from gateway.runtime import GatewayRuntime
 from gateway.security import CredentialCipher, EncryptedCredential, GatewayKey, GatewayKeyHasher
 
+# Snapshot models ignore fields they do not recognise rather than rejecting them.
+# These payloads are produced by the control plane, not by hand, so an unknown field
+# means the publisher is newer than this reader, not that someone mistyped something.
+# Rejecting it is catastrophic and silent: a newer field made every older instance
+# refuse the whole snapshot and freeze on its last good configuration. One did, for a
+# day, serving version 242 while 249 was published, because "timeout_seconds" was
+# added to provider_models. Fifteen thousand validation errors and no behaviour
+# change. Ignoring the field instead means an older instance keeps working, without
+# the feature it cannot understand, which is what a rolling deployment needs.
+#
+# Unknown fields are reported by report_unknown_snapshot_fields so this degrades
+# visibly rather than quietly.
+logger = logging.getLogger("gateway.configuration.runtime")
+
 
 class SnapshotClient(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     id: str
     name: str
@@ -37,7 +53,7 @@ class SnapshotClient(BaseModel):
 
 
 class SnapshotGatewayKey(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     id: str
     client_id: str
@@ -48,7 +64,7 @@ class SnapshotGatewayKey(BaseModel):
 
 
 class SnapshotProvider(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     id: str
     name: str
@@ -85,7 +101,7 @@ class SnapshotProvider(BaseModel):
 
 
 class SnapshotCredential(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     id: str
     provider_id: str
@@ -109,7 +125,7 @@ class SnapshotCredential(BaseModel):
 
 
 class SnapshotModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     id: str
     aliases: frozenset[str] = frozenset()
@@ -118,7 +134,7 @@ class SnapshotModel(BaseModel):
 
 
 class SnapshotProviderModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     id: str
     canonical_model_id: str
@@ -166,7 +182,7 @@ class SnapshotProviderModel(BaseModel):
 
 
 class RuntimeSnapshot(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     clients: list[SnapshotClient]
     gateway_keys: list[SnapshotGatewayKey]
@@ -199,12 +215,61 @@ class RuntimeSnapshot(BaseModel):
         return self
 
 
+_SNAPSHOT_SECTION_MODELS: dict[str, type[BaseModel]] = {
+    "clients": SnapshotClient,
+    "gateway_keys": SnapshotGatewayKey,
+    "providers": SnapshotProvider,
+    "credentials": SnapshotCredential,
+    "models": SnapshotModel,
+    "provider_models": SnapshotProviderModel,
+}
+
+
+def unknown_snapshot_fields(payload: dict[str, Any]) -> dict[str, list[str]]:
+    """Fields the publisher sent that this build does not model, by section.
+
+    Ignoring an unknown field keeps an older instance running, but silently ignoring
+    it would hide the fact that it is running without something the configuration
+    asked for. This names them so the gap is visible.
+    """
+    found: dict[str, set[str]] = {}
+    for section, model in _SNAPSHOT_SECTION_MODELS.items():
+        rows = payload.get(section)
+        if not isinstance(rows, list):
+            continue
+        known = set(model.model_fields)
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if extra := row.keys() - known:
+                found.setdefault(section, set()).update(extra)
+    top_level = payload.keys() - set(RuntimeSnapshot.model_fields)
+    if top_level:
+        found.setdefault("snapshot", set()).update(top_level)
+    return {section: sorted(names) for section, names in sorted(found.items())}
+
+
+def report_unknown_snapshot_fields(payload: dict[str, Any]) -> dict[str, list[str]]:
+    """Log any unmodelled fields once, and return them for callers that want them."""
+    unknown = unknown_snapshot_fields(payload)
+    if unknown:
+        log_event(
+            logger,
+            logging.WARNING,
+            "snapshot_has_unmodelled_fields",
+            sections={section: ",".join(names) for section, names in unknown.items()},
+            hint="this build is older than the configuration publisher",
+        )
+    return unknown
+
+
 class RuntimeBuilder:
     def __init__(self, *, encryption_key: str, key_pepper: str) -> None:
         self._cipher = CredentialCipher.from_base64(encryption_key)
         self._key_hasher = GatewayKeyHasher(self._decode_pepper(key_pepper))
 
     def build(self, payload: dict[str, Any]) -> GatewayRuntime:
+        report_unknown_snapshot_fields(payload)
         snapshot = RuntimeSnapshot.model_validate(payload)
         clients = [
             GatewayClient(

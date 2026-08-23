@@ -269,3 +269,91 @@ async def test_serving_the_cached_snapshot_is_reported_not_silent() -> None:
     served = await cache.refresh()
     assert served.version == 245, "the cached snapshot must still be served"
     assert cache.last_refresh_error == "OSError", "the reason must be retained"
+
+
+def test_a_field_from_a_newer_publisher_does_not_reject_the_snapshot() -> None:
+    """An older build must keep running when configuration gains a field.
+
+    This is the exact production failure. Adding timeout_seconds to provider_models
+    made every older instance reject the whole payload, because the snapshot models
+    forbade unknown fields. One instance sat on version 242 for a day while 249 was
+    published, logging fifteen thousand validation errors and changing nothing. A
+    reader that is older than its publisher has to degrade, not stop: it should run
+    without the feature it cannot understand.
+    """
+    from gateway.configuration.runtime_builder import (
+        RuntimeSnapshot,
+        unknown_snapshot_fields,
+    )
+
+    base = {
+        "clients": [],
+        "gateway_keys": [],
+        "providers": [
+            {
+                "id": "p",
+                "name": "P",
+                "base_url": "https://upstream.example",
+                "capabilities": [],
+            }
+        ],
+        "credentials": [],
+        "models": [{"id": "m", "capabilities": []}],
+        "provider_models": [
+            {
+                "id": "pm",
+                "canonical_model_id": "m",
+                "provider_id": "p",
+                "upstream_model_id": "u",
+                "protocol": "anthropic_messages",
+                "capabilities": [],
+            }
+        ],
+    }
+
+    # Sanity: the payload this build understands validates.
+    assert RuntimeSnapshot.model_validate(base) is not None
+    assert unknown_snapshot_fields(base) == {}
+
+    # Now the publisher adds a field on a row, and a whole section, from the future.
+    future = {
+        **base,
+        "provider_models": [{**base["provider_models"][0], "a_new_knob": 42}],
+        "sections_added_later": [{"anything": True}],
+    }
+    snapshot = RuntimeSnapshot.model_validate(future)
+    assert snapshot is not None, "an older build must still load the snapshot"
+    assert snapshot.provider_models[0].id == "pm"
+
+    # And the gap must be reported, so running without the field is visible.
+    assert unknown_snapshot_fields(future) == {
+        "provider_models": ["a_new_knob"],
+        "snapshot": ["sections_added_later"],
+    }
+
+
+def test_a_snapshot_that_is_genuinely_broken_is_still_rejected() -> None:
+    """Tolerating unknown fields must not tolerate a payload that cannot work."""
+    from gateway.configuration.runtime_builder import RuntimeSnapshot
+
+    dangling = {
+        "clients": [],
+        "gateway_keys": [],
+        "providers": [],
+        "credentials": [],
+        "models": [],
+        "provider_models": [
+            {
+                "id": "pm",
+                "canonical_model_id": "missing-model",
+                "provider_id": "missing-provider",
+                "upstream_model_id": "u",
+                "protocol": "anthropic_messages",
+                "capabilities": [],
+            }
+        ],
+    }
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="unknown provider"):
+        RuntimeSnapshot.model_validate(dangling)
