@@ -1171,3 +1171,27 @@ def test_naming_an_unknown_key_is_a_not_found() -> None:
         )
 
     assert response.status_code == 404
+
+
+def test_credential_access_ids_are_ordered_so_the_checksum_is_stable() -> None:
+    """An unordered aggregate makes the configuration checksum non-deterministic.
+
+    supported_provider_model_ids is hashed into the checksum that decides whether
+    there are unpublished changes. array_agg without an order by may return the same
+    ids in a different order on any read, so the checksum changes when nothing has.
+
+    In production this appeared as has_unpublished_changes true with change_count
+    zero: the section compares as different, the diff has nothing to describe, and
+    the operator is told to publish without being told what. Publishing "fixes" it
+    until the next read reorders the array again.
+    """
+    import inspect
+
+    from gateway.admin import control_plane
+
+    source = inspect.getsource(control_plane.publish_config.__wrapped__) if hasattr(
+        control_plane.publish_config, "__wrapped__"
+    ) else inspect.getsource(control_plane)
+    assert "array_agg(cma.provider_model_id::text order by cma.provider_model_id)" in source, (
+        "credential access ids must be aggregated in a deterministic order"
+    )

@@ -1525,8 +1525,15 @@ async def _snapshot_payload(pool: Any) -> dict[str, Any]:
         """select id::text,provider_id::text,secret_version,secret_nonce,
                    secret_ciphertext,enabled,priority,health,quota_limit,
                    quota_used,cooldown_until,requests_per_minute,tokens_per_minute,
+                   -- Ordered, because this array is hashed into the configuration
+                   -- checksum. An unordered array_agg may return the same ids in a
+                   -- different order on any read, which changes the checksum without
+                   -- anything having changed. That surfaced as a permanent "you have
+                   -- unpublished changes" with an empty change list: the diff finds
+                   -- the section different but has nothing to describe, so the
+                   -- operator is told to publish and shown no reason.
                    coalesce(
-                     array_agg(cma.provider_model_id::text)
+                     array_agg(cma.provider_model_id::text order by cma.provider_model_id)
                        filter (where cma.provider_model_id is not null),
                      '{}'
                    ) as supported_provider_model_ids
