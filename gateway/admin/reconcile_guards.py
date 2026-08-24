@@ -182,10 +182,23 @@ select case
  when exists (select 1 from public.provider_pool_members ppm join managed_pool mp
               on mp.id=ppm.pool_id where not ppm.enabled or ppm.draining)
    then 'member_operational_state'
- when exists (select 1 from provider_credentials c cross join provider_mappings pm where not exists
+ -- Selective access means somebody has deliberately restricted which credentials
+ -- may serve which mappings, and reconciling would flatten that. The absence of any
+ -- access row is the opposite: no restriction at all, which is how every provider
+ -- created before this flow existed looks, and what the router itself treats as
+ -- unrestricted. Reading absence as selective made those providers permanently
+ -- unmanageable: adding a model or a credential to hcnsec, GoRouter, TabiAi or
+ -- AgentRouter returned provider_topology_not_supported forever, because a complete
+ -- matrix is only ever written when a provider is first created.
+ when exists (select 1 from public.credential_model_access cma
+              join provider_credentials c on c.id=cma.credential_id)
+  and exists (select 1 from provider_credentials c cross join provider_mappings pm where not exists
               (select 1 from public.credential_model_access cma where cma.credential_id=c.id
                and cma.provider_model_id=pm.id)) then 'selective_credential_access'
- when exists (select 1 from provider_credentials c cross join provider_mappings pm where not exists
+ -- Same reasoning for pool membership: no members means no curated pool to preserve.
+ when exists (select 1 from public.provider_pool_members ppm join managed_pool mp
+              on mp.id=ppm.pool_id)
+  and exists (select 1 from provider_credentials c cross join provider_mappings pm where not exists
               (select 1 from public.provider_pool_members ppm join managed_pool mp
                on mp.id=ppm.pool_id where ppm.credential_id=c.id
                and ppm.provider_model_id=pm.id)) then 'selective_pool_membership'

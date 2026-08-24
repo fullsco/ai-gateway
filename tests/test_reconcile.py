@@ -390,3 +390,41 @@ def test_reconcile_persists_pool_member_priority_and_weight() -> None:
         if "insert into public.provider_pool_members" in query
     )
     assert member_args[3:] == (7, 3.0)
+
+
+def test_absent_credential_access_is_unrestricted_not_selective() -> None:
+    """No access rows means no restriction, so it must not block reconciling.
+
+    The topology guard refuses to reconcile a provider whose credentials are
+    deliberately restricted to particular mappings, because reconciling would flatten
+    that. But it decided this by looking for pairs that lack an access row, and a
+    provider with no access rows at all has every pair lacking one. That is the
+    opposite condition: the router treats an empty restriction set as "may serve
+    anything", and every provider created before this flow existed has zero rows.
+
+    The effect in production was that adding a model or a credential to hcnsec,
+    GoRouter, TabiAi or AgentRouter returned provider_topology_not_supported forever,
+    because a complete access matrix is only ever written when a provider is first
+    created. Confirmed against the live database: hcnsec, with one credential, one
+    mapping and zero access rows, was refused.
+
+    Both selective clauses must therefore be gated on the relevant rows existing.
+    """
+    from gateway.admin.reconcile_guards import _TOPOLOGY_QUERY
+
+    query = " ".join(_TOPOLOGY_QUERY.split())
+
+    access_clause = query.index("then 'selective_credential_access'")
+    access_condition = query[:access_clause]
+    assert "from public.credential_model_access cma join provider_credentials c" in (
+        access_condition
+    ), "selective_credential_access must first require that some access row exists"
+
+    membership_clause = query.index("then 'selective_pool_membership'")
+    membership_condition = query[access_clause:membership_clause]
+    assert "from public.provider_pool_members ppm join managed_pool mp on mp.id=ppm.pool_id)" in (
+        membership_condition
+    ), "selective_pool_membership must first require that some pool member exists"
+
+    # The genuinely selective case must still be detectable, so the pair check stays.
+    assert query.count("cross join provider_mappings pm where not exists") == 2

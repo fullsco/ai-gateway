@@ -11,6 +11,21 @@ function readable(value: unknown): string {
   try { return JSON.stringify(value); } catch { return "Request failed"; }
 }
 
+// What each reconcile guard reason means, and what to do about it. These are refusals
+// to overwrite something deliberate, so each one names the thing that is in the way.
+const RECONCILE_REASONS: Record<string, string> = {
+  selective_credential_access:
+    "some credentials on this provider are restricted to particular models, and saving here would give every credential access to every model. Clear the per-credential model restrictions first, or edit this provider outside the setup form.",
+  selective_pool_membership:
+    "this provider's pool has hand-picked members, and saving here would rebuild it with every credential. Clear the pool membership first, or edit outside the setup form.",
+  custom_route_pool:
+    "a route for this provider uses a pool this form does not manage. Point the route at the provider's own pool, or edit outside the setup form.",
+  custom_pool_configuration:
+    "this provider's pool carries settings this form does not manage, such as being bound to a single model. Reset those settings, or edit outside the setup form.",
+  member_operational_state:
+    "a pool member is disabled or draining, and saving here would re-enable it. Finish or undo the drain first.",
+};
+
 export async function gatewayApi(path: string, init?: RequestInit) {
   const response = await fetch(`/api/gateway/${path}`, {
     ...init,
@@ -34,7 +49,14 @@ export async function gatewayApi(path: string, init?: RequestInit) {
     const status = response.status === 404
       ? `${plain || "Not found"} (${path}). A model id containing "/" cannot be addressed by these endpoints; rename it without a slash and keep the provider's name as the upstream model id.`
       : plain;
-    throw new Error(details || validation || readable(data.error) || status || `Request failed with status ${response.status}`);
+    // Several guards answer with an error code plus a "reason" naming which condition
+    // fired. Dropping the reason turned an actionable refusal into a dead end:
+    // "provider topology not supported" says nothing about what to change, and the
+    // reason says exactly which part of the existing setup is in the way.
+    const reason = typeof data.reason === "string" ? RECONCILE_REASONS[data.reason] ?? data.reason.replaceAll("_", " ") : "";
+    const primary = readable(data.error);
+    const explained = primary && reason ? `${primary}: ${reason}` : primary || reason;
+    throw new Error(details || validation || explained || status || `Request failed with status ${response.status}`);
   }
   return data;
 }
