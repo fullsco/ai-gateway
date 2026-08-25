@@ -106,6 +106,56 @@ class PassiveHealthRecorder:
             )
             if event.error_category is not None:
                 await self._alert(event)
+                return
+            # A probe that succeeded is allowed to heal, and only to heal.
+            #
+            # Health degraded from real traffic and could only be restored by real
+            # traffic, while the router prefers healthy credentials: a credential marked
+            # bad was rarely routed, so it rarely got the successful request that would
+            # clear it. Meanwhile the prober observed it healthy hundreds of times a day
+            # and had no way to say so. One twenty-minute upstream incident left twenty
+            # of twenty-five AgentRouter credentials marked auth_failed with every key
+            # still valid, and they stayed that way for days.
+            #
+            # The asymmetry is deliberate. A failing probe still must not condemn a
+            # credential, because a synthetic request is weaker evidence than a real one
+            # and a provider-side blip should not park a working key. Recovering on
+            # success carries no such risk: the next real request re-evaluates it
+            # anyway, and being wrong costs one attempt instead of stranding a key.
+            #
+            # It is not traffic, so it does not touch success_count, last_success_at or
+            # last_used_at; the transition is recorded so the change is auditable.
+            await self._pool.execute(
+                """
+                with previous as (
+                  select health::text as old_health
+                  from public.provider_credentials where id=$1
+                ), updated as (
+                  update public.provider_credentials
+                     set health='healthy'::public.gateway_health_state,
+                         cooldown_until=null,
+                         updated_at=now()
+                   where id=$1 and health <> 'healthy'::public.gateway_health_state
+                     and health <> 'disabled'::public.gateway_health_state
+                  returning health::text as new_health
+                )
+                insert into public.provider_events(
+                  provider_id,credential_id,event_type,metadata
+                )
+                select $2,$1,'health_transition',jsonb_build_object(
+                  'old_health',previous.old_health,'new_health',updated.new_health,
+                  'error_category',null,'upstream_status',$3::integer,
+                  'latency_ms',$4::numeric,'source',$5::text,
+                  'recovered_by','probe'
+                ) from previous,updated
+                where previous.old_health is distinct from updated.new_health
+                """,
+                event.credential_id,
+                event.provider_id,
+                event.upstream_status,
+                event.latency_ms,
+                event.source,
+            )
             return
         if not event.credential_at_fault:
             # Observe it, but do not attribute it to the credential.

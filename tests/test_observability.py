@@ -821,3 +821,50 @@ def test_both_cached_dimensions_come_out_of_the_input_total() -> None:
     cost, _ = estimate_cost((10, 0, 4, 4), pricing)
 
     assert cost == Decimal("2.00000000")
+
+
+@pytest.mark.asyncio
+async def test_a_successful_probe_clears_a_stale_failure_state() -> None:
+    """An active probe that succeeds must be allowed to heal the credential.
+
+    Health degraded only from real traffic and could only be restored by real traffic,
+    while the router prefers healthy credentials, so a credential marked bad was rarely
+    routed and therefore rarely given the successful request that would clear it. The
+    active prober observed these credentials as healthy hundreds of times a day and
+    could not say so: it wrote a health_checks row and returned.
+
+    In production one twenty-minute upstream incident on 2026-08-24 left twenty of
+    twenty-five AgentRouter credentials marked auth_failed. Every key was still valid -
+    two of them completed requests when probed directly, one with 837 prior successes -
+    and the prober had already observed six of them healthy, repeatedly, without
+    effect.
+
+    Healing only. A failing probe still must not condemn a credential, which
+    test_synthetic_health_observation_does_not_update_credential_state asserts.
+    """
+    pool = TelemetryPool()
+    recorder = PassiveHealthRecorder(pool)
+
+    await recorder._persist(
+        PassiveHealthEvent(
+            provider_id="provider",
+            credential_id="credential",
+            provider_model_id="provider-model",
+            request_id="health-probe",
+            attempt_number=0,
+            observed_at=datetime.now(UTC),
+            latency_ms=12,
+            error_category=None,          # the probe succeeded
+            upstream_status=200,
+            source="automatic",
+        )
+    )
+
+    queries = " ".join(query for query, _ in pool.execute_calls)
+    assert "update public.provider_credentials" in queries, pool.execute_calls
+    assert "health=" in queries
+    # The observation is still recorded.
+    assert "insert into public.health_checks" in queries
+    # A probe is not traffic, so it must not inflate the success counter or claim the
+    # credential served a request.
+    assert "success_count=success_count + 1" not in queries
