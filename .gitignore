@@ -13,6 +13,11 @@ build/
 .env*
 !.env.example
 !dashboard/.env.example
+# Secret-bearing env files that do NOT start with ".env" and so escape the
+# patterns above. supabase.env holds a live database password and an
+# account-scoped sbp_ management token; this repository is public.
+*.env
+!*.example.env
 node_modules/
 .next/
 supabase/.temp/
