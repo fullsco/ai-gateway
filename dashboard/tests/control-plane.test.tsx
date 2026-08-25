@@ -465,3 +465,33 @@ describe("draft versus published state", () => {
     expect(screen.queryByText(/the initial configuration/i)).not.toBeInTheDocument();
   });
 });
+
+describe("observation freshness", () => {
+  it("says how old a balance reading is and when it is too old to trust", async () => {
+    // A hand-entered balance six days old rendered exactly like one taken a minute
+    // ago, so a figure that could not possibly be current was read as current. The
+    // poller that would refresh the quota figure is off by default, so the same is
+    // true of quota_observed_at.
+    const stale = new Date(Date.now() - 6 * 24 * 3600 * 1000).toISOString();
+    const fresh = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      if (String(input).includes("credentials")) {
+        return response({ data: [
+          { id: "c1", name: "stale-one", provider_name: "GoRouter", enabled: true,
+            health: "healthy", balance_amount: "0.061184", balance_observed_at: stale },
+          { id: "c2", name: "fresh-one", provider_name: "GoRouter", enabled: true,
+            health: "healthy", balance_amount: "12.00", balance_observed_at: fresh },
+        ] });
+      }
+      return response({ data: [] });
+    }));
+
+    render(<ControlPlane />);
+    await userEvent.click(await screen.findByRole("button", { name: /Credentials/i }));
+
+    expect(await screen.findByText(/6 days ago - stale, may not reflect reality/)).toBeInTheDocument();
+    expect(screen.getByText(/10 min ago/)).toBeInTheDocument();
+    // The fresh one must not be labelled stale.
+    expect(screen.getByText(/10 min ago/).textContent).not.toMatch(/stale/);
+  });
+});

@@ -80,6 +80,29 @@ class CredentialUpdateInput(BaseModel):
     note: str | None = Field(default=None, max_length=2000)
 
 
+class CredentialBalanceInput(BaseModel):
+    """A balance an operator has read from the provider's own dashboard.
+
+    Nothing in the gateway can discover a balance: the relays either do not expose
+    one or report an identical placeholder ceiling for every credential, so this is
+    an operator observation and is labelled as one. observed_at is deliberately not
+    accepted from the caller and is set server side, because the recorded figure
+    going stale without anybody noticing was the original problem, and a
+    client-supplied timestamp can claim to be fresher than it is.
+    """
+
+    amount: float = Field(ge=0)
+    currency: str = Field(default="USD", min_length=3, max_length=3)
+
+    @field_validator("currency")
+    @classmethod
+    def normalize_currency(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if not normalized.isalpha():
+            raise ValueError("currency must be a three-letter alphabetic code")
+        return normalized
+
+
 class CredentialReinstateInput(BaseModel):
     """Why this credential is being put back into service.
 
@@ -710,6 +733,48 @@ async def reinstate_credential(
     await _audit(
         pool, claims, "credential_reinstated", "credential", credential_id,
         {"note": body.note},
+    )
+    return JSONResponse(jsonable_encoder(dict(row)))
+
+
+@router.put("/credentials/{credential_id}/balance")
+async def record_credential_balance(
+    credential_id: str,
+    request: Request,
+    body: CredentialBalanceInput,
+) -> JSONResponse:
+    """Record the balance an operator read from the provider's dashboard.
+
+    Nothing in the gateway ever wrote this column. It was read in one place for
+    display and one for the low-balance alert, and written nowhere at all, so a
+    balance could be seeded once and never corrected: in production two of
+    forty-two credentials had one and both were six days old. Topping the account
+    up changed nothing on screen, and there was no request that could.
+
+    The figure does not affect routing, and is not presented as though it does.
+    """
+    context = await _context(request)
+    if isinstance(context, JSONResponse):
+        return context
+    claims, pool = context
+    row = await pool.fetchrow(
+        """
+        update public.provider_credentials set
+          balance_amount=$2, balance_currency=$3,
+          balance_observed_at=now(), balance_source='operator', updated_at=now()
+        where id=$1
+        returning id, provider_id, name, balance_amount, balance_currency,
+                  balance_observed_at, balance_source
+        """,
+        credential_id,
+        Decimal(str(body.amount)),
+        body.currency,
+    )
+    if row is None:
+        return _not_found("credential")
+    await _audit(
+        pool, claims, "credential_balance_recorded", "credential", credential_id,
+        {"amount": str(body.amount), "currency": body.currency},
     )
     return JSONResponse(jsonable_encoder(dict(row)))
 

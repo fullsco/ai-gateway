@@ -209,11 +209,18 @@ function display(value: unknown, key: string, row?: Row) {
     return "None configured";
   }
   if (typeof value === "object") return "Advanced details available";
-  if (key.endsWith("_at"))
-    return new Intl.DateTimeFormat(undefined, {
+  if (key.endsWith("_at")) {
+    const formatted = new Intl.DateTimeFormat(undefined, {
       dateStyle: "medium",
       timeStyle: "short",
     }).format(new Date(String(value)));
+    // An observation is only worth as much as its age. balance and quota figures are
+    // recorded by hand or by a poller that is off by default, so a six-day-old
+    // reading rendered identically to a fresh one and was read as current. Naming
+    // the age, and saying outright when it is too old to trust, is the difference
+    // between a number and a number somebody can act on.
+    return OBSERVATION_KEYS.has(key) ? `${formatted} (${observationAge(value)})` : formatted;
+  }
   if (key.includes("cost")) return row?.currency ? `${Number(value).toFixed(4)} ${String(row.currency)}` : "Pricing unavailable";
   if (key.includes("latency") && value !== "--") return `${Number(value).toFixed(0)} ms`;
   return String(value).replaceAll("_", " ");
@@ -340,6 +347,23 @@ const QUOTA_CONFIDENCE: Record<string, string> = {
   estimated: "Spend known, no limit - trend only, headroom unknown",
   unknown: "No signal - do not read this as remaining capacity",
 };
+
+// Timestamps that record when a figure was last observed, rather than when something
+// happened. These are the ones whose age changes how the number should be read.
+const OBSERVATION_KEYS = new Set(["balance_observed_at", "quota_observed_at"]);
+const STALE_AFTER_HOURS = 24;
+
+function observationAge(value: unknown): string {
+  const observed = new Date(String(value)).getTime();
+  if (Number.isNaN(observed)) return "age unknown";
+  const hours = (Date.now() - observed) / 3_600_000;
+  if (hours < 0) return "clock skew";
+  const age =
+    hours < 1 ? `${Math.max(1, Math.round(hours * 60))} min ago`
+    : hours < 48 ? `${Math.round(hours)} h ago`
+    : `${Math.round(hours / 24)} days ago`;
+  return hours >= STALE_AFTER_HOURS ? `${age} - stale, may not reflect reality` : age;
+}
 
 function explainError(value: unknown): string {
   // Keys must be the values the gateway actually writes. Two of the previous

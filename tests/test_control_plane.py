@@ -1394,3 +1394,58 @@ async def test_config_status_never_claims_changes_it_cannot_name() -> None:
     assert "routing policy" in " ".join(
         entry["summary"] for entry in body["changes"]
     ).lower(), body
+
+
+@pytest.mark.asyncio
+async def test_a_credential_balance_can_be_recorded_after_a_top_up() -> None:
+    """There was no way to correct a balance, so every displayed balance went stale.
+
+    Nothing in the gateway ever wrote balance_amount: it appeared in one SELECT for
+    display and one for the low-balance alert, and in no INSERT or UPDATE anywhere,
+    not even in the control plane. In production two of forty-two credentials had a
+    balance at all and both were six days old, so the dashboard showed a figure that
+    could only ever be wrong and that no top-up would correct.
+
+    observed_at is set here rather than accepted from the caller, because the value
+    being stale was the entire problem and a client-supplied timestamp can lie about
+    how fresh it is.
+    """
+    pool = FakePool()
+    pool.fetchrow_result = {
+        "id": "credential-1",
+        "provider_id": "provider-1",
+        "name": "primary",
+        "balance_amount": "12.34",
+        "balance_currency": "USD",
+        "balance_observed_at": datetime(2026, 8, 25, tzinfo=UTC),
+        "balance_source": "operator",
+    }
+
+    with client(pool) as test_client:
+        response = test_client.put(
+            "/api/admin/v1/credentials/credential-1/balance",
+            headers=auth(),
+            json={"amount": 12.34, "currency": "USD"},
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["balance_amount"] == "12.34"
+    assert body["balance_source"] == "operator"
+    queries = " ".join(q for q, _ in pool.fetchrow_calls)
+    assert "balance_observed_at=now()" in queries, pool.fetchrow_calls
+    # The write is audited like any other operator change.
+    audited = " ".join(str(a) for q, a in pool.execute_calls if "audit_logs" in q)
+    assert "credential_balance_recorded" in audited
+
+
+@pytest.mark.asyncio
+async def test_recording_a_balance_rejects_a_negative_amount() -> None:
+    pool = FakePool()
+    with client(pool) as test_client:
+        response = test_client.put(
+            "/api/admin/v1/credentials/credential-1/balance",
+            headers=auth(),
+            json={"amount": -1, "currency": "USD"},
+        )
+    assert response.status_code == 422, response.text
