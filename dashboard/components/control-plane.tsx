@@ -60,8 +60,12 @@ const resources: Record<ResourceView, { endpoint: string; title: string; mutable
       // and whether it will recover on its own. Reading health alone made a
       // provider with 17 usable credentials look like it had 1.
       "name", "provider_name", "masked_hint", "enabled", "routing_state", "health",
-      "quota_used", "quota_limit", "quota_confidence", "quota_observed_at",
-      "balance_amount", "balance_observed_at", "cooldown_until",
+      "quota_used", "quota_limit", "quota_confidence", "quota_observed_at", "quota_source",
+      // Provenance sits beside the age of the same figure. The poller refreshes quota
+      // every fifteen minutes; a balance is only ever typed in and nothing will ever
+      // refresh it. Without the source, a nine-minute-old quota and a five-day-old
+      // balance looked like two readings of equal standing.
+      "balance_amount", "balance_observed_at", "balance_source", "cooldown_until",
     ],
   },
   clients: {
@@ -173,6 +177,7 @@ const resources: Record<ResourceView, { endpoint: string; title: string; mutable
 const api = gatewayApi;
 
 function display(value: unknown, key: string, row?: Row) {
+  if (key === "quota_source" || key === "balance_source") return observationSource(value);
   if (key === "quota_confidence") return QUOTA_CONFIDENCE[String(value)] ?? "No signal";
   if (key === "routing_state") return ROUTING_STATE[String(value)] ?? String(value ?? "Unknown");
   if (key === "live_access") return LIVE_ACCESS[String(value)] ?? String(value ?? "Unknown");
@@ -358,6 +363,22 @@ const QUOTA_CONFIDENCE: Record<string, string> = {
 // happened. These are the ones whose age changes how the number should be read.
 const OBSERVATION_KEYS = new Set(["balance_observed_at", "quota_observed_at"]);
 const STALE_AFTER_HOURS = 24;
+
+// Where a figure came from. The gateway can measure cumulative spend, because the relay
+// answers /v1/dashboard/billing/usage. It cannot measure a balance: the same endpoint
+// family reports an identical placeholder ceiling for every credential and rejects API
+// keys on the account endpoint, so a balance is an operator's reading of a dashboard and
+// nothing refreshes it. Saying so is what stops a stale balance being read as a live one.
+const OBSERVATION_SOURCES: Record<string, string> = {
+  upstream_usage: "Read from the provider by the gateway",
+  operator: "Entered by an operator - not refreshed automatically",
+  unknown: "Never observed",
+};
+
+function observationSource(value: unknown): string {
+  if (value === null || value === undefined || value === "") return "Never observed";
+  return OBSERVATION_SOURCES[String(value)] ?? readable(value);
+}
 
 function observationAge(value: unknown): string {
   const observed = new Date(String(value)).getTime();

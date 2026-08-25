@@ -561,6 +561,61 @@ describe("observation freshness", () => {
     // "Not configured", which is correct for a setting.
     expect(row.textContent?.match(/Not observed/g)).toHaveLength(3);
   });
+
+  it("says which figures a machine measured and which a person typed", async () => {
+    // Now that the poller runs, quota_observed_at refreshes itself every fifteen
+    // minutes while balance_amount is still only ever entered by hand. A fresh quota
+    // timestamp sitting beside a hand-typed balance invited reading both as current
+    // measurements. quota_source and balance_source were already returned by the API
+    // and never shown, so the one field that resolves the ambiguity was invisible.
+    const fresh = new Date(Date.now() - 9 * 60 * 1000).toISOString();
+    const older = new Date(Date.now() - 5 * 24 * 3600 * 1000).toISOString();
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      if (String(input).includes("credentials")) {
+        return response({ data: [
+          { id: "c1", name: "polled", provider_name: "AgentRouter", enabled: true, health: "healthy",
+            quota_used: "67500.196", quota_source: "upstream_usage", quota_observed_at: fresh,
+            balance_amount: "12.50", balance_source: "operator", balance_observed_at: older },
+        ] });
+      }
+      return response({ data: [] });
+    }));
+
+    render(<ControlPlane />);
+    await userEvent.click(await screen.findByRole("button", { name: /Credentials/i }));
+    const row = (await screen.findByText("polled")).closest("tr") as HTMLElement;
+
+    // The polled figure is named as the gateway's own reading.
+    expect(row.textContent).toMatch(/Read from the provider by the gateway/);
+    // The balance is named as a human entry that nothing will refresh, which is the
+    // whole reason it can be five days old while the quota beside it is nine minutes old.
+    expect(row.textContent).toMatch(/Entered by an operator/);
+    expect(row.textContent).toMatch(/not refreshed automatically/);
+  });
+
+  it("does not describe an unpolled credential as measured", async () => {
+    // Sixteen of forty-two credentials sit on relays that do not implement the usage
+    // endpoint. The poller writes nothing for them, so their provenance is genuinely
+    // absent and must not borrow the vocabulary of a measurement.
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      if (String(input).includes("credentials")) {
+        return response({ data: [
+          { id: "c1", name: "unpolled", provider_name: "TabiAi", enabled: true, health: "healthy",
+            quota_used: null, quota_source: null, quota_observed_at: null,
+            balance_amount: null, balance_source: null, balance_observed_at: null },
+        ] });
+      }
+      return response({ data: [] });
+    }));
+
+    render(<ControlPlane />);
+    await userEvent.click(await screen.findByRole("button", { name: /Credentials/i }));
+    const row = (await screen.findByText("unpolled")).closest("tr") as HTMLElement;
+
+    expect(row.textContent).not.toMatch(/Read from the provider/);
+    expect(row.textContent).not.toMatch(/Entered by an operator/);
+    expect(row.textContent).toMatch(/Never observed/);
+  });
 });
 
 describe("recording a credential balance", () => {
