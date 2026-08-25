@@ -26,6 +26,24 @@ const RECONCILE_REASONS: Record<string, string> = {
     "a pool member is disabled or draining, and saving here would re-enable it. Finish or undo the drain first.",
 };
 
+// A shared model's metadata belongs to the catalogue, not to one provider, so the
+// refusal names the field and both values rather than leaving the operator to guess.
+function sharedModelConflict(data: GatewayRow): string {
+  const field = String(data.field ?? "").replaceAll("_", " ");
+  const shared = Array.isArray(data.shared_with) ? data.shared_with.join(", ") : "";
+  const show = (value: unknown) =>
+    value === null || value === undefined || value === ""
+      ? "empty"
+      : Array.isArray(value) ? value.join(", ") : String(value);
+  const where = shared ? ` It is also served by ${shared}.` : "";
+  return (
+    `"${data.model_id}" already exists in the shared model catalogue and its ${field} ` +
+    `does not match: it is currently ${show(data.current)} and this form would set it ` +
+    `to ${show(data.requested)}.${where} Either keep the existing value, or change it ` +
+    `for every provider from the Models and routing page.`
+  );
+}
+
 export async function gatewayApi(path: string, init?: RequestInit) {
   const response = await fetch(`/api/gateway/${path}`, {
     ...init,
@@ -43,12 +61,8 @@ export async function gatewayApi(path: string, init?: RequestInit) {
     // FastAPI returns a plain string detail for routing failures, most often
     // {"detail":"Not Found"}. That matched none of the shapes above, so a real cause
     // was replaced by the generic fallback and the operator was told nothing at all.
-    // A model id containing a slash produces exactly this, because it does not match
-    // the path pattern of the admin endpoints.
     const plain = typeof data.detail === "string" ? data.detail : "";
-    const status = response.status === 404
-      ? `${plain || "Not found"} (${path}). A model id containing "/" cannot be addressed by these endpoints; rename it without a slash and keep the provider's name as the upstream model id.`
-      : plain;
+    const status = response.status === 404 ? `${plain || "Not found"} (${path})` : plain;
     // Several guards answer with an error code plus a "reason" naming which condition
     // fired. Dropping the reason turned an actionable refusal into a dead end:
     // "provider topology not supported" says nothing about what to change, and the
@@ -56,6 +70,9 @@ export async function gatewayApi(path: string, init?: RequestInit) {
     const reason = typeof data.reason === "string" ? RECONCILE_REASONS[data.reason] ?? data.reason.replaceAll("_", " ") : "";
     const primary = readable(data.error);
     const explained = primary && reason ? `${primary}: ${reason}` : primary || reason;
+    if (data.error === "shared_model_metadata_conflict") {
+      throw new Error(sharedModelConflict(data));
+    }
     throw new Error(details || validation || explained || status || `Request failed with status ${response.status}`);
   }
   return data;
@@ -140,6 +157,11 @@ export default function ProviderSetup({ provider, onClose, onSaved }: { provider
   const [queryParameters, setQueryParameters] = useState(() => parsePairs(object(provider?.settings).endpoint_query));
   const [credentials, setCredentials] = useState<CredentialDraft[]>([emptyCredential()]);
   const [mappings, setMappings] = useState<MappingDraft[]>([emptyMapping()]);
+  // The full canonical catalogue, so an existing model can be chosen instead of
+  // retyped. Retyping is how an operator either creates an accidental second model
+  // from a typo, or reproduces an existing id exactly and trips the shared-model
+  // guard on a field the form itself prefilled.
+  const [catalogue, setCatalogue] = useState<GatewayRow[]>([]);
   const [strategy, setStrategy] = useState("priority");
   const [poolEnabled, setPoolEnabled] = useState(true);
   const poolMetadata = useRef({ health_aware: true, quota_aware: true });
@@ -164,6 +186,18 @@ export default function ProviderSetup({ provider, onClose, onSaved }: { provider
     if (!loading) initialFocus.current?.focus();
   }, [loading]);
 
+  // The canonical catalogue is loaded whether or not a provider is being edited.
+  // Adding a provider is precisely when an operator needs to attach an existing model,
+  // and the provider-scoped effect below returns early with no provider id, so the
+  // picker would have been empty in the one flow that most needed it.
+  useEffect(() => {
+    let active = true;
+    gatewayApi("models")
+      .then((modelData) => { if (active) setCatalogue((modelData.data as GatewayRow[]) ?? []); })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, []);
+
   useEffect(() => {
     if (!provider?.id) return;
     let active = true;
@@ -172,6 +206,7 @@ export default function ProviderSetup({ provider, onClose, onSaved }: { provider
         if (!active) return;
         const providerCredentials = (credentialData.data as GatewayRow[]).filter((item) => text(item.provider_id) === text(provider.id));
         const modelMap = new Map((modelData.data as GatewayRow[]).map((item) => [text(item.id), item]));
+        setCatalogue(modelData.data as GatewayRow[]);
         const providerMappings = (mappingData.data as GatewayRow[]).filter((item) => text(item.provider_id) === text(provider.id));
         const routes = (routeData.data as GatewayRow[]).filter((item) => text(item.provider_id) === text(provider.id));
         const poolIds = new Set(routes.filter((item) => text(item.provider_id) === text(provider.id) && item.pool_id).map((item) => text(item.pool_id)));
@@ -224,6 +259,29 @@ export default function ProviderSetup({ provider, onClose, onSaved }: { provider
       return position === index ? { ...item, ...shared, ...patch } : { ...item, ...shared };
     });
   });
+
+  // Choosing a model from the catalogue adopts its stored metadata verbatim. The
+  // canonical fields then describe what the catalogue already holds, so saving cannot
+  // trip the shared-model guard, and the operator is not asked to retype an id that
+  // has to match character for character.
+  const selectCatalogueModel = (index: number, modelId: string) => {
+    const known = catalogue.find((item) => text(item.id) === modelId);
+    if (!known) {
+      updateMapping(index, { model_id: modelId });
+      return;
+    }
+    updateMapping(index, {
+      model_id: modelId,
+      display_name: text(known.display_name, modelId),
+      aliases: list(known.aliases).join(", "),
+      context_window: text(known.context_window),
+      model_enabled: Boolean(known.enabled ?? true),
+      model_capabilities: list(known.capabilities),
+      // The provider's own name for the model is usually the canonical id; it stays
+      // editable because relays differ, but prefilling removes the common case.
+      upstream_model_id: modelId,
+    });
+  };
 
   function validate() {
     const labels = credentials.map((item) => item.name.trim().toLocaleLowerCase());
@@ -333,7 +391,7 @@ export default function ProviderSetup({ provider, onClose, onSaved }: { provider
        <fieldset disabled={busy}><legend>Models and routes</legend><div className="subsection-head"><p>Choose the models this provider serves, then set its primary or fallback position. Internal mappings are generated automatically.</p><button type="button" onClick={() => setMappings((items) => [...items, emptyMapping()])}><Plus size={14} />Model</button></div>
         <div className="mapping-list">{mappings.map((item, index) => <article className="mapping-card" key={index}>
           <div className="mapping-card-head"><strong>{item.model_id || `Mapping ${index + 1}`}</strong><button type="button" className="icon-button danger" onClick={() => setMappings((items) => items.filter((_, position) => position !== index))} aria-label={`Remove mapping ${item.model_id || index + 1}`}><Trash2 size={15} /></button></div>
-           <div className="provider-grid"><label className="field"><span>Model ID</span><input value={item.model_id} onChange={(event) => updateMapping(index, { model_id: event.target.value })} required /><small>Stable name clients use to request this model.</small></label><label className="field"><span>Model display name</span><input value={item.display_name} onChange={(event) => updateMapping(index, { display_name: event.target.value })} required /></label>
+           <div className="provider-grid"><label className="field"><span>Model ID</span><input value={item.model_id} list={`model-catalogue-${index}`} onChange={(event) => selectCatalogueModel(index, event.target.value)} required /><datalist id={`model-catalogue-${index}`}>{catalogue.map((known) => <option value={text(known.id)} key={text(known.id)}>{text(known.display_name, text(known.id))}</option>)}</datalist><small>{catalogue.some((known) => text(known.id) === item.model_id.trim()) ? "Existing catalogue model. Its shared details are filled in below and are edited for every provider at once." : "Pick an existing model, or type a new id to add one. Clients use this name to request the model."}</small></label><label className="field"><span>Model display name</span><input value={item.display_name} onChange={(event) => updateMapping(index, { display_name: event.target.value })} required /></label>
           <label className="field"><span>Aliases (comma separated)</span><input value={item.aliases} onChange={(event) => updateMapping(index, { aliases: event.target.value })} /></label><label className="field"><span>Context window</span><input type="number" min="1" step="1" value={item.context_window} onChange={(event) => updateMapping(index, { context_window: event.target.value })} /></label>
            <label className="field"><span>Provider model ID</span><input value={item.upstream_model_id} onChange={(event) => updateMapping(index, { upstream_model_id: event.target.value })} required /><small>The provider's name for this model.</small></label><label className="field"><span>Protocol</span><select value={item.protocol} onChange={(event) => updateMapping(index, { protocol: event.target.value })}>{protocols.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select><small>How requests are sent upstream.</small></label>
            <label className="field"><span>Provider priority</span><input type="number" min="0" step="1" value={item.priority} onChange={(event) => updateMapping(index, { priority: event.target.value })} /><small>Lower values are preferred.</small></label><label className="field"><span>Traffic share</span><input type="number" min="0.001" step="any" value={item.weight} onChange={(event) => updateMapping(index, { weight: event.target.value })} /><small>Used when multiple routes are eligible.</small></label><label className="field"><span>Concurrent request limit</span><input type="number" min="1" step="1" value={item.max_concurrency} onChange={(event) => updateMapping(index, { max_concurrency: event.target.value })} /></label>

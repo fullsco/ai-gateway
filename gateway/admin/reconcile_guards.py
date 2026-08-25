@@ -96,7 +96,11 @@ async def shared_model_conflict(
     rows = await connection.fetch(
         """select m.id,m.display_name,m.enabled,m.capabilities,m.context_window,
                   array(select a.alias from public.model_aliases a
-                        where a.model_id=m.id order by a.alias) as aliases
+                        where a.model_id=m.id order by a.alias) as aliases,
+                  array(select distinct p.name from public.provider_models pm
+                        join public.providers p on p.id=pm.provider_id
+                        where pm.model_id=m.id and pm.provider_id <> $2
+                        order by p.name) as shared_with
            from public.models m where m.id=any($1::text[])
              and exists (select 1 from public.provider_models pm
                          where pm.model_id=m.id and pm.provider_id <> $2)""",
@@ -106,33 +110,54 @@ async def shared_model_conflict(
     requested = {model.id: model for model in models}
     for row in rows:
         model = requested[row["id"]]
-        if _model_differs(model, row):
+        difference = _model_difference(model, row)
+        if difference is not None:
+            field, current, requested_value = difference
+            # Naming the field, both values, and who else depends on the model turns a
+            # dead end into something actionable: the operator can see whether they
+            # meant to change it catalogue-wide, or only tripped over a prefilled box.
             return JSONResponse(
-                {"error": "shared_model_metadata_conflict", "model_id": model.id},
+                {
+                    "error": "shared_model_metadata_conflict",
+                    "model_id": model.id,
+                    "field": field,
+                    "current": current,
+                    "requested": requested_value,
+                    "shared_with": list(row["shared_with"] or []),
+                },
                 status_code=409,
             )
     return None
 
 
-def _model_differs(model: ReconcileModel, row: Any) -> bool:
-    return (
-        ("display_name" in model.model_fields_set and model.display_name != row["display_name"])
-        or ("enabled" in model.model_fields_set and model.enabled != row["enabled"])
-        or (
-            "capabilities" in model.model_fields_set
-            and {enum_value(value) for value in model.capabilities}
-            != set(row["capabilities"] or [])
-        )
-        or (
-            "context_window" in model.model_fields_set
-            and model.context_window != row["context_window"]
-        )
-        or (
-            "aliases" in model.model_fields_set
-            and {normalized_name(value) for value in model.aliases}
-            != {normalized_name(value) for value in row["aliases"] or []}
-        )
-    )
+def _model_difference(
+    model: ReconcileModel, row: Any
+) -> tuple[str, Any, Any] | None:
+    """The first field whose requested value differs, with both values.
+
+    Only fields the caller actually sent are compared, so a form that omits a field
+    never counts as trying to clear it.
+    """
+    if "display_name" in model.model_fields_set and model.display_name != row["display_name"]:
+        return ("display_name", row["display_name"], model.display_name)
+    if "enabled" in model.model_fields_set and model.enabled != row["enabled"]:
+        return ("enabled", row["enabled"], model.enabled)
+    if "capabilities" in model.model_fields_set:
+        requested = {enum_value(value) for value in model.capabilities}
+        current = set(row["capabilities"] or [])
+        if requested != current:
+            return ("capabilities", sorted(current), sorted(requested))
+    if (
+        "context_window" in model.model_fields_set
+        and model.context_window != row["context_window"]
+    ):
+        return ("context_window", row["context_window"], model.context_window)
+    if "aliases" in model.model_fields_set:
+        requested = {normalized_name(value) for value in model.aliases}
+        current = {normalized_name(value) for value in row["aliases"] or []}
+        if requested != current:
+            return ("aliases", sorted(current), sorted(requested))
+    return None
 
 
 async def topology_conflict(

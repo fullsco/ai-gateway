@@ -1195,3 +1195,113 @@ def test_credential_access_ids_are_ordered_so_the_checksum_is_stable() -> None:
     assert "array_agg(cma.provider_model_id::text order by cma.provider_model_id)" in source, (
         "credential access ids must be aggregated in a deterministic order"
     )
+
+
+def test_a_model_id_containing_a_slash_is_addressable() -> None:
+    """Model ids are provider-native names, and several contain a slash.
+
+    `models.id` is the primary key referenced by provider_models, model_aliases,
+    model_routes and every historical usage_records snapshot, and it is also the name
+    clients send. "stealth/ox-alpha" is what OpenRouter calls the model and what
+    callers ask for, so renaming it to fit the URL grammar would break live traffic
+    and orphan history.
+
+    A FastAPI str path parameter matches [^/]+ and the server decodes %2F before
+    routing, so these endpoints could never match such an id no matter how the client
+    encoded it: every request answered 404 and the dashboard reported the model as
+    missing when it was present and serving.
+    """
+    model_id = "stealth/ox-alpha"
+
+    pool = FakePool()
+    pool.fetchrow_result = {
+        "id": model_id,
+        "display_name": "Ox Alpha",
+        "capabilities": ["streaming"],
+        "enabled": True,
+        "context_window": None,
+    }
+
+    with client(pool) as test_client:
+        routing = test_client.get(f"/api/admin/v1/models/{model_id}/routing", headers=auth())
+        update = test_client.put(
+            f"/api/admin/v1/models/{model_id}",
+            headers=auth(),
+            json={
+                "id": model_id,
+                "display_name": "Ox Alpha",
+                "capabilities": ["streaming"],
+                "enabled": True,
+                "aliases": [],
+            },
+        )
+        delete = test_client.delete(f"/api/admin/v1/models/{model_id}", headers=auth())
+
+    assert routing.status_code == 200, routing.text
+    assert routing.json()["model"]["id"] == model_id
+    assert update.status_code == 200, update.text
+    assert update.json()["id"] == model_id
+    assert delete.status_code == 200, delete.text
+
+
+def test_the_routing_suffix_is_not_swallowed_by_a_slashed_model_id() -> None:
+    """A greedy path parameter must not eat the trailing segment it is anchored on.
+
+    Matching the id greedily is what allows a slash through, but the same greed would
+    let "/models/a/routing" resolve as the id "a/routing" on the update endpoint. The
+    routing suffix has to win, or editing a model would silently address a different
+    one.
+    """
+    pool = FakePool()
+    pool.fetchrow_result = {
+        "id": "a/b",
+        "display_name": "A B",
+        "capabilities": [],
+        "enabled": True,
+        "context_window": None,
+    }
+
+    with client(pool) as test_client:
+        response = test_client.get("/api/admin/v1/models/a/b/routing", headers=auth())
+
+    assert response.status_code == 200, response.text
+    # The id stops before the suffix rather than absorbing it.
+    assert response.json()["model"]["id"] == "a/b"
+
+
+def test_updating_routing_is_not_captured_by_the_greedy_model_update() -> None:
+    """PUT /models/{id}/routing must reach routing, not update a model named ".../routing".
+
+    Both endpoints are now greedy, and Starlette matches in declaration order, so if
+    the bare update is declared first it captures the routing path with an id of
+    "model/routing". The request would then be answered by the wrong handler: routing
+    would silently not be saved, and an audit record would claim a model was updated.
+    """
+    pool = FakePool()
+    pool.fetchval_result = 1
+    pool.fetchrow_result = {"id": "claude-opus-5"}
+
+    with client(pool) as test_client:
+        response = test_client.put(
+            "/api/admin/v1/models/claude-opus-5/routing",
+            headers=auth(),
+            json={"providers": [{"provider": "AgentRouter"}]},
+        )
+
+    # The routing handler answered: the model update would have rejected the body for
+    # a missing "id" and "display_name". A routing-domain response, whatever it is,
+    # proves the request reached routing rather than mutating a model.
+    body = response.json()
+    missing_model_fields = [
+        item.get("loc", [])[-1]
+        for item in (body.get("detail") or [])
+        if isinstance(item, dict)
+    ]
+    assert "id" not in missing_model_fields, response.text
+    assert "display_name" not in missing_model_fields, response.text
+    updated_models = [
+        query for query, _ in pool.execute_calls if "update public.models" in query
+    ]
+    assert not updated_models, updated_models
+    audited = [args for query, args in pool.execute_calls if "audit_logs" in query]
+    assert all("model_updated" not in str(args) for args in audited), audited

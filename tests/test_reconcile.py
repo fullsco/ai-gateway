@@ -304,6 +304,7 @@ def test_reconcile_rejects_shared_model_metadata_changes() -> None:
                 "enabled": True,
                 "capabilities": ["streaming"],
                 "context_window": 128000,
+                "shared_with": ["Other Provider"],
             }
         ],
     )
@@ -323,10 +324,10 @@ def test_reconcile_rejects_shared_model_metadata_changes() -> None:
         )
 
     assert response.status_code == 409
-    assert response.json() == {
-        "error": "shared_model_metadata_conflict",
-        "model_id": "model-1",
-    }
+    # Which field differs is asserted by
+    # test_shared_model_conflict_names_the_field_that_differs.
+    assert response.json()["error"] == "shared_model_metadata_conflict"
+    assert response.json()["model_id"] == "model-1"
 
 
 def test_reconcile_route_is_reachable_in_production_app() -> None:
@@ -428,3 +429,53 @@ def test_absent_credential_access_is_unrestricted_not_selective() -> None:
 
     # The genuinely selective case must still be detectable, so the pair check stays.
     assert query.count("cross join provider_mappings pm where not exists") == 2
+
+
+def test_shared_model_conflict_names_the_field_that_differs() -> None:
+    """A refusal has to say what is in the way, or it cannot be acted on.
+
+    The guard is right to refuse: this model is served by another provider too, and a
+    per-provider form must not silently rewrite catalogue-wide metadata. But answering
+    with only the model id left the operator guessing which of display name, enabled,
+    capabilities, context window or aliases was the problem -- and the setup form
+    pre-fills display_name from the id and leaves context_window blank, so it invites
+    exactly the edit it then rejects.
+    """
+    pool = ReconcilePool(
+        existing_provider_id="provider-id",
+        shared_model_rows=[
+            {
+                "id": "model-1",
+                "display_name": "Original",
+                "enabled": True,
+                "capabilities": ["streaming"],
+                "context_window": 128000,
+                "shared_with": ["Other Provider"],
+            }
+        ],
+    )
+    with TestClient(reconcile_app(pool), raise_server_exceptions=False) as test_client:
+        response = test_client.put(
+            "/api/admin/v1/providers/reconcile",
+            headers=auth(),
+            json=reconcile_payload(
+                models=[
+                    {
+                        "id": "model-1",
+                        "display_name": "Changed",
+                        "capabilities": ["streaming"],
+                    }
+                ]
+            ),
+        )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error"] == "shared_model_metadata_conflict"
+    assert body["model_id"] == "model-1"
+    # Which field, what it is now, and what the form tried to make it.
+    assert body["field"] == "display_name"
+    assert body["current"] == "Original"
+    assert body["requested"] == "Changed"
+    # And who else depends on it, so the operator knows why it is shared.
+    assert body["shared_with"] == ["Other Provider"]

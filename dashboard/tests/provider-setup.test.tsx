@@ -136,7 +136,14 @@ describe("provider setup", () => {
     const view = render(<ProviderSetup onClose={onClose} onSaved={vi.fn(async () => undefined)} />);
     await userEvent.click(screen.getByRole("button", { name: "Close provider setup" }));
     expect(onClose).toHaveBeenCalledOnce();
-    expect(fetchMock).not.toHaveBeenCalled();
+    // Closing must not write anything. The form does read the canonical model
+    // catalogue on open, so that a model can be selected rather than retyped, so the
+    // assertion is on writes rather than on there being no traffic at all.
+    const writes = fetchMock.mock.calls.filter(([, init]) => {
+      const method = (init as RequestInit | undefined)?.method ?? "GET";
+      return method !== "GET";
+    });
+    expect(writes).toHaveLength(0);
     view.unmount();
 
     render(<ProviderSetup onClose={onClose} onSaved={vi.fn(async () => undefined)} />);
@@ -151,5 +158,80 @@ describe("provider setup", () => {
 
     vi.stubGlobal("fetch", vi.fn(() => response({ error: "not_authenticated" }, 401)));
     await expect(gatewayApi("providers")).rejects.toThrow("Session expired");
+  });
+});
+
+describe("model selection", () => {
+  it("offers existing catalogue models when adding a provider", async () => {
+    // Adding a provider is exactly when an existing model must be attachable, and the
+    // provider-scoped hydration returns early with no provider id, so the catalogue is
+    // loaded independently or the picker is empty in the flow that needs it most.
+    vi.stubGlobal("fetch", fetchForWorkspace());
+    render(<ProviderSetup onClose={vi.fn()} onSaved={vi.fn(async () => undefined)} />);
+
+    const field = screen.getByLabelText(/^Model ID/);
+    expect(field).toHaveAttribute("list");
+    // datalist options are not exposed with an option role in jsdom, so the list is
+    // inspected directly.
+    await waitFor(() => {
+      const listId = field.getAttribute("list") ?? "";
+      const options = document.querySelectorAll(`#${listId} option`);
+      expect(Array.from(options).map((node) => node.getAttribute("value"))).toContain("model-1");
+    });
+  });
+
+  it("adopts the stored metadata of a selected model so the shared guard cannot fire", async () => {
+    // The form used to prefill display_name from the id and leave context_window
+    // blank, which differs from what the catalogue holds and is refused as a shared
+    // model metadata change. Selecting the model copies its real values instead.
+    let payload: GatewayRow = {};
+    vi.stubGlobal("fetch", fetchForWorkspace((value) => { payload = value; }));
+    render(<ProviderSetup onClose={vi.fn()} onSaved={vi.fn(async () => undefined)} />);
+    await waitFor(() => expect(document.querySelectorAll("datalist option").length).toBeGreaterThan(0));
+
+    fireEvent.change(screen.getByLabelText("Provider name"), { target: { value: "New Provider" } });
+    fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "https://new.example" } });
+    fireEvent.change(screen.getByLabelText("Label"), { target: { value: "primary" } });
+    fireEvent.change(screen.getByLabelText("Secret"), { target: { value: "secret-value" } });
+    fireEvent.change(screen.getByLabelText(/^Model ID/), { target: { value: "model-1" } });
+    await userEvent.click(screen.getByRole("button", { name: "Create provider workspace" }));
+
+    await waitFor(() => expect(payload.models).toBeDefined());
+    expect(payload.models).toMatchObject([
+      {
+        id: "model-1",
+        display_name: "Model One",
+        context_window: 128000,
+        enabled: false,
+        aliases: ["latest", "fast"],
+      },
+    ]);
+  });
+
+  it("explains a shared model conflict by naming the field and both values", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => response({
+      error: "shared_model_metadata_conflict",
+      model_id: "model-1",
+      field: "context_window",
+      current: 128000,
+      requested: null,
+      shared_with: ["Other Provider"],
+    }, 409)));
+
+    await expect(gatewayApi("providers/reconcile", { method: "PUT", body: "{}" }))
+      .rejects.toThrow(/context window/);
+    await expect(gatewayApi("providers/reconcile", { method: "PUT", body: "{}" }))
+      .rejects.toThrow(/128000/);
+    await expect(gatewayApi("providers/reconcile", { method: "PUT", body: "{}" }))
+      .rejects.toThrow(/Other Provider/);
+  });
+
+  it("no longer blames a slash for every not found", async () => {
+    // The slash advice was printed on any 404 and told operators to rename ids that
+    // are primary keys referenced by routes, aliases and usage history. Slashes are
+    // now addressable, so the guess is gone.
+    vi.stubGlobal("fetch", vi.fn(() => response({ detail: "Not Found" }, 404)));
+    await expect(gatewayApi("models/does-not-exist/routing")).rejects.toThrow(/Not Found/);
+    await expect(gatewayApi("models/does-not-exist/routing")).rejects.not.toThrow(/rename it without a slash/);
   });
 });

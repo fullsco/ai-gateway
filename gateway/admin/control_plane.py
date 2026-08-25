@@ -1017,44 +1017,6 @@ async def create_model(request: Request, body: ModelInput) -> JSONResponse:
     return JSONResponse({"id": body.id, "aliases": body.aliases}, status_code=201)
 
 
-@router.put("/models/{model_id}")
-async def update_model(model_id: str, request: Request, body: ModelInput) -> JSONResponse:
-    context = await _context(request)
-    if isinstance(context, JSONResponse):
-        return context
-    claims, pool = context
-    if body.id != model_id:
-        return JSONResponse({"error": "model_id_is_immutable"}, status_code=422)
-    row = await pool.fetchrow(
-        """update public.models set display_name=$2,capabilities=$3,enabled=$4,
-                  context_window=$5,updated_at=now() where id=$1
-           returning id,display_name,capabilities,enabled,context_window""",
-        model_id, body.display_name, body.capabilities, body.enabled, body.context_window,
-    )
-    if row is None:
-        return _not_found("model")
-    await pool.execute("delete from public.model_aliases where model_id=$1", model_id)
-    for alias in body.aliases:
-        await pool.execute(
-            "insert into public.model_aliases(alias,model_id) values($1,$2)", alias, model_id
-        )
-    await _audit(pool, claims, "model_updated", "model", model_id, _audit_fields(body))
-    return JSONResponse(jsonable_encoder({**dict(row), "aliases": body.aliases}))
-
-
-@router.delete("/models/{model_id}")
-async def delete_model(model_id: str, request: Request) -> JSONResponse:
-    context = await _context(request)
-    if isinstance(context, JSONResponse):
-        return context
-    claims, pool = context
-    row = await pool.fetchrow("delete from public.models where id=$1 returning id", model_id)
-    if row is None:
-        return _not_found("model")
-    await _audit(pool, claims, "model_deleted", "model", model_id)
-    return JSONResponse({"deleted": True})
-
-
 @router.post("/provider-models")
 async def create_provider_model(
     request: Request,
@@ -1207,7 +1169,7 @@ async def delete_route(route_id: str, request: Request) -> JSONResponse:
     return JSONResponse({"deleted": True})
 
 
-@router.get("/models/{model_id}/routing")
+@router.get("/models/{model_id:path}/routing")
 async def model_routing(model_id: str, request: Request) -> JSONResponse:
     context = await _context(request)
     if isinstance(context, JSONResponse):
@@ -1257,7 +1219,7 @@ async def model_routing(model_id: str, request: Request) -> JSONResponse:
     )
 
 
-@router.put("/models/{model_id}/routing")
+@router.put("/models/{model_id:path}/routing")
 async def update_model_routing(
     model_id: str, request: Request, body: ModelRoutingInput
 ) -> JSONResponse:
@@ -1437,6 +1399,44 @@ async def update_model_routing(
             "strategy": body.strategy,
         }
     )
+
+
+@router.put("/models/{model_id:path}")
+async def update_model(model_id: str, request: Request, body: ModelInput) -> JSONResponse:
+    context = await _context(request)
+    if isinstance(context, JSONResponse):
+        return context
+    claims, pool = context
+    if body.id != model_id:
+        return JSONResponse({"error": "model_id_is_immutable"}, status_code=422)
+    row = await pool.fetchrow(
+        """update public.models set display_name=$2,capabilities=$3,enabled=$4,
+                  context_window=$5,updated_at=now() where id=$1
+           returning id,display_name,capabilities,enabled,context_window""",
+        model_id, body.display_name, body.capabilities, body.enabled, body.context_window,
+    )
+    if row is None:
+        return _not_found("model")
+    await pool.execute("delete from public.model_aliases where model_id=$1", model_id)
+    for alias in body.aliases:
+        await pool.execute(
+            "insert into public.model_aliases(alias,model_id) values($1,$2)", alias, model_id
+        )
+    await _audit(pool, claims, "model_updated", "model", model_id, _audit_fields(body))
+    return JSONResponse(jsonable_encoder({**dict(row), "aliases": body.aliases}))
+
+
+@router.delete("/models/{model_id:path}")
+async def delete_model(model_id: str, request: Request) -> JSONResponse:
+    context = await _context(request)
+    if isinstance(context, JSONResponse):
+        return context
+    claims, pool = context
+    row = await pool.fetchrow("delete from public.models where id=$1 returning id", model_id)
+    if row is None:
+        return _not_found("model")
+    await _audit(pool, claims, "model_deleted", "model", model_id)
+    return JSONResponse({"deleted": True})
 
 
 @router.post("/routing-policies")
