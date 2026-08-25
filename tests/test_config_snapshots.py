@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 
@@ -357,3 +358,68 @@ def test_a_snapshot_that_is_genuinely_broken_is_still_rejected() -> None:
 
     with pytest.raises(ValidationError, match="unknown provider"):
         RuntimeSnapshot.model_validate(dangling)
+
+
+def test_a_changed_routing_policy_is_described() -> None:
+    """Routing weights decide which provider serves a request, so a publish must say.
+
+    The policy is attached to the route in the snapshot, and changing it changes what
+    the gateway does, yet nothing described it: the section reported as changed with
+    nothing listed under it.
+    """
+    def payload(policy: Any) -> dict[str, Any]:
+        return {
+            "providers": [{"id": "p1", "name": "OpenRouter"}],
+            "provider_models": [
+                {
+                    "id": "pm1",
+                    "provider_id": "p1",
+                    "canonical_model_id": "stealth/ox-alpha",
+                    "upstream_model_id": "stealth/ox-alpha",
+                    "routing_policy": policy,
+                }
+            ],
+        }
+
+    changes = summarize_configuration_changes(
+        payload(None), payload({"health_weight": 3, "latency_weight": 1})
+    )
+
+    assert changes, "a routing policy change produced no description"
+    assert "routing policy" in " ".join(entry["summary"] for entry in changes).lower()
+
+
+def test_every_difference_is_described_by_something() -> None:
+    """If the gateway says configuration changed, it must be able to name a change.
+
+    Whether anything changed is decided by comparing whole projections, while what
+    changed is described by per-field tables. The two disagreed whenever a field was
+    added to the payload but not to a table, and the operator was shown "you have
+    unpublished changes" above an empty list, with no way to see what would be
+    published or to get back to a clean state. Publishing was the only way out, which
+    is exactly the action nobody should take blind.
+
+    This asserts the invariant rather than a field: any projection difference yields
+    at least one entry, including for fields that do not exist yet.
+    """
+    published = {
+        "providers": [{"id": "p1", "name": "OpenRouter"}],
+        "provider_models": [{"id": "pm1", "provider_id": "p1", "upstream_model_id": "m"}],
+    }
+    working = {
+        "providers": [{"id": "p1", "name": "OpenRouter"}],
+        "provider_models": [
+            {
+                "id": "pm1",
+                "provider_id": "p1",
+                "upstream_model_id": "m",
+                # A field no summary table knows about, standing in for the next one
+                # somebody adds to the snapshot.
+                "some_future_field": {"enabled": True},
+            }
+        ],
+    }
+
+    assert configuration_checksum(published) != configuration_checksum(working)
+    changes = summarize_configuration_changes(published, working)
+    assert changes, "projections differ but nothing was described"

@@ -761,8 +761,19 @@ function Resource({ view, rows, loading, reload, notify }: { view: ResourceView;
               )}
             </div>
           )}
-          {Boolean(publishState.has_unpublished_changes) && (!Array.isArray(publishState.changes) || (publishState.changes as Row[]).length === 0) && Array.isArray(publishState.changed_sections) && (
-            <span>Changes affect: {(publishState.changed_sections as string[]).join(", ") || "the initial configuration"}.</span>
+          {Boolean(publishState.has_unpublished_changes) && (!Array.isArray(publishState.changes) || (publishState.changes as Row[]).length === 0) && (
+            // The gateway guarantees a claimed change can be named, so this is a
+            // fallback rather than the normal path. It must still be honest: "the
+            // initial configuration" is only true before anything has been published,
+            // and an unitemised difference has to say so rather than imply an empty
+            // draft is reviewable.
+            <span>
+              {publishState.active_version == null
+                ? "Nothing has been published yet. Publishing creates the first snapshot."
+                : Array.isArray(publishState.changed_sections) && (publishState.changed_sections as string[]).length > 0
+                  ? `Changes affect: ${(publishState.changed_sections as string[]).join(", ")}.`
+                  : "The working configuration differs from the published snapshot, but the difference could not be itemised. Review before publishing."}
+            </span>
           )}
         </div>
       )}

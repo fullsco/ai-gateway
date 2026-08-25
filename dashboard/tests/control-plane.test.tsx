@@ -433,3 +433,35 @@ describe("control plane", () => {
     });
   });
 });
+
+describe("draft versus published state", () => {
+  it("does not claim an empty draft is reviewable", async () => {
+    // The gateway guarantees a claimed change can be named, so this is the fallback
+    // path. It previously read "Changes affect: the initial configuration." for any
+    // empty list, which is only true before the first publish and otherwise told the
+    // operator a published snapshot did not exist.
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes("config/status")) {
+        return response({
+          active_version: 7,
+          active_checksum: "a".repeat(64),
+          working_checksum: "b".repeat(64),
+          has_unpublished_changes: true,
+          changed_sections: [],
+          changes: [],
+          change_count: 0,
+          serving_version: 7,
+          serving_published_version: true,
+        });
+      }
+      return response({ data: [] });
+    }));
+
+    render(<ControlPlane />);
+    await userEvent.click(await screen.findByRole("button", { name: /Configuration/i }));
+
+    expect(await screen.findByText(/could not be itemised/i)).toBeInTheDocument();
+    expect(screen.queryByText(/the initial configuration/i)).not.toBeInTheDocument();
+  });
+});

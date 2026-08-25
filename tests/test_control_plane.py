@@ -1305,3 +1305,92 @@ def test_updating_routing_is_not_captured_by_the_greedy_model_update() -> None:
     assert not updated_models, updated_models
     audited = [args for query, args in pool.execute_calls if "audit_logs" in query]
     assert all("model_updated" not in str(args) for args in audited), audited
+
+
+@pytest.mark.asyncio
+async def test_config_status_never_claims_changes_it_cannot_name() -> None:
+    """Draft state has to be reviewable: unpublished changes implies a listed change.
+
+    has_unpublished_changes compares whole projections while changes are produced by
+    per-field tables, so the two disagreed whenever the snapshot gained a field no
+    table described. The dashboard then showed "you have unpublished changes" above an
+    empty review list: nothing to inspect, no way back to a clean state, and
+    publishing blind as the only exit.
+
+    The published payload here is the working snapshot with exactly one field altered,
+    so nothing else can account for the difference.
+    """
+    provider_row = {
+        "id": "provider-1",
+        "name": "OpenRouter",
+        "base_url": "https://openrouter.example",
+        "enabled": True,
+        "priority": 100,
+        "timeout_seconds": 110,
+        "health": "healthy",
+        "settings": {},
+    }
+    model_row = {
+        "id": "model-1",
+        "display_name": "Model One",
+        "enabled": True,
+        "capabilities": [],
+        "context_window": None,
+        "aliases": [],
+    }
+    row = {
+        "id": "mapping-1",
+        "route_id": "route-1",
+        "canonical_model_id": "model-1",
+        "provider_id": "provider-1",
+        "upstream_model_id": "upstream-1",
+        "protocol": "anthropic_messages",
+        "capabilities": [],
+        "priority": 1,
+        "weight": 1,
+        "max_concurrency": 8,
+        "pricing": {},
+        "allow_model_fallback": False,
+        "pool_id": "pool-1",
+        "pool_enabled": True,
+        "active_pool_credential_ids": [],
+        "active_pool_members": "{}",
+        "pool_strategy": "priority",
+        "enabled": True,
+        "routing_policy": {"health_weight": 3},
+    }
+
+    def build_pool() -> SnapshotPool:
+        return (
+            SnapshotPool()
+            .section("provider_models", [dict(row)])
+            .section("providers", [provider_row])
+            .section("models", [model_row])
+        )
+
+    # The published payload is the working snapshot with one field changed back, so the
+    # only difference is the routing policy.
+    published_payload = await _snapshot_payload(build_pool())
+    published_payload["provider_models"][0]["routing_policy"] = None
+
+    pool = build_pool()
+    pool.fetchrow_result = {
+        "id": 7,
+        "checksum": "0" * 64,
+        "payload": published_payload,
+        "published_at": datetime(2026, 1, 1, tzinfo=UTC),
+    }
+
+    with client(pool) as test_client:
+        response = test_client.get("/api/admin/v1/config/status", headers=auth())
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["has_unpublished_changes"] is True, body
+    # The invariant: a claimed change must be nameable.
+    assert body["change_count"] > 0, body
+    assert body["changes"], body
+    assert body["changed_sections"], body
+    assert "routing policy" in " ".join(
+        entry["summary"] for entry in body["changes"]
+    ).lower(), body

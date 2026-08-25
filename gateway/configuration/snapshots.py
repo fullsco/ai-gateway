@@ -95,6 +95,31 @@ def _list_transition(label: str, _before: Any, after: Any) -> str:
     return f"{label} now {values or 'none'}"
 
 
+def _policy_transition(label: str, before: Any, after: Any) -> str:
+    """Name the weights that moved, rather than printing two dictionaries.
+
+    The values are small integers whose meaning is in the field name, so the useful
+    summary is which weights changed and to what.
+    """
+    before = before or {}
+    after = after or {}
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return f"{label} changed"
+    keys = sorted(set(before) | set(after))
+    moved = [
+        f"{key.replace('_', ' ')} {_value(before.get(key))} to {_value(after.get(key))}"
+        for key in keys
+        if before.get(key) != after.get(key)
+    ]
+    if not moved:
+        return ""
+    if not before:
+        return f"{label} set: {', '.join(moved)}"
+    if not after:
+        return f"{label} cleared"
+    return f"{label} {', '.join(moved)}"
+
+
 def _pricing_transition(before: Any, after: Any) -> str:
     before = before or {}
     after = after or {}
@@ -273,6 +298,9 @@ def _route_changes(
         ("timeout_seconds", "timeout in seconds", _transition),
         ("upstream_model_id", "upstream model", _transition),
         ("max_concurrency", "max concurrency", _transition),
+        # Routing weights decide which eligible provider actually serves a request, so
+        # moving them changes behaviour as surely as moving a priority does.
+        ("routing_policy", "routing policy", _policy_transition),
     ]
     for key in sorted(prior.keys() & current.keys()):
         details = _field_changes(prior[key], current[key], specs)
@@ -353,7 +381,7 @@ def summarize_configuration_changes(
     before = configuration_projection(published or {})
     after = configuration_projection(working or {})
     names = _provider_names(before, after)
-    return [
+    described = [
         *_provider_changes(before, after),
         *_credential_changes(before, after, names),
         *_model_changes(before, after),
@@ -361,6 +389,54 @@ def summarize_configuration_changes(
         *_client_changes(before, after),
         *_key_changes(before, after),
     ]
+    if described or before == after:
+        return described
+    # Whether anything changed is decided by comparing whole projections, while what
+    # changed is described by the per-field tables above. Those two answers disagreed
+    # whenever a field was added to the snapshot and not to a table, and the operator
+    # was shown "you have unpublished changes" above an empty list: nothing to review,
+    # no way back to a clean state, and publishing blind as the only way out. Naming
+    # the residual difference generically keeps the two answers consistent for fields
+    # that do not exist yet, so this can never silently recur.
+    return _residual_changes(before, after)
+
+
+def _residual_changes(
+    before: dict[str, Any], after: dict[str, Any]
+) -> list[dict[str, str]]:
+    """Name differences no field table describes, so a difference is never silent."""
+    changes: list[dict[str, str]] = []
+    for section in sorted(set(before) | set(after)):
+        prior, current = before.get(section), after.get(section)
+        if prior == current:
+            continue
+        label = section.replace("_", " ")
+        if not isinstance(prior, list) or not isinstance(current, list):
+            changes.append(_change("updated", "Configuration", f"Changed {label}"))
+            continue
+        prior_rows, current_rows = _index(prior), _index(current)
+        fields = sorted(
+            {
+                field
+                for key in prior_rows.keys() & current_rows.keys()
+                for field in set(prior_rows[key]) | set(current_rows[key])
+                if prior_rows[key].get(field) != current_rows[key].get(field)
+            }
+        )
+        if fields:
+            named = ", ".join(field.replace("_", " ") for field in fields)
+            changes.append(
+                _change("updated", "Configuration", f"Changed {label}: {named}")
+            )
+        elif prior_rows.keys() != current_rows.keys():
+            changes.append(_change("updated", "Configuration", f"Changed {label}"))
+    if not changes:
+        # The projections differ in a way this walk cannot localise, such as row
+        # ordering. Saying so is still better than an empty list.
+        changes.append(
+            _change("updated", "Configuration", "Changed configuration")
+        )
+    return changes
 
 
 class ConfigSnapshot(BaseModel):
