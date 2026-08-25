@@ -162,20 +162,28 @@ async def usage_poll_loop(
     pool_getter,
     encryption_key: str | None,
 ) -> None:
+    """Refresh every observable spend figure, starting immediately.
+
+    The loop used to sleep before its first pass. At the default fifteen minute
+    interval that meant a restart guaranteed quarter-hour-old figures, with no
+    way for an operator to ask for a fresher one: the only thing that writes
+    quota_observed_at is this worker. Since the task is only created once a
+    database pool exists, there is nothing to wait for, so the first pass runs
+    at startup and the interval separates passes rather than delaying the first.
+    """
     while True:
-        await asyncio.sleep(interval_seconds)
         pool = pool_getter()
-        if pool is None or not encryption_key:
-            continue
-        try:
-            await poll_credential_usage(pool, encryption_key)
-        except Exception as exc:  # pragma: no cover - defensive
-            log_event(
-                logger,
-                logging.WARNING,
-                "credential_usage_poll_failed",
-                error_type=type(exc).__name__,
-            )
+        if pool is not None and encryption_key:
+            try:
+                await poll_credential_usage(pool, encryption_key)
+            except Exception as exc:  # pragma: no cover - defensive
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "credential_usage_poll_failed",
+                    error_type=type(exc).__name__,
+                )
+        await asyncio.sleep(interval_seconds)
 
 
 __all__ = ["UsageObservation", "poll_credential_usage", "usage_poll_loop", "USAGE_PATH"]
