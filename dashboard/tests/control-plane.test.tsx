@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import ControlPlane from "../components/control-plane";
@@ -493,5 +493,110 @@ describe("observation freshness", () => {
     expect(screen.getByText(/10 min ago/)).toBeInTheDocument();
     // The fresh one must not be labelled stale.
     expect(screen.getByText(/10 min ago/).textContent).not.toMatch(/stale/);
+  });
+
+  it("shows how old the quota reading is, because that is the figure that exists", async () => {
+    // The age annotation was added to balance_observed_at and quota_observed_at, but
+    // only balance_observed_at was a credentials column, and balance is null on forty
+    // of forty-two credentials. quota_observed_at is populated on all of them and is
+    // days old because the poller is off, so the one age worth reading was the one
+    // never displayed.
+    const stale = new Date(Date.now() - 6 * 24 * 3600 * 1000).toISOString();
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      if (String(input).includes("credentials")) {
+        return response({ data: [
+          { id: "c1", name: "agent-one", provider_name: "AgentRouter", enabled: true, health: "auth_failed",
+            quota_used: "12373.4414", quota_limit: null, quota_confidence: "estimated",
+            quota_observed_at: stale, balance_amount: null, balance_observed_at: null },
+        ] });
+      }
+      return response({ data: [] });
+    }));
+
+    render(<ControlPlane />);
+    await userEvent.click(await screen.findByRole("button", { name: /Credentials/i }));
+
+    expect(await screen.findByText(/6 days ago - stale, may not reflect reality/)).toBeInTheDocument();
+  });
+
+  it("does not print a raw machine timestamp for a cooldown", async () => {
+    // cooldown_until is a timestamp, but the formatting branch keys off keys ending in
+    // _at, so every cooling-down credential showed an unreadable ISO string with
+    // microseconds and an offset.
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      if (String(input).includes("credentials")) {
+        return response({ data: [
+          { id: "c1", name: "cooling", provider_name: "AgentRouter", enabled: true,
+            health: "quota_exhausted", cooldown_until: "2026-08-24T17:03:04.617395+00:00" },
+        ] });
+      }
+      return response({ data: [] });
+    }));
+
+    render(<ControlPlane />);
+    await userEvent.click(await screen.findByRole("button", { name: /Credentials/i }));
+    await screen.findByText("cooling");
+    expect(document.body.textContent).not.toContain("2026-08-24T17:03:04.617395+00:00");
+  });
+
+  it("calls an observation that was never taken unobserved, not unconfigured", async () => {
+    // A missing observation is not a missing setting. "Not configured" implies the
+    // operator failed to fill something in, when the truth is that nothing has ever
+    // recorded a reading.
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      if (String(input).includes("credentials")) {
+        return response({ data: [
+          { id: "c1", name: "never-read", provider_name: "AgentRouter", enabled: true,
+            health: "healthy", balance_amount: null, balance_observed_at: null, quota_observed_at: null },
+        ] });
+      }
+      return response({ data: [] });
+    }));
+
+    render(<ControlPlane />);
+    await userEvent.click(await screen.findByRole("button", { name: /Credentials/i }));
+    const row = (await screen.findByText("never-read")).closest("tr") as HTMLElement;
+    // quota_observed_at, balance_amount and balance_observed_at are all readings, and
+    // all three are absent. A genuinely unset field such as quota_limit still reads
+    // "Not configured", which is correct for a setting.
+    expect(row.textContent?.match(/Not observed/g)).toHaveLength(3);
+  });
+});
+
+describe("recording a credential balance", () => {
+  it("records the balance an operator read from the provider dashboard", async () => {
+    // The gateway cannot discover a balance: the relay reports an identical placeholder
+    // ceiling for every credential and rejects API keys on its own account endpoint. So
+    // the figure is an operator observation, and until now there was no way to enter one.
+    // The column read "Not observed" permanently and topping the account up changed
+    // nothing on screen.
+    const calls: { path: string; method?: string; body?: string }[] = [];
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      calls.push({ path, method: init?.method, body: init?.body ? String(init.body) : undefined });
+      if (path.includes("credentials")) {
+        return response({ data: [
+          { id: "c1", name: "agent-one", provider_name: "AgentRouter", enabled: true,
+            health: "healthy", balance_amount: null, balance_observed_at: null },
+        ] });
+      }
+      return response({ data: [] });
+    }));
+
+    render(<ControlPlane />);
+    await userEvent.click(await screen.findByRole("button", { name: /Credentials/i }));
+    await screen.findByText("agent-one");
+    await userEvent.click(screen.getByRole("button", { name: /Record balance/i }));
+
+    fireEvent.change(await screen.findByLabelText(/Balance remaining/i), { target: { value: "12.5" } });
+    // The row action and the dialog submit share a name, so the click is scoped to the dialog.
+    await userEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: /^Record balance$/i }));
+
+    await waitFor(() => {
+      const put = calls.find((call) => call.method === "PUT" && call.path.includes("/balance"));
+      expect(put).toBeDefined();
+      expect(put?.path).toContain("credentials/c1/balance");
+      expect(JSON.parse(put?.body ?? "{}")).toMatchObject({ amount: 12.5 });
+    });
   });
 });

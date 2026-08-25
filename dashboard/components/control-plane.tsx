@@ -60,8 +60,8 @@ const resources: Record<ResourceView, { endpoint: string; title: string; mutable
       // and whether it will recover on its own. Reading health alone made a
       // provider with 17 usable credentials look like it had 1.
       "name", "provider_name", "masked_hint", "enabled", "routing_state", "health",
-      "quota_used", "quota_limit", "quota_confidence", "balance_amount",
-      "balance_observed_at", "cooldown_until",
+      "quota_used", "quota_limit", "quota_confidence", "quota_observed_at",
+      "balance_amount", "balance_observed_at", "cooldown_until",
     ],
   },
   clients: {
@@ -192,6 +192,9 @@ function display(value: unknown, key: string, row?: Row) {
   if (value === null || value === undefined || value === "") {
     if (key.includes("cooldown")) return "Not cooling down";
     if (key.includes("pricing")) return "Pricing unavailable";
+    // A reading nobody has ever taken is not a setting nobody filled in. Saying
+    // "Not configured" invited an operator to look for the field they had missed.
+    if (OBSERVATION_KEYS.has(key)) return "Not observed";
     return "Not configured";
   }
   if (typeof value === "boolean") return value ? "Enabled" : "Disabled";
@@ -209,7 +212,10 @@ function display(value: unknown, key: string, row?: Row) {
     return "None configured";
   }
   if (typeof value === "object") return "Advanced details available";
-  if (key.endsWith("_at")) {
+  // cooldown_until is as much a timestamp as anything ending in _at, but the suffix
+  // test excluded it, so every cooling-down credential displayed a raw ISO string
+  // with microseconds and a UTC offset.
+  if (key.endsWith("_at") || key.endsWith("_until")) {
     const formatted = new Intl.DateTimeFormat(undefined, {
       dateStyle: "medium",
       timeStyle: "short",
@@ -746,6 +752,7 @@ function Resource({ view, rows, loading, reload, notify }: { view: ResourceView;
         </>
       )}
       {view === "credentials" && <button onClick={() => setEditor({ row: { ...row, __rotate: true } })}>Rotate</button>}
+      {view === "credentials" && <button onClick={() => setEditor({ row: { ...row, __balance: true } })}>Record balance</button>}
       {view === "providers" && <button onClick={() => setProviderSetup(row)}>Configure</button>}
       {view === "clients" && (
         <>
@@ -963,7 +970,7 @@ function ResourceEditor({ view, row, onClose, onSaved }: { view: ResourceView; r
   const [error, setError] = useState("");
   const [references, setReferences] = useState<Record<string, Row[]>>({});
   const [referencesLoading, setReferencesLoading] = useState(true);
-  const editing = !!row?.id && !row.__rotate;
+  const editing = !!row?.id && !row.__rotate && !row.__balance;
   useEffect(() => {
     let active = true;
     Promise.all([api("providers"), api("models"), api("provider-models"), api("routing-policies")])
@@ -995,12 +1002,20 @@ function ResourceEditor({ view, row, onClose, onSaved }: { view: ResourceView; r
     try {
       const body = buildPayload(view, data, row);
       const endpoint = view === "routing" ? "routes" : resources[view].endpoint;
-      const path = row?.__rotate ? `credentials/${row.id}/rotate` : editing ? `${endpoint}/${row?.id}` : endpoint;
+      const path = row?.__rotate
+        ? `credentials/${row.id}/rotate`
+        : row?.__balance
+          ? `credentials/${row.id}/balance`
+          : editing ? `${endpoint}/${row?.id}` : endpoint;
       await api(path, {
-        method: row?.__rotate ? "POST" : editing ? "PUT" : "POST",
+        method: row?.__rotate ? "POST" : row?.__balance ? "PUT" : editing ? "PUT" : "POST",
         body: JSON.stringify(body),
       });
-      await onSaved(row?.__rotate ? "Credential rotated securely." : editing ? "Changes saved." : "Record created.");
+      await onSaved(
+        row?.__rotate ? "Credential rotated securely."
+        : row?.__balance ? "Balance recorded as an operator observation."
+        : editing ? "Changes saved." : "Record created.",
+      );
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Save failed");
       setBusy(false);
@@ -1011,20 +1026,25 @@ function ResourceEditor({ view, row, onClose, onSaved }: { view: ResourceView; r
       <section className="editor" role="dialog" aria-modal="true" aria-labelledby="editor-title">
         <div className="editor-head">
           <div>
-            <h2 id="editor-title">{row?.__rotate ? "Rotate credential" : editing ? `Edit ${resources[view].title}` : `Add ${resources[view].title}`}</h2>
-            <p>{row?.__rotate ? "The replacement secret is encrypted before persistence and is never returned." : "Changes affect the working configuration until published."}</p>
+            <h2 id="editor-title">{row?.__rotate ? "Rotate credential" : row?.__balance ? "Record credential balance" : editing ? `Edit ${resources[view].title}` : `Add ${resources[view].title}`}</h2>
+            <p>{row?.__rotate ? "The replacement secret is encrypted before persistence and is never returned." : row?.__balance ? "The gateway cannot discover a balance: the provider reports an identical placeholder ceiling for every credential. Enter the figure from the provider's own dashboard. It is stored as an operator observation, timestamped on the server, and does not affect routing." : "Changes affect the working configuration until published."}</p>
           </div>
           <button className="icon-button" onClick={onClose} aria-label="Close editor">
             <X size={18} />
           </button>
         </div>
         <form onSubmit={submit}>
-          {referencesLoading && !row?.__rotate ? (
+          {referencesLoading && !row?.__rotate && !row?.__balance ? (
             <div className="loading-state" role="status">
               Loading form options...
             </div>
           ) : row?.__rotate ? (
             <Field name="secret" label="Replacement secret" type="password" required />
+          ) : row?.__balance ? (
+            <>
+              <Field name="amount" label="Balance remaining" type="number" min={0} step="any" defaultValue={row.balance_amount ?? ""} required />
+              <Field name="currency" label="Currency" defaultValue={String(row.balance_currency ?? "USD")} required />
+            </>
           ) : (
             <Fields view={view} row={row} references={references} />
           )}
@@ -1037,8 +1057,8 @@ function ResourceEditor({ view, row, onClose, onSaved }: { view: ResourceView; r
             <button type="button" onClick={onClose}>
               Cancel
             </button>
-            <button className="primary" disabled={busy || referencesLoading}>
-              {busy ? "Saving..." : editing ? "Save changes" : "Create record"}
+            <button className="primary" disabled={busy || (referencesLoading && !row?.__rotate && !row?.__balance)}>
+              {busy ? "Saving..." : row?.__balance ? "Record balance" : editing ? "Save changes" : "Create record"}
             </button>
           </div>
         </form>
@@ -1274,6 +1294,10 @@ function buildPayload(view: ResourceView, data: FormData, row?: Row) {
     }
   };
   if (row?.__rotate) return { secret: value("secret") };
+  // observed_at is deliberately not sent. The server stamps it, because a recorded
+  // figure going stale unnoticed was the original problem and a client-supplied
+  // timestamp can claim to be fresher than it is.
+  if (row?.__balance) return { amount: Number(value("amount")), currency: value("currency").toUpperCase() || "USD" };
   if (view === "providers")
     return {
       name: value("name"),
