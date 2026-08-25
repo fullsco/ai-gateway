@@ -33,6 +33,14 @@ class Settings(BaseSettings):
     quota_hard_threshold: float = Field(default=0.02, ge=0, le=1)
     request_timeout_seconds: float = Field(default=600, gt=0)
     first_event_timeout_seconds: float = Field(default=60, gt=0)
+    # How long a committed stream may go silent before a no-op event is sent to keep
+    # the client connection warm. A CDN in front of the gateway measures its read
+    # timeout between bytes delivered to the client, not between useful ones, so a
+    # model that thinks for longer than that window has its connection killed at the
+    # edge while the gateway and the provider are both still healthy and working. The
+    # client sees a 524, or a stream that stops and cannot be told from a finished one.
+    # Must stay well under the edge timeout; 0 disables and restores raw relaying.
+    stream_keepalive_seconds: float = Field(default=15, ge=0)
     # Some provider edges challenge on the caller's source IP, so a datacenter
     # egress range can be refused no matter what the request looks like. Routing
     # upstream traffic through a proxy with a clean reputation fixes that without

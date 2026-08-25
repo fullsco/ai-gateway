@@ -481,6 +481,7 @@ async def execute_request(
                                 first_chunk,
                                 iterator,
                                 finalizer,
+                                keepalive_seconds=settings.stream_keepalive_seconds,
                             ),
                             status_code=200,
                             media_type="text/event-stream",
@@ -802,6 +803,20 @@ async def _close_response(response: httpx.Response | None) -> None:
         await response.aclose()
 
 
+def _stream_keepalive_frame(protocol: ClientProtocol) -> bytes:
+    """A no-op event that advances the byte clock without adding client-visible content.
+
+    Anthropic's own streaming API emits `ping`, so Anthropic clients already ignore it.
+    For the OpenAI protocols an SSE comment is used: the wire format reserves any line
+    beginning with a colon as a comment, and it is discarded before a client ever sees
+    a chunk, so no parser has to learn a new event type and no `data:` frame is
+    fabricated that could be mistaken for model output.
+    """
+    if protocol is ClientProtocol.ANTHROPIC_MESSAGES:
+        return b"event: ping\ndata: {}\n\n"
+    return b": keepalive\n\n"
+
+
 def _terminal_stream_error(protocol: ClientProtocol, message: str) -> bytes:
     """A last event telling the client the stream ended abnormally.
 
@@ -816,20 +831,70 @@ def _terminal_stream_error(protocol: ClientProtocol, message: str) -> bytes:
     return f"data: {json.dumps(payload)}\n\ndata: [DONE]\n\n".encode()
 
 
+_STREAM_EXHAUSTED = object()
+_EVENT_BOUNDARIES = (b"\n\n", b"\r\n\r\n")
+
+
+def _ends_on_event_boundary(chunk: bytes) -> bool:
+    """Whether the bytes relayed so far leave the client between two SSE events.
+
+    The upstream body arrives as raw network chunks, which are under no obligation to
+    align to event boundaries: a single event can straddle two reads. Injecting
+    anything while the client is part-way through one would splice a keepalive into the
+    middle of a half-written frame and break the parse, turning a liveness fix into
+    corruption. Sending nothing is always safe; sending at the wrong moment is not.
+    """
+    return chunk.endswith(_EVENT_BOUNDARIES)
+
+
+async def _next_stream_chunk(iterator: AsyncIterator[bytes]) -> object:
+    """`anext` in a form that is safe to wrap in a task and await more than once.
+
+    StopAsyncIteration must not be allowed to escape either a task or an async
+    generator: PEP 479 converts it into a RuntimeError raised several frames away from
+    the cause, which would surface as a gateway fault rather than a finished stream.
+    """
+    try:
+        return await anext(iterator)
+    except StopAsyncIteration:
+        return _STREAM_EXHAUSTED
+
+
 async def _stream_response(
     first_chunk: bytes,
     iterator: AsyncIterator[bytes],
     finalizer: "_StreamFinalizer",
+    keepalive_seconds: float = 0,
 ) -> AsyncIterator[bytes]:
     completed = False
     error: ProviderError | None = None
+    pending: asyncio.Task[object] | None = None
     try:
         finalizer.usage.feed(first_chunk)
         yield first_chunk
-        async for chunk in iterator:
+        at_boundary = _ends_on_event_boundary(first_chunk)
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(_next_stream_chunk(iterator))
+            if keepalive_seconds > 0:
+                done, _ = await asyncio.wait({pending}, timeout=keepalive_seconds)
+                if not done:
+                    # The same task is awaited again on the next pass rather than being
+                    # cancelled and reissued, so a chunk that arrives during a keepalive
+                    # tick is never dropped and the upstream read is never restarted.
+                    if at_boundary:
+                        yield _stream_keepalive_frame(finalizer.protocol)
+                    continue
+            chunk = await pending
+            pending = None
+            if chunk is _STREAM_EXHAUSTED:
+                completed = True
+                break
+            # Only real upstream bytes are metered. Keepalives are never fed to the
+            # usage parser, so token accounting and cost are bit-for-bit unchanged.
             finalizer.usage.feed(chunk)
             yield chunk
-        completed = True
+            at_boundary = _ends_on_event_boundary(chunk)
     except (httpx.StreamError, httpx.HTTPError) as exc:
         # The upstream stopped mid-body. This used to escape the generator and reach
         # uvicorn as an unhandled ASGI exception, which logged a traceback implying a
@@ -851,6 +916,12 @@ async def _stream_response(
         )
         yield _terminal_stream_error(finalizer.protocol, error.message)
     finally:
+        # A client that disconnects mid-stream throws in at a yield, leaving the
+        # upstream read outstanding. Without this it survives as an orphaned task
+        # holding the connection and is reported as "Task was destroyed but it is
+        # pending" long after the request is gone.
+        if pending is not None and not pending.done():
+            pending.cancel()
         await finalizer.finish(completed, error=error)
 
 

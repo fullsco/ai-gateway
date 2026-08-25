@@ -294,3 +294,153 @@ def test_an_upstream_that_truncates_a_stream_is_blamed_for_it() -> None:
     assert response.status_code == 200
     assert b"upstream_truncated" in response.content
     assert b"message_start" in response.content
+
+
+def test_stream_keepalive_holds_connection_open_during_upstream_silence():
+    """A model that thinks longer than the edge read timeout must not be cut off.
+
+    Cloudflare measures proxy_read_timeout between bytes delivered to the client, and
+    on this Free zone it is 125s and not editable. An upstream that goes quiet for
+    longer than that has its client connection killed by the edge while the gateway
+    and the provider are both still healthy and still working. The client sees a 524,
+    or worse a stream that simply stops and is indistinguishable from a complete one.
+    Production ran 9.2% of attempts past 120s and paid $21 in one day for answers it
+    could not deliver.
+
+    A no-op event keeps the byte clock alive without adding anything the client has to
+    understand: Anthropic's own API sends `ping`, so its clients already ignore it.
+    """
+
+    class SilentThenFinishes(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"event: message_start\ndata: {}\n\n"
+            await asyncio.sleep(0.25)
+            yield b"event: message_stop\ndata: {}\n\n"
+
+        async def aclose(self) -> None:
+            return None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=SilentThenFinishes(),
+        )
+
+    runtime, key = make_runtime(handler)
+    app = create_app(
+        Settings(environment="test", stream_keepalive_seconds=0.05, _env_file=None),
+        runtime,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": key},
+            json={"model": "model-x", "stream": True, "messages": []},
+        )
+
+    assert response.status_code == 200
+    # The connection was kept warm across the silence.
+    assert b"event: ping" in response.content
+    # Real events are still relayed, in order, and the stream still completes.
+    assert b"message_start" in response.content
+    assert b"message_stop" in response.content
+    assert response.content.index(b"message_start") < response.content.index(b"event: ping")
+    assert response.content.index(b"event: ping") < response.content.index(b"message_stop")
+
+
+def test_stream_keepalive_never_splices_into_a_partial_event():
+    """A stall part-way through an event must not have a keepalive spliced into it.
+
+    The upstream body arrives as raw network chunks and an event can straddle two of
+    them. Injecting during that gap would produce `data: {"usa` + `event: ping`, which
+    no client can parse, so a liveness fix would become a corruption bug. The keepalive
+    is therefore only ever emitted while the client sits on an event boundary.
+    """
+
+    class StallsMidEvent(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"event: message_start\ndata: {}\n\n"
+            yield b'event: message_delta\ndata: {"par'   # deliberately unterminated
+            await asyncio.sleep(0.25)
+            yield b'tial": true}\n\nevent: message_stop\ndata: {}\n\n'
+
+        async def aclose(self) -> None:
+            return None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, stream=StallsMidEvent()
+        )
+
+    runtime, key = make_runtime(handler)
+    app = create_app(
+        Settings(environment="test", stream_keepalive_seconds=0.05, _env_file=None),
+        runtime,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": key},
+            json={"model": "model-x", "stream": True, "messages": []},
+        )
+
+    assert response.status_code == 200
+    # The split event is reassembled exactly as sent, with nothing injected into it.
+    assert b'event: message_delta\ndata: {"partial": true}\n\n' in response.content
+    assert b'{"par' + b"event: ping" not in response.content
+    assert response.content.endswith(b"event: message_stop\ndata: {}\n\n")
+
+
+def test_stream_keepalive_does_not_alter_recorded_usage():
+    """Keepalives must not reach the usage parser or the bill changes.
+
+    Cost is derived by feeding relayed bytes to a streaming SSE usage extractor. If
+    synthetic frames were fed in alongside real ones they would shift the parser's
+    buffer and could drop the `message_delta` carrying the token counts, which is
+    silent: the request records as having cost nothing.
+    """
+    usage_event = (
+        b"event: message_delta\n"
+        b'data: {"usage": {"input_tokens": 11, "output_tokens": 7}}\n\n'
+    )
+
+    class SilentBeforeUsage(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"event: message_start\ndata: {}\n\n"
+            await asyncio.sleep(0.25)          # forces several keepalives
+            yield usage_event
+            yield b"event: message_stop\ndata: {}\n\n"
+
+        async def aclose(self) -> None:
+            return None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, stream=SilentBeforeUsage()
+        )
+
+    def run(keepalive: float) -> bytes:
+        runtime, key = make_runtime(handler)
+        app = create_app(
+            Settings(environment="test", stream_keepalive_seconds=keepalive, _env_file=None),
+            runtime,
+        )
+        with TestClient(app) as client:
+            return client.post(
+                "/v1/messages",
+                headers={"x-api-key": key},
+                json={"model": "model-x", "stream": True, "messages": []},
+            ).content
+
+    with_keepalive = run(0.05)
+    without_keepalive = run(0)
+
+    assert b"event: ping" in with_keepalive
+    assert b"event: ping" not in without_keepalive
+    # Stripping the synthetic frames reproduces the untouched byte stream exactly, so
+    # everything the usage parser is fed is identical with the feature on and off.
+    assert with_keepalive.replace(b"event: ping\ndata: {}\n\n", b"") == without_keepalive
+    assert usage_event in with_keepalive
