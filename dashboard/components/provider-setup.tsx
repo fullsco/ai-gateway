@@ -92,6 +92,10 @@ type MappingDraft = {
   route_priority: string; allow_model_fallback: boolean;
 };
 
+// The select value that means "an id the catalogue does not hold yet". It is not a
+// legal model id, so it cannot collide with a real one.
+const NEW_MODEL = "__new__";
+
 const capabilities = [
   ["streaming", "Streaming"], ["tool_calling", "Tool calling"], ["reasoning", "Reasoning"],
   ["vision", "Vision"], ["structured_output", "Structured output"], ["computer_use", "Computer use"],
@@ -264,6 +268,19 @@ export default function ProviderSetup({ provider, onClose, onSaved }: { provider
   // canonical fields then describe what the catalogue already holds, so saving cannot
   // trip the shared-model guard, and the operator is not asked to retype an id that
   // has to match character for character.
+  const catalogueHas = (modelId: string) => catalogue.some((known) => text(known.id) === modelId.trim());
+
+  // A select is the choice made visible, but it cannot express an id that does not
+  // exist yet, so adding a model is an option of its own that reveals a text field
+  // rather than a free-text box that only sometimes offers suggestions.
+  const chooseModel = (index: number, chosen: string) => {
+    if (chosen === NEW_MODEL) {
+      updateMapping(index, { model_id: "" });
+      return;
+    }
+    selectCatalogueModel(index, chosen);
+  };
+
   const selectCatalogueModel = (index: number, modelId: string) => {
     const known = catalogue.find((item) => text(item.id) === modelId);
     if (!known) {
@@ -391,7 +408,7 @@ export default function ProviderSetup({ provider, onClose, onSaved }: { provider
        <fieldset disabled={busy}><legend>Models and routes</legend><div className="subsection-head"><p>Choose the models this provider serves, then set its primary or fallback position. Internal mappings are generated automatically.</p><button type="button" onClick={() => setMappings((items) => [...items, emptyMapping()])}><Plus size={14} />Model</button></div>
         <div className="mapping-list">{mappings.map((item, index) => <article className="mapping-card" key={index}>
           <div className="mapping-card-head"><strong>{item.model_id || `Mapping ${index + 1}`}</strong><button type="button" className="icon-button danger" onClick={() => setMappings((items) => items.filter((_, position) => position !== index))} aria-label={`Remove mapping ${item.model_id || index + 1}`}><Trash2 size={15} /></button></div>
-           <div className="provider-grid"><label className="field"><span>Model ID</span><input value={item.model_id} list={`model-catalogue-${index}`} onChange={(event) => selectCatalogueModel(index, event.target.value)} required /><datalist id={`model-catalogue-${index}`}>{catalogue.map((known) => <option value={text(known.id)} key={text(known.id)}>{text(known.display_name, text(known.id))}</option>)}</datalist><small>{catalogue.some((known) => text(known.id) === item.model_id.trim()) ? "Existing catalogue model. Its shared details are filled in below and are edited for every provider at once." : "Pick an existing model, or type a new id to add one. Clients use this name to request the model."}</small></label><label className="field"><span>Model display name</span><input value={item.display_name} onChange={(event) => updateMapping(index, { display_name: event.target.value })} required /></label>
+           <div className="provider-grid"><label className="field"><span>Catalogue model</span><select value={catalogueHas(item.model_id) ? item.model_id.trim() : NEW_MODEL} onChange={(event) => chooseModel(index, event.target.value)}>{catalogue.map((known) => <option value={text(known.id)} key={text(known.id)}>{text(known.display_name, text(known.id))}</option>)}<option value={NEW_MODEL}>Add a new model...</option></select><small>{catalogueHas(item.model_id) ? "Existing catalogue model. Its shared details are filled in below and are edited for every provider at once." : "Choose a model this provider already serves, or add a new one. Clients use this name to request the model."}</small></label>{!catalogueHas(item.model_id) && <label className="field"><span>New model ID</span><input value={item.model_id} onChange={(event) => selectCatalogueModel(index, event.target.value)} required /><small>The name clients use to request the model. It must not already exist in the catalogue.</small></label>}<label className="field"><span>Model display name</span><input value={item.display_name} onChange={(event) => updateMapping(index, { display_name: event.target.value })} required /></label>
           <label className="field"><span>Aliases (comma separated)</span><input value={item.aliases} onChange={(event) => updateMapping(index, { aliases: event.target.value })} /></label><label className="field"><span>Context window</span><input type="number" min="1" step="1" value={item.context_window} onChange={(event) => updateMapping(index, { context_window: event.target.value })} /></label>
            <label className="field"><span>Provider model ID</span><input value={item.upstream_model_id} onChange={(event) => updateMapping(index, { upstream_model_id: event.target.value })} required /><small>The provider's name for this model.</small></label><label className="field"><span>Protocol</span><select value={item.protocol} onChange={(event) => updateMapping(index, { protocol: event.target.value })}>{protocols.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select><small>How requests are sent upstream.</small></label>
            <label className="field"><span>Provider priority</span><input type="number" min="0" step="1" value={item.priority} onChange={(event) => updateMapping(index, { priority: event.target.value })} /><small>Lower values are preferred.</small></label><label className="field"><span>Traffic share</span><input type="number" min="0.001" step="any" value={item.weight} onChange={(event) => updateMapping(index, { weight: event.target.value })} /><small>Used when multiple routes are eligible.</small></label><label className="field"><span>Concurrent request limit</span><input type="number" min="1" step="1" value={item.max_concurrency} onChange={(event) => updateMapping(index, { max_concurrency: event.target.value })} /></label>

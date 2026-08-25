@@ -40,7 +40,8 @@ describe("provider setup", () => {
     fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "https://new.example" } });
     fireEvent.change(screen.getByLabelText("Label"), { target: { value: "primary" } });
     fireEvent.change(screen.getByLabelText("Secret"), { target: { value: "secret-value" } });
-    fireEvent.change(screen.getByLabelText(/^Model ID/), { target: { value: "model-new" } });
+    await userEvent.selectOptions(screen.getByLabelText(/^Catalogue model/), "__new__");
+    fireEvent.change(screen.getByLabelText(/^New model ID/), { target: { value: "model-new" } });
     fireEvent.change(screen.getByLabelText("Model display name"), { target: { value: "Model New" } });
     fireEvent.change(screen.getByLabelText(/^Provider model ID/), { target: { value: "upstream-new" } });
     await userEvent.selectOptions(screen.getByLabelText("Selection strategy"), "least_loaded");
@@ -162,22 +163,50 @@ describe("provider setup", () => {
 });
 
 describe("model selection", () => {
-  it("offers existing catalogue models when adding a provider", async () => {
-    // Adding a provider is exactly when an existing model must be attachable, and the
-    // provider-scoped hydration returns early with no provider id, so the catalogue is
-    // loaded independently or the picker is empty in the flow that needs it most.
+  it("offers existing catalogue models as a real select", async () => {
+    // The picker was an <input list> backed by a <datalist>. A datalist is a typeahead
+    // hint, not a control: it renders no affordance that a list exists, and on mobile
+    // browsers the suggestions frequently never appear at all, which is indistinguishable
+    // from the field being broken. A native select is the same choice made visible, and
+    // works in every browser.
     vi.stubGlobal("fetch", fetchForWorkspace());
     render(<ProviderSetup onClose={vi.fn()} onSaved={vi.fn(async () => undefined)} />);
 
-    const field = screen.getByLabelText(/^Model ID/);
-    expect(field).toHaveAttribute("list");
-    // datalist options are not exposed with an option role in jsdom, so the list is
-    // inspected directly.
-    await waitFor(() => {
-      const listId = field.getAttribute("list") ?? "";
-      const options = document.querySelectorAll(`#${listId} option`);
-      expect(Array.from(options).map((node) => node.getAttribute("value"))).toContain("model-1");
+    const field = await waitFor(() => {
+      const node = screen.getByLabelText(/^Catalogue model/);
+      expect(node.tagName).toBe("SELECT");
+      return node as HTMLSelectElement;
     });
+    // Real options, discoverable by role, unlike datalist entries.
+    await waitFor(() => {
+      const values = Array.from(field.querySelectorAll("option")).map((node) => node.getAttribute("value"));
+      expect(values).toContain("model-1");
+    });
+    expect(screen.getByRole("option", { name: /Model One/ })).toBeInTheDocument();
+  });
+
+  it("adds a brand new model through an explicit choice rather than free typing", async () => {
+    // A select cannot express "an id that does not exist yet", so the new-model path is
+    // an option of its own that reveals a text field. Without it, switching to a select
+    // would remove the ability to onboard a model the gateway has never seen.
+    let payload: GatewayRow = {};
+    vi.stubGlobal("fetch", fetchForWorkspace((value) => { payload = value; }));
+    render(<ProviderSetup onClose={vi.fn()} onSaved={vi.fn(async () => undefined)} />);
+    await waitFor(() => expect(screen.getByLabelText(/^Catalogue model/).querySelectorAll("option").length).toBeGreaterThan(1));
+
+    fireEvent.change(screen.getByLabelText("Provider name"), { target: { value: "New Provider" } });
+    fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "https://new.example" } });
+    fireEvent.change(screen.getByLabelText("Label"), { target: { value: "primary" } });
+    fireEvent.change(screen.getByLabelText("Secret"), { target: { value: "secret-value" } });
+
+    await userEvent.selectOptions(screen.getByLabelText(/^Catalogue model/), "__new__");
+    fireEvent.change(screen.getByLabelText(/^New model ID/), { target: { value: "model-new" } });
+    fireEvent.change(screen.getByLabelText("Model display name"), { target: { value: "Model New" } });
+    fireEvent.change(screen.getByLabelText(/^Provider model ID/), { target: { value: "upstream-new" } });
+    await userEvent.click(screen.getByRole("button", { name: "Create provider workspace" }));
+
+    await waitFor(() => expect(payload.models).toBeDefined());
+    expect(payload.models).toMatchObject([{ id: "model-new", display_name: "Model New" }]);
   });
 
   it("adopts the stored metadata of a selected model so the shared guard cannot fire", async () => {
@@ -187,13 +216,13 @@ describe("model selection", () => {
     let payload: GatewayRow = {};
     vi.stubGlobal("fetch", fetchForWorkspace((value) => { payload = value; }));
     render(<ProviderSetup onClose={vi.fn()} onSaved={vi.fn(async () => undefined)} />);
-    await waitFor(() => expect(document.querySelectorAll("datalist option").length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getByLabelText(/^Catalogue model/).querySelectorAll("option").length).toBeGreaterThan(1));
 
     fireEvent.change(screen.getByLabelText("Provider name"), { target: { value: "New Provider" } });
     fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "https://new.example" } });
     fireEvent.change(screen.getByLabelText("Label"), { target: { value: "primary" } });
     fireEvent.change(screen.getByLabelText("Secret"), { target: { value: "secret-value" } });
-    fireEvent.change(screen.getByLabelText(/^Model ID/), { target: { value: "model-1" } });
+    await userEvent.selectOptions(screen.getByLabelText(/^Catalogue model/), "model-1");
     await userEvent.click(screen.getByRole("button", { name: "Create provider workspace" }));
 
     await waitFor(() => expect(payload.models).toBeDefined());
