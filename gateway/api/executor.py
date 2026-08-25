@@ -325,7 +325,9 @@ async def execute_request(
                 upstream.url,
                 headers=upstream.headers,
                 json=upstream.json_body,
-                timeout=upstream.timeout,
+                timeout=_clamp_timeout_to_deadline(
+                    upstream.timeout, deadline, stream=normalized.stream
+                ),
             )
         except Exception as exc:
             lease.release()
@@ -796,6 +798,40 @@ def _map_upstream_model(request: NormalizedRequest, upstream_model: str) -> Norm
     payload = deepcopy(request.payload)
     payload["model"] = upstream_model
     return request.model_copy(update={"payload": payload})
+
+
+def _clamp_timeout_to_deadline(
+    timeout: httpx.Timeout, deadline: datetime, *, stream: bool
+) -> httpx.Timeout:
+    """Hold an attempt to whatever is left of the request's budget.
+
+    request_timeout_seconds only ever decided whether a *new* attempt could start, so
+    an attempt beginning a moment before the deadline still received the provider's
+    full timeout. The real ceiling was therefore max_attempts x provider_timeout, and
+    production logged a request that ran 545s over three attempts while the caller had
+    been disconnected since the edge cut it at 125s: every one of those seconds was
+    billed for an answer that could not be delivered.
+
+    read is treated differently for the two response shapes, because httpx means two
+    different things by it. On a buffered response it bounds the wait for the body, so
+    it is the only thing standing between a slow provider and an edge timeout the
+    gateway cannot see, and it is clamped. On a streaming response it bounds the gap
+    between chunks rather than the whole body, so clamping it would abort long healthy
+    answers -- the very thing the keepalive exists to keep alive -- and it is left at
+    the provider's value to bound silence instead. A stream may therefore outlive the
+    budget on purpose; the budget still gates whether another attempt may begin.
+    """
+    remaining = max(0.0, (deadline - datetime.now(UTC)).total_seconds())
+    return httpx.Timeout(
+        connect=_min_optional(timeout.connect, remaining),
+        read=timeout.read if stream else _min_optional(timeout.read, remaining),
+        write=_min_optional(timeout.write, remaining),
+        pool=timeout.pool,
+    )
+
+
+def _min_optional(value: float | None, limit: float) -> float:
+    return limit if value is None else min(value, limit)
 
 
 async def _close_response(response: httpx.Response | None) -> None:

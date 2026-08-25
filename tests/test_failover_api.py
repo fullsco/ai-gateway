@@ -444,3 +444,86 @@ def test_stream_keepalive_does_not_alter_recorded_usage():
     # everything the usage parser is fed is identical with the feature on and off.
     assert with_keepalive.replace(b"event: ping\ndata: {}\n\n", b"") == without_keepalive
     assert usage_event in with_keepalive
+
+
+def test_attempt_timeout_is_clamped_to_the_remaining_request_budget():
+    """No attempt may be allowed to run past the deadline the request was given.
+
+    request_timeout_seconds only ever gated whether a *new* attempt could start
+    (`now < deadline`), never how long one could run. An attempt begun one second
+    before the deadline still got the provider's full timeout, so the real ceiling was
+    max_attempts x provider_timeout -- 1800s against a 125s edge -- and production
+    logged a single request that ran 545s across three attempts, spending money on all
+    three for a caller that had been disconnected since 125s.
+    """
+    attempt_timeouts: list[float] = []
+
+    class NeverAnswers(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            await asyncio.sleep(30)
+            yield b"never"
+
+        async def aclose(self) -> None:
+            return None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempt_timeouts.append(request.extensions["timeout"]["read"])
+        raise httpx.ConnectTimeout("upstream did not answer", request=request)
+
+    runtime, key = make_runtime(handler, alternate_route=True)
+    # A budget far smaller than the provider's own timeout, which make_runtime leaves
+    # at its default, so any attempt that ignored the budget is obvious.
+    app = create_app(
+        Settings(environment="test", request_timeout_seconds=2, _env_file=None),
+        runtime,
+    )
+
+    with TestClient(app) as client:
+        client.post(
+            "/v1/messages",
+            headers={"x-api-key": key},
+            json={"model": "model-x", "messages": []},
+        )
+
+    assert attempt_timeouts, "no upstream attempt was made"
+    # No attempt may be handed a ceiling that reaches past the deadline. Before the
+    # clamp each of these was the provider's full 600s against a 2s budget.
+    assert all(t <= 2 for t in attempt_timeouts), attempt_timeouts
+    # The ceiling tracks the budget as it is spent, so it never grows between attempts.
+    assert attempt_timeouts == sorted(attempt_timeouts, reverse=True), attempt_timeouts
+
+
+def test_streaming_attempt_keeps_the_provider_read_timeout():
+    """A stream's read timeout bounds silence, not length, so it must not be clamped.
+
+    httpx applies read between chunks on a streaming response rather than to the whole
+    body. Clamping it to the remaining budget would cut off long healthy answers at the
+    budget -- the exact failure the keepalive exists to prevent -- so a stream is
+    allowed to outrun the budget while the budget still gates further attempts.
+    """
+    seen: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions["timeout"]["read"])
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=BytesStream([b"event: message_stop\ndata: {}\n\n"]),
+        )
+
+    runtime, key = make_runtime(handler)
+    app = create_app(
+        Settings(environment="test", request_timeout_seconds=2, _env_file=None),
+        runtime,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": key},
+            json={"model": "model-x", "stream": True, "messages": []},
+        )
+
+    assert response.status_code == 200
+    # The provider's own read timeout survives, rather than being cut to the 2s budget.
+    assert seen == [600], seen
