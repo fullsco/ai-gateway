@@ -476,7 +476,26 @@ export default function ControlPlane() {
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   const [notice, setNotice] = useState<Notice>(null);
   const [navOpen, setNavOpen] = useState(false);
+  const [draftState, setDraftState] = useState<Row | null>(null);
   const sequence = useRef(0);
+
+  // Every view needs to know whether working changes are waiting for a publish:
+  // saving a provider and wondering why nothing changed is the same trip to the
+  // Configuration page every time. The rich diff stays on Configuration; this is
+  // just the fact that a publish is pending, everywhere.
+  useEffect(() => {
+    let active = true;
+    void api("config/status")
+      .then((status) => {
+        if (active) setDraftState(status);
+      })
+      .catch(() => {
+        if (active) setDraftState(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [view, updatedAt]);
 
   async function load(target = view, quiet = false) {
     const request = ++sequence.current;
@@ -571,6 +590,22 @@ export default function ControlPlane() {
             {loading ? "Refreshing" : "Refresh"}
           </button>
         </header>
+        {view !== "configuration" && Number(draftState?.has_unpublished_changes ?? 0) === 1 && (
+          <div className="notice draft" role="status">
+            <span>
+              You have unpublished changes. The gateway is still serving the last published
+              snapshot - nothing you saved is live yet.
+            </span>
+            <button
+              onClick={() => {
+                setView("configuration");
+                window.history.pushState(null, "", "/?view=configuration");
+              }}
+            >
+              Review &amp; publish
+            </button>
+          </div>
+        )}
         {notice && (
           <div className={`notice ${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"}>
             <span>{notice.message}</span>

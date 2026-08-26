@@ -49,6 +49,8 @@ header p, .section-head p, .editor-head p { color: var(--muted); font-size: 12px
 .notice { border: 1px solid var(--line); padding: 11px 13px; margin-block-end: 18px; display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 13px; }
 .notice.error, .form-error { border-color: #9c5d48; color: #ffd2c0; background: #2c1d19; }
 .notice.success { border-color: #4d7a5d; color: #bce3c9; background: #17251c; }
+.notice.draft { border-color: #8a6d3a; color: #ecd9ac; background: #26200f; }
+.notice.draft button { white-space: nowrap; }
 .publish-state { border: 1px solid var(--line); padding: 12px 14px; margin-block-end: 18px; display: grid; gap: 4px; font-size: 12px; }
 .publish-state span { color: var(--muted); }
 .publish-state.draft { border-color: #9a6d24; background: #2b2315; }

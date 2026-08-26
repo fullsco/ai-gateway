@@ -655,3 +655,38 @@ describe("recording a credential balance", () => {
     });
   });
 });
+
+describe("unpublished changes banner", () => {
+  it("warns on every view and offers a direct path to publish", async () => {
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes("config/status")) return response({ has_unpublished_changes: true, active_version: 31, changes: [], change_count: 0 });
+      if (path.includes("config/versions")) return response({ data: [] });
+      if (path.includes("providers")) return response({ data: [{ id: "one", name: "AgentRouter", enabled: true }] });
+      return response(overview);
+    }));
+    render(<ControlPlane />);
+
+    // The banner is not scoped to the Configuration view - that scoping is what
+    // let saves pile up unpublished while every other screen looked settled.
+    await userEvent.click(screen.getByRole("button", { name: "Providers" }));
+    expect(await screen.findByText(/You have unpublished changes/)).toBeVisible();
+    expect(screen.getByText(/still serving the last published snapshot/i)).toBeVisible();
+
+    await userEvent.click(screen.getByRole("button", { name: "Review & publish" }));
+    expect(await screen.findByRole("heading", { name: "Configuration" })).toBeVisible();
+  });
+
+  it("stays quiet when the working configuration matches production", async () => {
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes("config/status")) return response({ has_unpublished_changes: false, active_version: 31 });
+      if (path.includes("providers")) return response({ data: [] });
+      return response(overview);
+    }));
+    render(<ControlPlane />);
+    await userEvent.click(screen.getByRole("button", { name: "Providers" }));
+    expect(await screen.findByText("AgentRouter").catch(() => screen.findByText(/Updated/i))).toBeVisible();
+    expect(screen.queryByText(/You have unpublished changes/)).not.toBeInTheDocument();
+  });
+});

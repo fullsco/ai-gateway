@@ -264,3 +264,68 @@ describe("model selection", () => {
     await expect(gatewayApi("models/does-not-exist/routing")).rejects.not.toThrow(/rename it without a slash/);
   });
 });
+
+describe("publish refusal clarity", () => {
+  it("names stranded models and the way out when publish would strand them", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => response({
+      error: "publish_would_strand_models",
+      message: "some enabled models have no route in this snapshot",
+      models: ["deepseek-v4-flash"],
+    }, 409)));
+
+    await expect(gatewayApi("config/publish", { method: "POST" }))
+      .rejects.toThrow(/stranded: "deepseek-v4-flash"/);
+    await expect(gatewayApi("config/publish", { method: "POST" }))
+      .rejects.toThrow(/Open Models and either disable or delete/);
+  });
+
+  it("prefers the server's sentence over the bare error code", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => response({
+      error: "provider_has_dependents",
+      message: "Deleting this provider would also remove configuration that active models depend on.",
+    }, 409)));
+
+    await expect(gatewayApi("providers/p-1", { method: "DELETE" }))
+      .rejects.toThrow(/remove configuration that active models depend on/);
+    await expect(gatewayApi("providers/p-1", { method: "DELETE" }))
+      .rejects.not.toThrow(/provider_has_dependents/);
+  });
+});
+
+describe("duplicate mapping guard", () => {
+  it("blocks the save and names the duplicate instead of a round-trip refusal", async () => {
+    const fetchMock = fetchForWorkspace();
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ProviderSetup provider={provider} onClose={vi.fn()} onSaved={vi.fn(async () => undefined)} />);
+
+    // Hydrate, then add a second card describing the exact same combination.
+    expect(await screen.findByDisplayValue("latest, fast")).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Model" }));
+    // Only the new card renders a "New model ID" input; card 1 uses the select.
+    const newIds = screen.getAllByLabelText(/^New model ID/);
+    const names = screen.getAllByLabelText("Model display name");
+    const upstreams = screen.getAllByLabelText(/^Provider model ID/);
+    fireEvent.change(newIds[newIds.length - 1], { target: { value: "model-1" } });
+    fireEvent.change(names[names.length - 1], { target: { value: "Model One" } });
+    fireEvent.change(upstreams[upstreams.length - 1], { target: { value: "upstream-1" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Save provider workspace" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/Two mappings describe the same model "model-1"/);
+    expect(fetchMock).not.toHaveBeenCalledWith(expect.stringContaining("providers/reconcile"), expect.anything());
+  });
+});
+
+describe("scratch hydrate copy", () => {
+  it("copies the proven hydrate pattern verbatim", async () => {
+    vi.stubGlobal("fetch", fetchForWorkspace());
+    const onClose = vi.fn();
+    render(<ProviderSetup provider={provider} onClose={onClose} onSaved={vi.fn(async () => undefined)} />);
+    try {
+      expect(await screen.findByDisplayValue("latest, fast")).toBeVisible();
+    } catch (error) {
+      console.log("HYDRATE FAILED:", (error as Error).message.slice(0, 200));
+      throw error;
+    }
+  });
+});

@@ -70,10 +70,24 @@ export async function gatewayApi(path: string, init?: RequestInit) {
     const reason = typeof data.reason === "string" ? RECONCILE_REASONS[data.reason] ?? data.reason.replaceAll("_", " ") : "";
     const primary = readable(data.error);
     const explained = primary && reason ? `${primary}: ${reason}` : primary || reason;
+    if (data.error === "publish_would_strand_models") {
+      // The guard names exactly which models would be left with no route. An
+      // operator who only reads "would strand models" still has to hunt for the
+      // list, so repeat it here with what to do about each one.
+      const names = Array.isArray(data.models) ? data.models.map((model: unknown) => `"${String(model)}"`).join(", ") : "";
+      throw new Error(
+        `Publish refused: ${data.message ?? "some enabled models would have no provider route"}` +
+          (names ? ` - stranded: ${names}.` : ".") +
+          ` Open Models and either disable or delete ${names ? "them" : "the listed models"}, then publish again.`,
+      );
+    }
     if (data.error === "shared_model_metadata_conflict") {
       throw new Error(sharedModelConflict(data));
     }
-    throw new Error(details || validation || explained || status || `Request failed with status ${response.status}`);
+    // The guards write a full sentence in "message"; the error code alone is a
+    // dead end, so the sentence always wins when both exist.
+    const message = typeof data.message === "string" ? data.message : "";
+    throw new Error(details || validation || message || explained || status || `Request failed with status ${response.status}`);
   }
   return data;
 }
@@ -302,9 +316,20 @@ export default function ProviderSetup({ provider, onClose, onSaved }: { provider
 
   function validate() {
     const labels = credentials.map((item) => item.name.trim().toLocaleLowerCase());
-    if (labels.some((label, index) => labels.indexOf(label) !== index)) throw new Error("Credential labels must be unique.");
-    const keys = mappings.map((item) => `${item.model_id.trim()}\u0000${item.upstream_model_id.trim()}\u0000${item.protocol}`.toLocaleLowerCase());
-    if (keys.some((key, index) => keys.indexOf(key) !== index)) throw new Error("Model, upstream model, and protocol combinations must be unique.");
+    const repeatedLabel = labels.find((label, index) => label && labels.indexOf(label) !== index);
+    if (repeatedLabel) throw new Error(`Two credentials are named "${repeatedLabel}". Rename one of them - credential names must be unique.`);
+    const keys = mappings.map((item) => ({ key: `${item.model_id.trim()}\u0000${item.upstream_model_id.trim()}\u0000${item.protocol}`.toLocaleLowerCase(), item }));
+    const repeatedMapping = keys.find((entry, index) => entry.key && keys.findIndex((other) => other.key === entry.key) !== index);
+    if (repeatedMapping) {
+      // Naming the exact combination turns a refusal into a fix: the operator
+      // knows which card pair to collapse instead of diffing every card.
+      const { item } = repeatedMapping;
+      throw new Error(
+        `Two mappings describe the same model "${item.model_id.trim()}" with upstream ` +
+          `"${item.upstream_model_id.trim()}" over ${item.protocol.replaceAll("_", " ")}. ` +
+          `Remove one of the two cards - only one can be saved.`,
+      );
+    }
     const aliases = Array.from(new Map(mappings.map((item) => [item.model_id.trim(), item.aliases])).values())
       .flatMap((value) => value.split(",").map((alias) => alias.trim().toLocaleLowerCase()).filter(Boolean));
     if (aliases.some((alias, index) => aliases.indexOf(alias) !== index)) throw new Error("Canonical model aliases must be unique.");
