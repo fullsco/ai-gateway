@@ -27,6 +27,7 @@ from typing import Any
 import httpx
 
 from gateway.logging import log_event
+from gateway.providers import DEFAULT_USER_AGENT
 from gateway.security.credentials import CredentialCipher, EncryptedCredential
 
 logger = logging.getLogger("gateway.health.usage")
@@ -135,7 +136,17 @@ async def _fetch_usage(
     url = base_url.rstrip("/") + USAGE_PATH
     try:
         response = await client.get(
-            url, headers={"Authorization": f"Bearer {secret}"}, timeout=_TIMEOUT
+            url,
+            headers={
+                "Authorization": f"Bearer {secret}",
+                # Two of the relays sit behind Cloudflare, which refuses generic
+                # library user-agents. Omitting this let httpx send its own and
+                # the edge answered an HTML challenge, so fifteen credentials
+                # reported no spend while serving traffic normally: the request
+                # path sets this header and this call did not.
+                "user-agent": DEFAULT_USER_AGENT,
+            },
+            timeout=_TIMEOUT,
         )
     except Exception:
         return None

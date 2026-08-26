@@ -7,6 +7,19 @@ from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field
 
 from gateway.protocols import Capability, ClientProtocol, NormalizedRequest
 
+# How this gateway identifies itself on every outbound request, whether that is
+# provider traffic, a health probe or a billing poll.
+#
+# Letting httpx supply its own gives "python-httpx/x.y", which is on Cloudflare's
+# generic-library blocklist; measured against gorouter.app and tabitoken.com the
+# httpx default, python-requests and curl are all refused with an HTML challenge
+# page, and this value is accepted. It lives here, in the one module every caller
+# already imports, because it was previously copied into each adapter and the
+# copies are what allowed a third call path - the credential usage poll - to omit
+# it entirely and go unnoticed: fifteen credentials served traffic normally while
+# reporting no spend figure at all.
+DEFAULT_USER_AGENT = "ai-gateway/0.1"
+
 
 class ErrorCategory(StrEnum):
     AUTHENTICATION_ERROR = "authentication_error"

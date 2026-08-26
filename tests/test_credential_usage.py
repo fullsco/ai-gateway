@@ -11,6 +11,8 @@ matter are pinned here:
 * every kind of bad answer leaves the previous observation untouched
 * a stale observation becomes fresh again after one successful poll
 * the loop polls when it starts, not one interval later
+* the poll identifies itself the way provider traffic does, because two relays
+  sit behind an edge that refuses generic library user-agents
 * the poller never writes a balance, because no provider exposes one it could
   trust and inventing one would be worse than admitting ignorance
 """
@@ -28,6 +30,7 @@ from gateway.health.usage import (
     poll_credential_usage,
     usage_poll_loop,
 )
+from gateway.providers import DEFAULT_USER_AGENT
 from gateway.security.credentials import CredentialCipher
 
 ENCRYPTION_KEY = base64.b64encode(b"u" * 32).decode()
@@ -246,6 +249,62 @@ async def test_the_poller_never_writes_a_balance() -> None:
     assert "balance_amount" not in written
     assert "balance_observed_at" not in written
     assert "balance_source" not in written
+
+
+@pytest.mark.asyncio
+async def test_the_poll_identifies_itself_the_same_way_traffic_does() -> None:
+    """The poll must send the user-agent the request path already sends.
+
+    Two of the configured relays sit behind Cloudflare, which refuses generic
+    library user-agents. The adapters set one for exactly that reason; this
+    request did not, so httpx supplied "python-httpx/x.y" and the edge answered a
+    challenge page. Asserting against the shared constant rather than a literal
+    is deliberate: if the value the traffic path uses ever changes, the poll has
+    to change with it, and the two drifting apart is the whole defect.
+    """
+    pool = RecordingPool([credential("cred-1")])
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return usage_response(1.0)
+
+    async with responder(handler) as client:
+        await poll_credential_usage(pool, ENCRYPTION_KEY, client=client)
+
+    assert seen[0].headers["user-agent"] == DEFAULT_USER_AGENT
+
+
+@pytest.mark.asyncio
+async def test_an_edge_that_refuses_library_user_agents_is_still_polled() -> None:
+    """Reproduces the observed production failure end to end.
+
+    gorouter.app and tabitoken.com answer 403 with an HTML challenge to the httpx
+    default and to curl, and 200 with JSON to this gateway's user-agent. Fifteen
+    credentials therefore read "never observed" while serving live traffic
+    normally, because the request path sent the header and this worker did not.
+    The poller's own guards behaved correctly throughout - HTML is refused rather
+    than stored - so nothing looked broken except the absence of any figure.
+    """
+    pool = RecordingPool([credential("cred-1")])
+
+    def cloudflare(request: httpx.Request) -> httpx.Response:
+        agent = request.headers.get("user-agent", "")
+        if agent != DEFAULT_USER_AGENT:
+            return httpx.Response(
+                403,
+                text="<html><title>Attention Required! | Cloudflare</title></html>",
+                headers={"content-type": "text/html; charset=UTF-8"},
+            )
+        return usage_response(2720.0)
+
+    async with responder(cloudflare) as client:
+        observations = await poll_credential_usage(pool, ENCRYPTION_KEY, client=client)
+
+    assert [(item.credential_id, item.total_usage) for item in observations] == [
+        ("cred-1", 2720.0)
+    ]
+    assert pool.updated_ids() == ["cred-1"]
 
 
 @pytest.mark.asyncio

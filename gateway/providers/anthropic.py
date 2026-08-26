@@ -6,6 +6,7 @@ import httpx
 
 from gateway.protocols import ClientProtocol, NormalizedRequest
 from gateway.providers.base import (
+    DEFAULT_USER_AGENT,
     Credential,
     ErrorCategory,
     ProviderAdapter,
@@ -22,7 +23,6 @@ QUOTA_MARKERS = (
     "insufficient balance",
     "billing limit",
 )
-DEFAULT_USER_AGENT = "ai-gateway/0.1"
 
 
 class AnthropicCompatibleAdapter(ProviderAdapter):

@@ -5,6 +5,7 @@ import httpx
 
 from gateway.protocols import ClientProtocol, NormalizedRequest
 from gateway.providers.base import (
+    DEFAULT_USER_AGENT,
     Credential,
     ErrorCategory,
     ProviderAdapter,
@@ -19,14 +20,6 @@ ENDPOINTS = {
     ClientProtocol.OPENAI_RESPONSES: "/v1/responses",
 }
 QUOTA_MARKERS = ("quota", "insufficient_quota", "billing", "credit balance")
-# Sending no user-agent lets httpx supply its own, and "python-httpx/x.y" is on
-# Cloudflare's generic-library blocklist. The Anthropic adapter has always set this;
-# this one did not, so the same provider answered anthropic_messages normally and
-# met a Cloudflare challenge page on openai_chat_completions. The HTML then failed
-# the JSON check and surfaced as a 502, which read as a provider outage rather than
-# a header we control. Measured against gorouter.app and tabitoken.com: the httpx
-# default, python-requests and curl are all refused, this value is accepted.
-DEFAULT_USER_AGENT = "ai-gateway/0.1"
 
 
 class OpenAICompatibleAdapter(ProviderAdapter):

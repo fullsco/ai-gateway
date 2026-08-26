@@ -1,4 +1,5 @@
 from gateway.providers.base import (
+    DEFAULT_USER_AGENT,
     Credential,
     ErrorCategory,
     ProviderAdapter,
@@ -10,6 +11,7 @@ from gateway.providers.base import (
 )
 
 __all__ = [
+    "DEFAULT_USER_AGENT",
     "Credential",
     "ErrorCategory",
     "ProviderAdapter",
