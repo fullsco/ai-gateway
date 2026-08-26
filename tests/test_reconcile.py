@@ -479,3 +479,78 @@ def test_shared_model_conflict_names_the_field_that_differs() -> None:
     assert body["requested"] == "Changed"
     # And who else depends on it, so the operator knows why it is shared.
     assert body["shared_with"] == ["Other Provider"]
+
+
+def test_reconcile_disables_catalogue_models_left_without_a_live_route() -> None:
+    pool = ReconcilePool(
+        previously_mapped_models=["deepseek-v4-flash"],
+        sync_disabled_ids=["deepseek-v4-flash"],
+    )
+    with TestClient(reconcile_app(pool), raise_server_exceptions=False) as test_client:
+        response = test_client.put(
+            "/api/admin/v1/providers/reconcile",
+            headers=auth(),
+            json=reconcile_payload(models=[], mappings=[], routes=[]),
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["models_disabled"] == ["deepseek-v4-flash"]
+    assert body["models_enabled"] == []
+    sync_query, sync_args = next(
+        (query, args)
+        for query, args in pool.fetch_calls
+        if "update public.models m set enabled=false" in query
+    )
+    assert "not exists" in sync_query
+    assert list(sync_args[0]) == ["deepseek-v4-flash"]
+    audit_args = next(
+        args
+        for query, args in pool.execute_calls
+        if "provider_reconciled" in query
+    )
+    metadata = __import__("json").loads(audit_args[2])
+    assert metadata["models_disabled"] == ["deepseek-v4-flash"]
+
+
+def test_reconcile_reenables_a_stranded_model_when_a_route_returns() -> None:
+    pool = ReconcilePool(
+        previously_mapped_models=["deepseek-v4-flash"],
+        sync_enabled_ids=["deepseek-v4-flash"],
+    )
+    with TestClient(reconcile_app(pool), raise_server_exceptions=False) as test_client:
+        response = test_client.put(
+            "/api/admin/v1/providers/reconcile",
+            headers=auth(),
+            json=reconcile_payload(),
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["models_enabled"] == ["deepseek-v4-flash"]
+    assert body["models_disabled"] == []
+
+
+def test_reconcile_only_judges_models_this_save_touches() -> None:
+    pool = ReconcilePool()
+    with TestClient(reconcile_app(pool), raise_server_exceptions=False) as test_client:
+        response = test_client.put(
+            "/api/admin/v1/providers/reconcile",
+            headers=auth(),
+            json=reconcile_payload(),
+        )
+
+    assert response.status_code == 200
+    _, disable_args = next(
+        (query, args)
+        for query, args in pool.fetch_calls
+        if "update public.models m set enabled=false" in query
+    )
+    _, enable_args = next(
+        (query, args)
+        for query, args in pool.fetch_calls
+        if "update public.models m set enabled=true" in query
+    )
+    # The affected set is the provider's previous mappings plus declared ones.
+    assert sorted(disable_args[0]) == ["model-1"]
+    assert sorted(enable_args[0]) == ["model-1"]

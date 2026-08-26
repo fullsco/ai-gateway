@@ -209,6 +209,20 @@ async def reconcile_provider(request: Request, body: ProviderReconcileInput) -> 
                 item.id,
             )
 
+    # Every catalogue model this save can change the serving story for: anything
+    # the provider currently maps plus everything the save declares. After the
+    # mappings and routes below are applied, each one is synced to whether a live
+    # route actually exists - a model left enabled with none is exactly what the
+    # publish guard calls stranded.
+    previously_mapped = {
+        row["model_id"]
+        for row in await connection.fetch(
+            "select distinct model_id from public.provider_models where provider_id=$1",
+            provider_id,
+        )
+    }
+    affected_models = previously_mapped | {item.model_id for item in body.mappings}
+
     mapping_ids: dict[tuple[str, str, ClientProtocol], str] = {}
     mapping_weights: dict[str, float] = {}
     for item in body.mappings:
@@ -381,6 +395,40 @@ async def reconcile_provider(request: Request, body: ProviderReconcileInput) -> 
         desired_route_model_ids,
         desired_route_mapping_ids,
     )
+
+    # A catalogue model is serviceable exactly when some enabled provider still
+    # reaches it through an enabled route on an enabled provider. Syncing both
+    # ways keeps a save from doing either half: leaving an orphan enabled would
+    # block every later publish as stranded, and re-declaring a route for a
+    # model stranded by an earlier save would store a route that can never
+    # resolve. Models this save never touched are not judged here.
+    live_route = """
+        select 1 from public.model_routes r
+        join public.provider_models pm on pm.id = r.provider_model_id
+        join public.providers p on p.id = pm.provider_id
+        where r.model_id = m.id and r.enabled and pm.enabled and p.enabled
+    """
+    disabled_models = [
+        row["id"]
+        for row in await connection.fetch(
+            f"""update public.models m set enabled=false,updated_at=now()
+                where m.enabled and m.id = any($1::text[])
+                  and not exists ({live_route})
+                returning id""",
+            sorted(affected_models),
+        )
+    ]
+    enabled_models = [
+        row["id"]
+        for row in await connection.fetch(
+            f"""update public.models m set enabled=true,updated_at=now()
+                where not m.enabled and m.id = any($1::text[])
+                  and exists ({live_route})
+                returning id""",
+            sorted(affected_models),
+        )
+    ]
+
     await connection.execute(
         """insert into public.audit_logs(actor_id,action,resource_type,resource_id,metadata)
            values($1,'provider_reconciled','provider',$2,$3::jsonb)""",
@@ -391,6 +439,8 @@ async def reconcile_provider(request: Request, body: ProviderReconcileInput) -> 
                 "credential_count": len(credential_ids),
                 "model_count": len(model_ids),
                 "mapping_count": len(mapping_ids),
+                "models_disabled": disabled_models,
+                "models_enabled": enabled_models,
             }
         ),
     )
@@ -403,6 +453,8 @@ async def reconcile_provider(request: Request, body: ProviderReconcileInput) -> 
                 "model_count": len(model_ids),
                 "mapping_count": len(mapping_ids),
                 "route_count": len(body.routes),
+                "models_disabled": disabled_models,
+                "models_enabled": enabled_models,
             }
         )
     )

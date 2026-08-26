@@ -54,6 +54,9 @@ class ReconcilePool:
         conflicting_pool_provider: str | None = None,
         existing_provider_id: str | None = None,
         topology_conflict: str | None = None,
+        previously_mapped_models: list[str] | None = None,
+        sync_disabled_ids: list[str] | None = None,
+        sync_enabled_ids: list[str] | None = None,
     ) -> None:
         self.alias_rows = alias_rows or []
         self.namespace_model_rows = namespace_model_rows or []
@@ -61,15 +64,32 @@ class ReconcilePool:
         self.conflicting_pool_provider = conflicting_pool_provider
         self.existing_provider_id = existing_provider_id
         self.topology_conflict = topology_conflict
+        self.previously_mapped_models = previously_mapped_models or []
+        self.sync_disabled_ids = sync_disabled_ids or []
+        self.sync_enabled_ids = sync_enabled_ids or []
         self.fetchrow_calls: list[tuple[str, tuple[Any, ...]]] = []
         self.execute_calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.fetch_calls: list[tuple[str, tuple[Any, ...]]] = []
         self.transactions: list[Transaction] = []
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        self.fetch_calls.append((query, args))
         if "m.display_name" in query and "from public.models" in query:
             return self.shared_model_rows
         if "from public.model_aliases" in query:
             return self.alias_rows
+        if (
+            "update public.models m set enabled=false" in query
+            or "update public.models m set enabled=true" in query
+        ):
+            source = (
+                self.sync_disabled_ids
+                if "enabled=false" in query
+                else self.sync_enabled_ids
+            )
+            return [{"id": model_id} for model_id in source]
+        if "select distinct model_id from public.provider_models" in query:
+            return [{"model_id": model_id} for model_id in self.previously_mapped_models]
         if "from public.models" in query:
             return self.namespace_model_rows
         return []
