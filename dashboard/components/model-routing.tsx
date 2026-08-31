@@ -2,7 +2,8 @@
 
 import { ArrowDown, ArrowUp, Check, Save, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { gatewayApi } from "./provider-setup";
+import { gatewayApi } from "./gateway-api";
+import { PROTOCOLS, PROTOCOL_ENDPOINTS, servedProtocols } from "./gateway-protocols";
 
 type Row = Record<string, unknown>;
 type RouteDraft = {
@@ -21,6 +22,21 @@ type ProviderOption = {
   mappingIds: string[];
   /** The mappings that are currently carrying traffic. */
   activeMappingIds: string[];
+};
+type MappingFacts = {
+  provider: string;
+  upstreamModelId: string;
+  /** The protocol the gateway speaks to this provider. */
+  protocol: string;
+  /** Every client protocol this mapping answers, its native one included. */
+  serves: string[];
+};
+type Reach = {
+  protocol: string;
+  label: string;
+  endpoint: string;
+  /** The drafted routes that answer this protocol, in the order they are tried. */
+  via: { provider: string; upstreamModelId: string; native: boolean }[];
 };
 
 const text = (value: unknown, fallback = "") => String(value ?? fallback);
@@ -69,6 +85,56 @@ function optionsFromRouting(rows: Row[]): ProviderOption[] {
   return [...byProvider.values()];
 }
 
+/**
+ * Per-mapping protocol facts, kept beside the provider aggregate.
+ *
+ * `optionsFromRouting` collapses a provider's mappings into one row, which is the right
+ * shape for ordering providers but loses the question a client actually asks: can *this*
+ * endpoint reach the model. That is a property of an individual mapping, so it is indexed
+ * separately rather than smeared across the aggregate.
+ */
+function mappingFacts(rows: Row[]): Map<string, MappingFacts> {
+  const facts = new Map<string, MappingFacts>();
+  rows.forEach((row) => {
+    const mappingId = text(row.provider_model_id);
+    if (!mappingId || facts.has(mappingId)) return;
+    const protocol = text(row.protocol);
+    facts.set(mappingId, {
+      provider: text(row.provider),
+      upstreamModelId: text(row.upstream_model_id),
+      protocol,
+      // A gateway older than the served-protocols column reports nothing here and
+      // answered only its upstream protocol - which is what the shared helper returns
+      // for an empty list, so old and new snapshots read the same way.
+      serves: servedProtocols(protocol, Array.isArray(row.serves_protocols) ? row.serves_protocols.map(String) : []),
+    });
+  });
+  return facts;
+}
+
+/**
+ * Which client APIs reach this model once the drafted routes are saved.
+ *
+ * Drafted rather than active on purpose: this sits under the provider order the operator
+ * is editing, so it has to answer for the arrangement in front of them. Removing the last
+ * provider that answers `/v1/messages` should read as unreachable here, before a client
+ * discovers it as a 404.
+ */
+function reachability(routes: RouteDraft[], facts: Map<string, MappingFacts>): Reach[] {
+  return PROTOCOLS.map(([protocol, label]) => ({
+    protocol,
+    label,
+    endpoint: PROTOCOL_ENDPOINTS[protocol],
+    via: routes.flatMap((route) =>
+      route.providerModelIds.flatMap((mappingId) => {
+        const fact = facts.get(mappingId);
+        if (!fact || !fact.serves.includes(protocol)) return [];
+        return [{ provider: route.provider, upstreamModelId: fact.upstreamModelId, native: fact.protocol === protocol }];
+      }),
+    ),
+  }));
+}
+
 function draftFromOption(option: ProviderOption, priority: number): RouteDraft {
   return {
     provider: option.provider,
@@ -84,6 +150,7 @@ export default function ModelRouting({ onNotice }: { onNotice: (message: string,
   const [models, setModels] = useState<Row[]>([]);
   const [modelId, setModelId] = useState("");
   const [options, setOptions] = useState<ProviderOption[]>([]);
+  const [facts, setFacts] = useState<Map<string, MappingFacts>>(new Map());
   const [routes, setRoutes] = useState<RouteDraft[]>([]);
   const [strategy, setStrategy] = useState("priority");
   const [healthAware, setHealthAware] = useState(true);
@@ -108,8 +175,10 @@ export default function ModelRouting({ onNotice }: { onNotice: (message: string,
     setLoading(true);
     try {
       const payload = await gatewayApi(`models/${encodeURIComponent(model)}/routing`);
-      const derived = optionsFromRouting((payload.data as Row[]) ?? []);
+      const rows = (payload.data as Row[]) ?? [];
+      const derived = optionsFromRouting(rows);
       setOptions(derived);
+      setFacts(mappingFacts(rows));
       setRoutes(
         derived
           .filter((option) => option.routed)
@@ -119,6 +188,7 @@ export default function ModelRouting({ onNotice }: { onNotice: (message: string,
     } catch (reason) {
       onNotice(reason instanceof Error ? reason.message : "Unable to load model routing", "error");
       setOptions([]);
+      setFacts(new Map());
       setRoutes([]);
     } finally {
       setLoading(false);
@@ -186,6 +256,7 @@ export default function ModelRouting({ onNotice }: { onNotice: (message: string,
   const capabilities = (selected?.capabilities as string[] | undefined) ?? [];
   const available = options.filter((option) => option.enabled && !routes.some((route) => route.provider === option.provider));
   const exposesModel = options.length > 0;
+  const reach = reachability(routes, facts);
 
   if (loading && !models.length) return <div className="loading-state" role="status">Loading models...</div>;
   if (!models.length) return <div className="empty-state"><strong>No models yet</strong><span>Add a provider through guided setup to make a model available.</span></div>;
@@ -227,6 +298,35 @@ export default function ModelRouting({ onNotice }: { onNotice: (message: string,
           <span>{exposesModel ? "Add a provider to make this model available." : "Add this model to a provider through guided setup, then route it here."}</span>
         </div>
       )}
+    </div>
+    <div className="reach-panel">
+      <div className="section-head">
+        <div>
+          <h3>Client reachability</h3>
+          <p>Which client APIs can reach this model with the order above. An unanswered API returns 404 to its callers even while the provider is healthy.</p>
+        </div>
+      </div>
+      <ul className="reach-list">
+        {reach.map((entry) => {
+          const translated = entry.via.filter((step) => !step.native).length;
+          return (
+            <li key={entry.protocol} className={entry.via.length ? "reach" : "reach unreachable"}>
+              <div className="reach-copy">
+                <strong>{entry.label}</strong>
+                <code>{entry.endpoint}</code>
+                <span>
+                  {entry.via.length
+                    ? `Served by ${entry.via.map((step) => `${step.provider} / ${step.upstreamModelId} (${step.native ? "native" : "translated"})`).join(", ")}.`
+                    : `No route in this order answers ${entry.endpoint}. Add a provider whose mapping serves it, or tick it on the mapping in guided setup.`}
+                </span>
+              </div>
+              <span className={entry.via.length ? "state ok" : "state bad"}>
+                {entry.via.length === 0 ? "unreachable" : translated === 0 ? "native" : translated === entry.via.length ? "translated" : "native + translated"}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
     </div>
     <div className="routing-review">
       <strong>What will happen</strong>

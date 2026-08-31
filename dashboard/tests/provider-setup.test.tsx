@@ -316,6 +316,137 @@ describe("duplicate mapping guard", () => {
   });
 });
 
+describe("served protocols control", () => {
+  /** The guided create form, filled just far enough that a save passes validation. */
+  async function fillNewProvider() {
+    fireEvent.change(screen.getByLabelText("Provider name"), { target: { value: "New Provider" } });
+    fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "https://new.example" } });
+    fireEvent.change(screen.getByLabelText("Label"), { target: { value: "primary" } });
+    fireEvent.change(screen.getByLabelText("Secret"), { target: { value: "secret-value" } });
+    await userEvent.selectOptions(screen.getByLabelText(/^Catalogue model/), "__new__");
+    fireEvent.change(screen.getByLabelText(/^New model ID/), { target: { value: "model-new" } });
+    fireEvent.change(screen.getByLabelText("Model display name"), { target: { value: "Model New" } });
+    fireEvent.change(screen.getByLabelText(/^Provider model ID/), { target: { value: "upstream-new" } });
+  }
+
+  const served = (name: RegExp) => screen.getByRole("checkbox", { name });
+  /** Whether this API is relayed, converted, or cannot be served at all. */
+  const marker = (name: RegExp) => served(name).closest("label")?.querySelector("em")?.textContent;
+
+  it("cannot switch off the protocol the route speaks upstream", async () => {
+    // Relaying bytes to its own protocol is not a setting. Offering it as one invited an
+    // operator to claim a route is unreachable from the very API it speaks, which the
+    // server normalizes away - so the form would show a state it could never save.
+    vi.stubGlobal("fetch", fetchForWorkspace());
+    render(<ProviderSetup onClose={vi.fn()} onSaved={vi.fn(async () => undefined)} />);
+
+    const native = served(/Anthropic Messages/);
+    expect(native).toBeChecked();
+    expect(native).toBeDisabled();
+    expect(marker(/Anthropic Messages/)).toBe("native");
+    expect(served(/OpenAI Chat Completions/)).toBeEnabled();
+    expect(served(/OpenAI Chat Completions/)).not.toBeChecked();
+    expect(marker(/OpenAI Chat Completions/)).toBe("translated");
+  });
+
+  it("carries a newly ticked client API through to the save payload", async () => {
+    let payload: GatewayRow = {};
+    vi.stubGlobal("fetch", fetchForWorkspace((value) => { payload = value; }));
+    render(<ProviderSetup onClose={vi.fn()} onSaved={vi.fn(async () => undefined)} />);
+    await fillNewProvider();
+
+    await userEvent.click(served(/OpenAI Chat Completions/));
+    await userEvent.click(screen.getByRole("button", { name: "Create provider workspace" }));
+
+    await waitFor(() => expect(payload.mappings).toBeDefined());
+    // Normalized to the declared order, upstream protocol included, as the server stores it.
+    expect((payload.mappings as GatewayRow[])[0].serves_protocols).toEqual([
+      "anthropic_messages",
+      "openai_chat_completions",
+    ]);
+  });
+
+  it("keeps the old protocol served when the upstream protocol changes", async () => {
+    // Changing how the gateway talks to a provider must not silently 404 the clients that
+    // were reaching the model a moment ago. The previous protocol stays served, now by
+    // translation, and the checkbox shows the new arrangement so it can be undone.
+    let payload: GatewayRow = {};
+    vi.stubGlobal("fetch", fetchForWorkspace((value) => { payload = value; }));
+    render(<ProviderSetup onClose={vi.fn()} onSaved={vi.fn(async () => undefined)} />);
+    await fillNewProvider();
+
+    await userEvent.selectOptions(screen.getByLabelText(/^Protocol/), "openai_chat_completions");
+
+    // Anthropic is still answered, but now as a translation rather than a relay, and it
+    // has become something the operator may switch off.
+    expect(served(/Anthropic Messages/)).toBeChecked();
+    expect(served(/Anthropic Messages/)).toBeEnabled();
+    expect(marker(/Anthropic Messages/)).toBe("translated");
+    expect(served(/OpenAI Chat Completions/)).toBeDisabled();
+    expect(marker(/OpenAI Chat Completions/)).toBe("native");
+
+    await userEvent.click(screen.getByRole("button", { name: "Create provider workspace" }));
+    await waitFor(() => expect(payload.mappings).toBeDefined());
+    const mapping = (payload.mappings as GatewayRow[])[0];
+    expect(mapping.protocol).toBe("openai_chat_completions");
+    expect(mapping.serves_protocols).toEqual(["anthropic_messages", "openai_chat_completions"]);
+  });
+
+  it("hydrates a stored translation and round-trips it unchanged", async () => {
+    const translating = [{ ...workspace["provider-models"][0], serves_protocols: ["anthropic_messages", "openai_responses"] }];
+    let payload: GatewayRow = {};
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input).split("/").pop() ?? "";
+      if (init?.method === "PUT") {
+        payload = JSON.parse(String(init.body));
+        return response({ provider_id: "provider-1" });
+      }
+      if (path === "provider-models") return response({ data: translating });
+      return response({ data: workspace[path] ?? [] });
+    }));
+    render(<ProviderSetup provider={provider} onClose={vi.fn()} onSaved={vi.fn(async () => undefined)} />);
+    await screen.findByDisplayValue("upstream-1");
+
+    expect(served(/Anthropic Messages/)).toBeChecked();
+    expect(served(/OpenAI Responses/)).toBeChecked();
+    expect(served(/OpenAI Chat Completions/)).not.toBeChecked();
+
+    await userEvent.click(screen.getByRole("button", { name: "Save provider workspace" }));
+    await waitFor(() => expect(payload.mappings).toBeDefined());
+    expect((payload.mappings as GatewayRow[])[0].serves_protocols).toEqual([
+      "anthropic_messages",
+      "openai_responses",
+    ]);
+  });
+
+  it("reads a mapping stored before the column existed as native only", async () => {
+    // A pre-migration row reports no serves_protocols at all. It answered exactly its
+    // upstream protocol then, and saving it back must not widen that.
+    let payload: GatewayRow = {};
+    vi.stubGlobal("fetch", fetchForWorkspace((value) => { payload = value; }));
+    render(<ProviderSetup provider={provider} onClose={vi.fn()} onSaved={vi.fn(async () => undefined)} />);
+    await screen.findByDisplayValue("upstream-1");
+
+    expect(served(/Anthropic Messages/)).toBeChecked();
+    expect(served(/OpenAI Chat Completions/)).not.toBeChecked();
+    expect(served(/OpenAI Responses/)).not.toBeChecked();
+
+    await userEvent.click(screen.getByRole("button", { name: "Save provider workspace" }));
+    await waitFor(() => expect(payload.mappings).toBeDefined());
+    expect((payload.mappings as GatewayRow[])[0].serves_protocols).toEqual(["anthropic_messages"]);
+  });
+
+  it("says what an unticked endpoint costs a client", async () => {
+    // The consequence is a 404 on a healthy route, which is the confusing case: the
+    // provider is up, the model exists, and the client still gets nothing.
+    vi.stubGlobal("fetch", fetchForWorkspace());
+    render(<ProviderSetup onClose={vi.fn()} onSaved={vi.fn(async () => undefined)} />);
+
+    expect(screen.getByText(/A client calling an unchecked endpoint gets a 404 for this model/)).toBeVisible();
+    expect(screen.getByRole("group", { name: "Client APIs this mapping answers" })).toBeVisible();
+  });
+});
+
 describe("scratch hydrate copy", () => {
   it("copies the proven hydrate pattern verbatim", async () => {
     vi.stubGlobal("fetch", fetchForWorkspace());
