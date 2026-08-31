@@ -32,6 +32,17 @@ class ProviderModel:
     pool_members: Mapping[str, object] | None = None
     pool_strategy: str | None = None
     allow_model_fallback: bool = True
+    # Which client APIs this route answers. `protocol` is what the gateway speaks to
+    # the provider; anything here that differs from it is served by translating the
+    # request, the response and the SSE stream.
+    serves_protocols: frozenset[ClientProtocol] = frozenset()
+
+    def __post_init__(self) -> None:
+        # Resolved once, here, so every reader sees the same answer: an empty set means
+        # the upstream protocol only, and a route built before this field existed keeps
+        # exactly the reachability it had.
+        if not self.serves_protocols:
+            object.__setattr__(self, "serves_protocols", frozenset({self.protocol}))
 
 
 class ModelRegistry:
@@ -86,7 +97,11 @@ class ModelRegistry:
             for route in self._provider_models
             if route.enabled
             and route.canonical_model_id == model.id
-            and route.protocol is request.protocol
+            # Not `route.protocol is request.protocol`: a route may answer a client
+            # protocol its upstream does not speak, which the gateway serves by
+            # translating. Requiring identity here is what made every OpenAI-protocol
+            # mapping return 404 to a client that speaks Anthropic Messages.
+            and request.protocol in route.serves_protocols
             and request.required_capabilities <= route.capabilities
         ]
         return tuple(sorted(eligible, key=lambda route: (route.priority, route.id)))

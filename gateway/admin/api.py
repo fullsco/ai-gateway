@@ -293,7 +293,8 @@ async def provider_models(request: Request) -> JSONResponse:
         request,
         """
         select pm.id, pm.provider_id, p.name as provider_name, pm.model_id,
-                pm.upstream_model_id, pm.protocol, pm.capabilities, pm.priority,
+                pm.upstream_model_id, pm.protocol, pm.serves_protocols,
+                 pm.capabilities, pm.priority,
                  pm.weight, pm.max_concurrency, pm.enabled, pm.pricing,
                  pm.settings,
                 pm.created_at, pm.updated_at

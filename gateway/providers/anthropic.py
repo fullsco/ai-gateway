@@ -8,21 +8,15 @@ from gateway.protocols import ClientProtocol, NormalizedRequest
 from gateway.providers.base import (
     DEFAULT_USER_AGENT,
     Credential,
-    ErrorCategory,
     ProviderAdapter,
     ProviderConfig,
     ProviderError,
     UpstreamRequest,
     build_provider_error,
+    classify_upstream_status,
 )
 
 FORWARDED_HEADERS = {"anthropic-beta", "anthropic-version"}
-QUOTA_MARKERS = (
-    "quota",
-    "credit balance",
-    "insufficient balance",
-    "billing limit",
-)
 
 
 class AnthropicCompatibleAdapter(ProviderAdapter):
@@ -90,51 +84,15 @@ class AnthropicCompatibleAdapter(ProviderAdapter):
     def normalize_error(self, response: httpx.Response) -> ProviderError:
         message, error_type = self._extract_error(response)
         searchable = f"{error_type} {message}".lower()
-        retry_after = self._retry_after(response.headers.get("retry-after"))
-
-        if response.status_code == 403 and self._is_waf_rejection(response):
-            category = ErrorCategory.UPSTREAM_WAF_REJECTION
-        elif response.status_code == 403 and any(
-            marker in searchable for marker in QUOTA_MARKERS
-        ):
-            # Some resellers answer 403 rather than 402 or 429 when a key is out of
-            # quota. Reading that as a rejected credential parked working keys as
-            # auth_failed, which is both wrong and unrecoverable: quota comes back,
-            # a bad secret does not. Two AgentRouter credentials sat like that while
-            # the provider was plainly saying "user quota is not enough".
-            category = ErrorCategory.QUOTA_EXHAUSTED
-        elif response.status_code in {401, 403}:
-            # The upstream rejected *this credential*, not the client's gateway key.
-            # This also covers a key restricted by IP or not entitled to the model:
-            # both are specific to the credential, so a sibling key may still work.
-            category = ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR
-        elif response.status_code in {402, 429} and any(
-            marker in searchable for marker in QUOTA_MARKERS
-        ):
-            category = ErrorCategory.QUOTA_EXHAUSTED
-        elif response.status_code == 402:
-            # Payment Required is a billing condition even when the wording does
-            # not match a marker; classifying it as an invalid request made it
-            # non-retryable and returned 400 to the client.
-            category = ErrorCategory.QUOTA_EXHAUSTED
-        elif response.status_code == 429:
-            category = ErrorCategory.RATE_LIMIT
-        elif response.status_code in {408, 504}:
-            category = ErrorCategory.TIMEOUT
-        elif response.status_code >= 500:
-            category = ErrorCategory.PROVIDER_UNAVAILABLE
-        elif response.status_code == 404 and "model" in searchable:
-            category = ErrorCategory.MODEL_UNAVAILABLE
-        elif 400 <= response.status_code < 500:
-            category = ErrorCategory.INVALID_REQUEST
-        else:
-            category = ErrorCategory.INTERNAL_ERROR
-
         return build_provider_error(
-            category,
+            classify_upstream_status(
+                response.status_code,
+                searchable,
+                waf_rejection=self._is_waf_rejection(response),
+            ),
             message,
             upstream_status=response.status_code,
-            retry_after_seconds=retry_after,
+            retry_after_seconds=self._retry_after(response.headers.get("retry-after")),
         )
 
     def create_probe_request(

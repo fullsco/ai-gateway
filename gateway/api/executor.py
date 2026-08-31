@@ -24,7 +24,13 @@ from gateway.observability import (
     UsageAttribution,
     estimate_cost,
 )
-from gateway.protocols import ClientProtocol, NormalizedRequest
+from gateway.protocols import Capability, ClientProtocol, NormalizedRequest
+from gateway.protocols.translate import (
+    ProtocolTranslator,
+    StreamTranslator,
+    TranslationContext,
+    get_translator,
+)
 from gateway.providers import ErrorCategory, ProviderError, build_provider_error
 from gateway.providers.base import RetryScope
 from gateway.quotas import (
@@ -216,7 +222,14 @@ async def execute_request(
         if not await runtime.route_controls.allow(route.provider_model.id):
             excluded_routes = excluded_routes | {route.provider_model.id}
             continue
-        adapter = runtime.provider_model_adapters[route.provider_model.id]
+        adapter = runtime.adapter_for(route.provider_model.id, normalized.protocol)
+        # Three jobs below read a protocol, and on a translated route they do not all
+        # read the same one. Usage extraction, cost and foreign-stream detection look at
+        # the *upstream* body; keepalive and terminal-error frames are written for the
+        # *client*. Conflating them is how streamed requests silently recorded zero
+        # tokens once already.
+        upstream_protocol = route.provider_model.protocol
+        translator = get_translator(normalized.protocol, upstream_protocol)
         credential = runtime.credentials[route.credential.credential_id]
         lease = await runtime.route_controls.acquire(
             route.provider_model.id,
@@ -388,7 +401,7 @@ async def execute_request(
                 last_error = adapter.normalize_error(response)
                 actual_cost = await recorder.record_usage(
                     attempt_id,
-                    normalized.protocol,
+                    upstream_protocol,
                     response.content,
                     attribution,
                     attempt_status="failed",
@@ -423,7 +436,7 @@ async def execute_request(
                         last_error = _unexpected_upstream_response(response.status_code)
                         await _close_response(response)
                         response = None
-                    elif _stream_is_foreign_protocol(normalized.protocol, first_chunk):
+                    elif _stream_is_foreign_protocol(upstream_protocol, first_chunk):
                         last_error = build_provider_error(
                             ErrorCategory.MODEL_UNAVAILABLE,
                             "The provider answered in a different protocol than this route "
@@ -436,7 +449,7 @@ async def execute_request(
                             "upstream_stream_protocol_mismatch",
                             provider_id=route.provider_model.provider_id,
                             provider_model_id=route.provider_model.id,
-                            expected_protocol=normalized.protocol.value,
+                            expected_protocol=upstream_protocol.value,
                         )
                         await _close_response(response)
                         response = None
@@ -445,7 +458,8 @@ async def execute_request(
                             recorder,
                             response=response,
                             attempt_id=attempt_id,
-                            protocol=normalized.protocol,
+                            client_protocol=normalized.protocol,
+                            upstream_protocol=upstream_protocol,
                             resolved_model=route.canonical_model_id,
                             started_at=started_at,
                             attempt_started_at=attempt_started_at,
@@ -484,6 +498,11 @@ async def execute_request(
                                 iterator,
                                 finalizer,
                                 keepalive_seconds=settings.stream_keepalive_seconds,
+                                translator=(
+                                    translator.stream(_translation_context(normalized))
+                                    if translator is not None
+                                    else None
+                                ),
                             ),
                             status_code=200,
                             media_type="text/event-stream",
@@ -491,7 +510,15 @@ async def execute_request(
                         )
             else:
                 content = await response.aread()
+                # Translated before anything is committed, so a body that cannot be
+                # restated in the client's protocol still fails over to another route
+                # instead of reaching the client unparseable.
+                client_content: bytes | None = content
                 if not _valid_upstream_json(content):
+                    client_content = None
+                elif translator is not None:
+                    client_content = _translated_body(translator, content, normalized)
+                if client_content is None:
                     last_error = _unexpected_upstream_response(response.status_code)
                     await response.aclose()
                     response = None
@@ -530,7 +557,7 @@ async def execute_request(
                     )
                     actual_cost = await recorder.record_usage(
                         attempt_id,
-                        normalized.protocol,
+                        upstream_protocol,
                         content,
                         attribution,
                         attempt_status="succeeded",
@@ -548,7 +575,7 @@ async def execute_request(
                         fallback_count=fallback_count,
                     )
                     await recorder.record_routing_trace(traces)
-                    return Response(content, status_code=status_code, headers=headers)
+                    return Response(client_content, status_code=status_code, headers=headers)
         except (TimeoutError, httpx.TransportError) as exc:
             last_error = _transport_error(exc)
             log_event(
@@ -800,6 +827,58 @@ def _map_upstream_model(request: NormalizedRequest, upstream_model: str) -> Norm
     return request.model_copy(update={"payload": payload})
 
 
+def _translation_context(request: NormalizedRequest) -> TranslationContext:
+    """What a translator needs to know about the client's request.
+
+    The model is echoed back as the client named it rather than as the upstream id it
+    was mapped to, and reasoning is only rendered as client-visible blocks when the
+    client asked to see thinking: a client that did not ask must not be handed a block
+    type it does not model.
+    """
+    return TranslationContext(
+        requested_model=request.requested_model,
+        reasoning_requested=Capability.REASONING in request.required_capabilities,
+    )
+
+
+def _translated_body(
+    translator: ProtocolTranslator,
+    content: bytes,
+    request: NormalizedRequest,
+) -> bytes | None:
+    """The upstream JSON body restated in the protocol the client asked for.
+
+    None when it cannot be, so the caller fails over to another route rather than
+    answering 200 with a body the client cannot parse.
+    """
+    try:
+        payload = json.loads(content)
+        if not isinstance(payload, dict):
+            return None
+        translated = translator.translate_response(payload, _translation_context(request))
+        return json.dumps(translated).encode()
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "upstream_body_translation_failed",
+            client_protocol=translator.client_protocol.value,
+            upstream_protocol=translator.upstream_protocol.value,
+            error_type=type(exc).__name__,
+        )
+        return None
+
+
+def _emit(translator: StreamTranslator | None, chunk: bytes) -> bytes:
+    """The bytes this upstream chunk becomes for the client.
+
+    The chunk itself on a native route, so the relay stays verbatim; otherwise whatever
+    complete client-protocol events the translator can frame from what it has seen,
+    which may be nothing yet.
+    """
+    return chunk if translator is None else translator.feed(chunk)
+
+
 def _clamp_timeout_to_deadline(
     timeout: httpx.Timeout, deadline: datetime, *, stream: bool
 ) -> httpx.Timeout:
@@ -901,14 +980,20 @@ async def _stream_response(
     iterator: AsyncIterator[bytes],
     finalizer: "_StreamFinalizer",
     keepalive_seconds: float = 0,
+    translator: StreamTranslator | None = None,
 ) -> AsyncIterator[bytes]:
     completed = False
     error: ProviderError | None = None
     pending: asyncio.Task[object] | None = None
+    at_boundary = True
     try:
         finalizer.usage.feed(first_chunk)
-        yield first_chunk
-        at_boundary = _ends_on_event_boundary(first_chunk)
+        # Metering always reads the upstream bytes; the client is sent whatever protocol
+        # it asked for. With no translator these are the same bytes and the relay is
+        # verbatim, exactly as it was before translation existed.
+        if emitted := _emit(translator, first_chunk):
+            yield emitted
+            at_boundary = _ends_on_event_boundary(emitted)
         while True:
             if pending is None:
                 pending = asyncio.ensure_future(_next_stream_chunk(iterator))
@@ -919,7 +1004,7 @@ async def _stream_response(
                     # cancelled and reissued, so a chunk that arrives during a keepalive
                     # tick is never dropped and the upstream read is never restarted.
                     if at_boundary:
-                        yield _stream_keepalive_frame(finalizer.protocol)
+                        yield _stream_keepalive_frame(finalizer.client_protocol)
                     continue
             chunk = await pending
             pending = None
@@ -929,8 +1014,14 @@ async def _stream_response(
             # Only real upstream bytes are metered. Keepalives are never fed to the
             # usage parser, so token accounting and cost are bit-for-bit unchanged.
             finalizer.usage.feed(chunk)
-            yield chunk
-            at_boundary = _ends_on_event_boundary(chunk)
+            if emitted := _emit(translator, chunk):
+                yield emitted
+                at_boundary = _ends_on_event_boundary(emitted)
+        # A translated stream may owe the client a close: the events that end a message
+        # in one protocol have no one-to-one trigger in another, so the translator emits
+        # them once the upstream is done rather than in response to a chunk.
+        if translator is not None and (tail := translator.finish()):
+            yield tail
     except (httpx.StreamError, httpx.HTTPError) as exc:
         # The upstream stopped mid-body. This used to escape the generator and reach
         # uvicorn as an unhandled ASGI exception, which logged a traceback implying a
@@ -950,7 +1041,7 @@ async def _stream_response(
             attempt_number=finalizer.attempt_number,
             error_type=type(exc).__name__,
         )
-        yield _terminal_stream_error(finalizer.protocol, error.message)
+        yield _terminal_stream_error(finalizer.client_protocol, error.message)
     finally:
         # A client that disconnects mid-stream throws in at a yield, leaving the
         # upstream read outstanding. Without this it survives as an orphaned task
@@ -968,7 +1059,8 @@ class _StreamFinalizer:
         *,
         response: httpx.Response,
         attempt_id: int | None,
-        protocol: ClientProtocol,
+        client_protocol: ClientProtocol,
+        upstream_protocol: ClientProtocol,
         resolved_model: str,
         started_at: datetime,
         attempt_started_at: datetime,
@@ -1002,11 +1094,15 @@ class _StreamFinalizer:
         self.provider_model_id = provider_model_id
         self.attempt_number = attempt_number
         self.attribution = attribution
-        self.protocol = protocol
+        # Client-facing frames (keepalive, terminal error) are written in the protocol
+        # the client asked for; usage is parsed out of the protocol the upstream
+        # answered in. On a translated route those differ, and reading the wrong one
+        # here records a request that cost nothing.
+        self.client_protocol = client_protocol
         # Called with the actual cost once the stream ends, so the pre-flight
         # reservation can be corrected. A stream only knows its usage at the end.
         self.settle = settle
-        self.usage = StreamUsageAccumulator(protocol)
+        self.usage = StreamUsageAccumulator(upstream_protocol)
         self._task: asyncio.Task[None] | None = None
 
     async def finish(self, completed: bool, *, error: ProviderError | None = None) -> None:

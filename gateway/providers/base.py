@@ -20,6 +20,27 @@ from gateway.protocols import Capability, ClientProtocol, NormalizedRequest
 # reporting no spend figure at all.
 DEFAULT_USER_AGENT = "ai-gateway/0.1"
 
+# Wordings that decide what a 401 or 403 actually means. They live here, for the same
+# reason DEFAULT_USER_AGENT does: both adapters classify the same providers -
+# AgentRouter answers the same credentials over /v1/messages and /v1/chat/completions -
+# so a rule that holds on one protocol holds on the other. They were previously two
+# diverging copies. The Anthropic tuple knew "insufficient balance" and "billing
+# limit", the OpenAI one knew "insufficient_quota" and "billing", and neither knew the
+# other's, so one reseller's quota 403 read as exhausted quota on one protocol and as
+# a rejected credential on the other. The shorter substrings below subsume both sets.
+QUOTA_MARKERS = ("quota", "credit balance", "insufficient balance", "billing")
+
+# A provider that gates on client identity answers 401/403 with this wording for
+# *every* key presented, working ones included. Measured on AgentRouter while probing
+# eight credentials parked as auth_failed: with a minimal header set all eight returned
+# 403 "unauthorized client detected" - the credential then serving all production
+# traffic among them - while with the mapping's real headers four returned 200, two
+# were out of quota, one was outside its token's IP allow list and one lacked model
+# entitlement (deploy/act_on_credential_probe.py). Reading this wording as a credential
+# rejection therefore condemns every healthy key on the provider in turn, and the
+# remedy is the request's headers, not key rotation.
+CLIENT_GATING_MARKERS = ("unauthorized client",)
+
 
 class ErrorCategory(StrEnum):
     AUTHENTICATION_ERROR = "authentication_error"
@@ -147,6 +168,73 @@ def build_provider_error(
         retry_scope=scope,
         credential_at_fault=at_fault,
     )
+
+
+def classify_upstream_status(
+    status_code: int,
+    searchable: str,
+    *,
+    waf_rejection: bool = False,
+) -> ErrorCategory:
+    """Read an upstream failure's status and wording into a category.
+
+    Shared by every adapter. The classification is deliberately protocol-independent:
+    the providers behind it are resellers reached over whichever protocol a mapping
+    happens to declare, and the same host answers the same credentials on both. When
+    this logic lived once per adapter the copies drifted, and a quota 403 was read as
+    a rejected credential on one protocol while reading correctly on the other.
+
+    `searchable` is the error type, code and message lowercased into one string, so a
+    marker matches wherever the provider chose to put the wording. `waf_rejection`
+    says the 403 body was not an API error object at all.
+    """
+    if status_code == 403 and waf_rejection:
+        # An edge or bot-protection layer answering 403 with a challenge page is not a
+        # credential rejection. Without this a Cloudflare 403 parked every working key
+        # on the provider in turn.
+        return ErrorCategory.UPSTREAM_WAF_REJECTION
+    if status_code == 403 and _matches(searchable, QUOTA_MARKERS):
+        # Some resellers answer 403 rather than 402 or 429 when a key is out of quota.
+        # Reading that as a rejected credential parked working keys as auth_failed,
+        # which is both wrong and unrecoverable: quota comes back, a bad secret does
+        # not. Two AgentRouter credentials sat like that while the provider was
+        # plainly saying "user quota is not enough".
+        return ErrorCategory.QUOTA_EXHAUSTED
+    if status_code in {401, 403} and _matches(searchable, CLIENT_GATING_MARKERS):
+        # The provider refused the *client's* identity, not this credential, and says
+        # so for every key including the ones that work. Condemning the credential
+        # burns the whole pool one key at a time and points the operator at rotation
+        # when the fix is the request's headers. Provider-scoped and not the
+        # credential's fault, so a sibling key is not tried for the same refusal.
+        return ErrorCategory.UPSTREAM_WAF_REJECTION
+    if status_code in {401, 403}:
+        # The upstream rejected *this credential*, not the client's gateway key. This
+        # also covers a key outside its token's IP allow list or without entitlement
+        # to the model: both are specific to the credential, so a sibling may work.
+        return ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR
+    if status_code in {402, 429} and _matches(searchable, QUOTA_MARKERS):
+        return ErrorCategory.QUOTA_EXHAUSTED
+    if status_code == 402:
+        # Payment Required is a billing condition even when the wording matches no
+        # marker. Classifying it as an invalid request made it non-retryable and
+        # returned 400 to the client, the opposite of the intended failover to a
+        # credential that still has balance.
+        return ErrorCategory.QUOTA_EXHAUSTED
+    if status_code == 429:
+        return ErrorCategory.RATE_LIMIT
+    if status_code in {408, 504}:
+        return ErrorCategory.TIMEOUT
+    if status_code >= 500:
+        return ErrorCategory.PROVIDER_UNAVAILABLE
+    if status_code == 404 and "model" in searchable:
+        return ErrorCategory.MODEL_UNAVAILABLE
+    if 400 <= status_code < 500:
+        return ErrorCategory.INVALID_REQUEST
+    return ErrorCategory.INTERNAL_ERROR
+
+
+def _matches(searchable: str, markers: tuple[str, ...]) -> bool:
+    return any(marker in searchable for marker in markers)
 
 
 class ProviderAdapter(ABC):

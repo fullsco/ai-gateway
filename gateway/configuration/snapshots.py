@@ -291,6 +291,11 @@ def _route_changes(
         ("allow_model_fallback", "model fallback", _toggle_transition),
         ("pool_strategy", "strategy", _transition),
         ("protocol", "protocol", _transition),
+        # Which client APIs a route answers is the difference between a model being
+        # reachable from a client and returning 404 to it, so a publish has to name it.
+        # The checksum already counts it; without this the section reported as changed
+        # with nothing listed under it.
+        ("serves_protocols", "serves", _list_transition),
         # A route timeout changes how long a caller waits and how long a
         # concurrency slot is held, so a publish must say when it moves. Without
         # this the section reported as changed with nothing listed under it, which

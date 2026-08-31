@@ -228,9 +228,10 @@ async def reconcile_provider(request: Request, body: ProviderReconcileInput) -> 
     for item in body.mappings:
         mapping = await connection.fetchrow(
             """insert into public.provider_models(provider_id,model_id,upstream_model_id,protocol,
-                 capabilities,enabled,priority,weight,max_concurrency,settings,pricing)
-               values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb)
+                 serves_protocols,capabilities,enabled,priority,weight,max_concurrency,settings,pricing)
+               values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb)
                on conflict(provider_id,model_id,upstream_model_id,protocol) do update set
+                 serves_protocols=excluded.serves_protocols,
                  capabilities=excluded.capabilities,enabled=excluded.enabled,priority=excluded.priority,
                  weight=excluded.weight,max_concurrency=excluded.max_concurrency,settings=excluded.settings,
                  pricing=excluded.pricing,updated_at=now()
@@ -239,6 +240,7 @@ async def reconcile_provider(request: Request, body: ProviderReconcileInput) -> 
             item.model_id,
             item.upstream_model_id,
             item.protocol.value,
+            [_enum_value(protocol) for protocol in item.serves_protocols],
             [_enum_value(capability) for capability in item.capabilities],
             item.enabled,
             item.priority,
