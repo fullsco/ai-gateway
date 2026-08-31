@@ -21,9 +21,31 @@ from gateway.configuration import (
 )
 from gateway.configuration.runtime_builder import RuntimeSnapshot
 from gateway.protocols import ClientProtocol
+from gateway.protocols.translate import can_translate
 from gateway.security import CredentialCipher, GatewayKeyHasher
 
 router = APIRouter(prefix="/api/admin/v1", tags=["admin-control"])
+
+
+def normalize_served_protocols(
+    upstream: ClientProtocol, served: list[ClientProtocol]
+) -> list[ClientProtocol]:
+    """The client protocols a mapping answers, always including its own upstream one.
+
+    A route speaks its upstream protocol for free, by relaying bytes, so serving that
+    protocol is not a setting an operator can switch off - an empty list means "no
+    extra translation", not "unreachable". Everything else must be a pair the gateway
+    can actually translate, checked here rather than discovered as a 404 later.
+    """
+    unsupported = sorted(
+        protocol.value for protocol in served if not can_translate(protocol, upstream)
+    )
+    if unsupported:
+        raise ValueError(
+            f"cannot serve {', '.join(unsupported)} from an {upstream.value} route: "
+            "no translation exists for that pair"
+        )
+    return sorted({upstream, *served}, key=lambda protocol: protocol.value)
 
 
 class NormalizedStringLists(BaseModel):
@@ -153,6 +175,7 @@ class ProviderModelInput(NormalizedStringLists):
     model_id: str
     upstream_model_id: str
     protocol: ClientProtocol
+    serves_protocols: list[ClientProtocol] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
     priority: int = Field(default=100, ge=0)
     weight: float = Field(default=1, gt=0)
@@ -160,6 +183,11 @@ class ProviderModelInput(NormalizedStringLists):
     max_concurrency: int = Field(default=8, gt=0)
     settings: dict[str, Any] = Field(default_factory=dict)
     pricing: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def normalize_served_protocols(self) -> "ProviderModelInput":
+        self.serves_protocols = normalize_served_protocols(self.protocol, self.serves_protocols)
+        return self
 
     @field_validator("pricing")
     @classmethod
@@ -1100,16 +1128,17 @@ async def create_provider_model(
     row = await pool.fetchrow(
         """
         insert into public.provider_models(
-          provider_id,model_id,upstream_model_id,protocol,
+          provider_id,model_id,upstream_model_id,protocol,serves_protocols,
           capabilities,priority,weight,enabled,max_concurrency,settings,pricing
-        ) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb)
-        returning id,provider_id,model_id,upstream_model_id,protocol,
+        ) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb)
+        returning id,provider_id,model_id,upstream_model_id,protocol,serves_protocols,
                   capabilities,priority,weight,enabled,max_concurrency,settings,pricing
         """,
         body.provider_id,
         body.model_id,
         body.upstream_model_id,
         body.protocol,
+        [protocol.value for protocol in body.serves_protocols],
         body.capabilities,
         body.priority,
         body.weight,
@@ -1141,12 +1170,15 @@ async def update_provider_model(
         return _not_found("provider")
     row = await pool.fetchrow(
         """update public.provider_models set provider_id=$2,model_id=$3,upstream_model_id=$4,
-                   protocol=$5,capabilities=$6,priority=$7,weight=$8,enabled=$9,
-                   max_concurrency=$10,settings=$11::jsonb,pricing=$12::jsonb,updated_at=now()
+                   protocol=$5,serves_protocols=$6,capabilities=$7,priority=$8,weight=$9,
+                   enabled=$10,max_concurrency=$11,settings=$12::jsonb,pricing=$13::jsonb,
+                   updated_at=now()
            where id=$1 returning id,provider_id,model_id,upstream_model_id,protocol,
-                                  capabilities,priority,weight,enabled,max_concurrency,settings,pricing""",
+                                  serves_protocols,capabilities,priority,weight,enabled,
+                                  max_concurrency,settings,pricing""",
         provider_model_id, body.provider_id, body.model_id, body.upstream_model_id,
-        body.protocol, body.capabilities, body.priority, body.weight, body.enabled,
+        body.protocol, [protocol.value for protocol in body.serves_protocols],
+        body.capabilities, body.priority, body.weight, body.enabled,
           body.max_concurrency, json.dumps(body.settings), json.dumps(body.pricing),
     )
     if row is None:
@@ -1251,6 +1283,7 @@ async def model_routing(model_id: str, request: Request) -> JSONResponse:
         select p.id::text as provider_id, p.name as provider, p.health as provider_health,
                p.enabled as provider_enabled,
                pm.id::text as provider_model_id, pm.upstream_model_id, pm.protocol,
+               pm.serves_protocols,
                pm.capabilities, pm.enabled as mapping_enabled, r.priority,
                r.enabled as route_enabled,
                -- Effective routing: a route through a disabled provider or mapping
@@ -1617,7 +1650,8 @@ async def _snapshot_payload(pool: Any) -> dict[str, Any]:
         pool,
         """select pm.id::text,r.id::text as route_id,
                    pm.model_id as canonical_model_id,pm.provider_id::text,
-                   pm.upstream_model_id,pm.protocol,pm.capabilities,r.priority,pm.weight,
+                   pm.upstream_model_id,pm.protocol,pm.serves_protocols,
+                   pm.capabilities,r.priority,pm.weight,
                      pm.max_concurrency,
                      case when pm.settings ? 'default_headers'
                           then pm.settings->'default_headers' end as default_headers,

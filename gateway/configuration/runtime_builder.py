@@ -10,7 +10,8 @@ from gateway.auth import ClientPermissions, GatewayClient, InMemoryGatewayKeySto
 from gateway.logging import log_event
 from gateway.models import CanonicalModel, ModelRegistry, ProviderModel
 from gateway.protocols import Capability, ClientProtocol
-from gateway.providers import Credential, ProviderConfig
+from gateway.protocols.translate import get_translator
+from gateway.providers import Credential, ProviderConfig, TranslatingAdapter
 from gateway.providers.anthropic import AnthropicCompatibleAdapter
 from gateway.providers.egress import build_upstream_client
 from gateway.providers.openai import OpenAICompatibleAdapter
@@ -141,6 +142,10 @@ class SnapshotProviderModel(BaseModel):
     provider_id: str
     upstream_model_id: str
     protocol: ClientProtocol
+    # Client APIs this mapping answers; anything other than `protocol` is served by
+    # translating. Empty means the upstream protocol only, which is how every mapping
+    # behaved before this field existed and so is what an older snapshot must mean.
+    serves_protocols: frozenset[ClientProtocol] = frozenset()
     capabilities: frozenset[Capability]
     priority: int = 100
     weight: float = Field(default=1, gt=0)
@@ -327,6 +332,7 @@ class RuntimeBuilder:
                 pool_members=model.pool_members,
                 pool_strategy=model.pool_strategy,
                 allow_model_fallback=model.allow_model_fallback,
+                serves_protocols=model.serves_protocols,
             )
             for model in snapshot.provider_models
         ]
@@ -337,6 +343,15 @@ class RuntimeBuilder:
             if model.enabled
             for provider in snapshot.providers
             if provider.id == model.provider_id and provider.enabled
+        }
+        translating = {
+            (model.id, client_protocol): TranslatingAdapter(adapters[model.id], translator)
+            for model in snapshot.provider_models
+            if model.id in adapters
+            for client_protocol in sorted(model.serves_protocols)
+            # The registry covers every ordered pair of protocols, so None here is the
+            # identity pair: a protocol served natively, which needs no wrapper.
+            if (translator := get_translator(client_protocol, model.protocol)) is not None
         }
         credentials, credential_states = self._build_credentials(snapshot.credentials)
         provider_states = tuple(
@@ -359,6 +374,7 @@ class RuntimeBuilder:
             provider_states=provider_states,
             credential_states=credential_states,
             provider_model_adapters=adapters,
+            translating_adapters=translating,
             credentials=credentials,
             http_client=build_upstream_client(),
             route_controls=RouteControls(
@@ -387,14 +403,22 @@ class RuntimeBuilder:
                 else provider.timeout_seconds
             ),
         )
+        # A mapping may override a provider-wide setting, including overriding it to
+        # nothing: an explicit empty value is a decision, so absence is `is None`
+        # rather than falsiness.
+        default_headers = (
+            model.default_headers if model.default_headers is not None
+            else provider.default_headers
+        )
+        endpoint_query = (
+            model.endpoint_query if model.endpoint_query is not None
+            else provider.endpoint_query
+        )
         if protocol is ClientProtocol.ANTHROPIC_MESSAGES:
             return AnthropicCompatibleAdapter(
                 config,
-                default_headers=(
-                    model.default_headers
-                    if model.default_headers is not None
-                    else provider.default_headers
-                ),
+                default_headers=default_headers,
+                endpoint_query=endpoint_query,
                 required_betas=(
                     model.required_betas
                     if model.required_betas is not None
@@ -403,11 +427,6 @@ class RuntimeBuilder:
                 auth_scheme=(
                     model.auth_scheme if model.auth_scheme is not None else provider.auth_scheme
                 ),
-                endpoint_query=(
-                    model.endpoint_query
-                    if model.endpoint_query is not None
-                    else provider.endpoint_query
-                ),
             )
         if protocol not in {
             ClientProtocol.OPENAI_CHAT_COMPLETIONS,
@@ -415,17 +434,7 @@ class RuntimeBuilder:
         }:
             raise ValueError(f"Unsupported provider-model protocol: {protocol.value}")
         return OpenAICompatibleAdapter(
-            config,
-            default_headers=(
-                model.default_headers
-                if model.default_headers is not None
-                else provider.default_headers
-            ),
-            endpoint_query=(
-                model.endpoint_query
-                if model.endpoint_query is not None
-                else provider.endpoint_query
-            ),
+            config, default_headers=default_headers, endpoint_query=endpoint_query
         )
 
     def _build_credentials(

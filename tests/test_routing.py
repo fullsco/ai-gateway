@@ -421,6 +421,34 @@ def test_a_healthy_credential_is_preferred_over_one_on_trial() -> None:
     assert decision.credential.credential_id == "healthy"
 
 
+def _classifying_adapters() -> tuple:
+    """One adapter per protocol, so every classification assertion covers both.
+
+    AgentRouter answers the same credentials on /v1/messages and /v1/chat/completions,
+    so a rule that holds on one protocol holds on the other. The two adapters used to
+    carry separate copies of this logic and the copies drifted; asserting over both is
+    what keeps them from drifting again.
+    """
+    from gateway.protocols import ClientProtocol
+    from gateway.providers import ProviderConfig
+    from gateway.providers.anthropic import AnthropicCompatibleAdapter
+    from gateway.providers.openai import OpenAICompatibleAdapter
+
+    def config(protocol: ClientProtocol) -> ProviderConfig:
+        return ProviderConfig(
+            id="p",
+            name="P",
+            base_url="https://upstream.example",
+            protocol=protocol,
+            capabilities=frozenset(),
+        )
+
+    return (
+        AnthropicCompatibleAdapter(config(ClientProtocol.ANTHROPIC_MESSAGES)),
+        OpenAICompatibleAdapter(config(ClientProtocol.OPENAI_CHAT_COMPLETIONS)),
+    )
+
+
 def test_a_403_that_says_out_of_quota_is_not_read_as_a_rejected_credential() -> None:
     """Quota and authentication need opposite responses, so they must not collapse.
 
@@ -433,40 +461,66 @@ def test_a_403_that_says_out_of_quota_is_not_read_as_a_rejected_credential() -> 
     """
     import httpx
 
-    from gateway.protocols import ClientProtocol
-    from gateway.providers import ErrorCategory, ProviderConfig
-    from gateway.providers.anthropic import AnthropicCompatibleAdapter
-    from gateway.providers.openai import OpenAICompatibleAdapter
+    from gateway.providers import ErrorCategory
 
-    adapters = (
-        AnthropicCompatibleAdapter(
-            ProviderConfig(
-                id="p", name="P", base_url="https://upstream.example",
-                protocol=ClientProtocol.ANTHROPIC_MESSAGES, capabilities=frozenset(),
-            )
-        ),
-        OpenAICompatibleAdapter(
-            ProviderConfig(
-                id="p", name="P", base_url="https://upstream.example",
-                protocol=ClientProtocol.OPENAI_CHAT_COMPLETIONS, capabilities=frozenset(),
-            )
-        ),
-    )
-    for adapter in adapters:
+    for adapter in _classifying_adapters():
         out_of_quota = httpx.Response(
             403, json={"error": {"message": "user quota is not enough"}}
         )
         assert adapter.normalize_error(out_of_quota).category is ErrorCategory.QUOTA_EXHAUSTED
 
         # A 403 that is genuinely about the credential must still read that way, so
-        # the fix cannot swallow real rejections.
-        rejected = httpx.Response(
-            403, json={"error": {"message": "unauthorized client detected"}}
-        )
-        assert (
-            adapter.normalize_error(rejected).category
-            is ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR
-        )
+        # the fix cannot swallow real rejections. Both wordings below are ones the
+        # credential probe actually recorded (deploy/act_on_credential_probe.py), and
+        # both are properties of the key rather than of the caller: a sibling key may
+        # well be on the allow list, or entitled to the model.
+        for message in (
+            "the caller's IP is not on the token's allow list",
+            "the token may not access claude-opus-5",
+            "invalid api key",
+        ):
+            rejected = httpx.Response(403, json={"error": {"message": message}})
+            assert (
+                adapter.normalize_error(rejected).category
+                is ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR
+            ), message
+
+
+def test_a_refusal_of_the_client_does_not_condemn_the_credential() -> None:
+    """"unauthorized client detected" is a fingerprint check, not a key check.
+
+    Probing eight AgentRouter credentials parked as auth_failed with a minimal header
+    set returned this wording for all eight - the credential then serving every
+    production request among them - while the mapping's real headers got 200 from four
+    of them. Reading it as a rejected credential therefore walks the whole pool into
+    auth_failed one key at a time, and points the operator at rotation when the fix is
+    the request's headers.
+
+    Both statuses are asserted because the two records of this disagree: the probe
+    script logged 403, the relay findings logged 401. The wording is what identifies
+    it, not the status.
+    """
+    import httpx
+
+    from gateway.observability import _passive_health
+    from gateway.providers import ErrorCategory
+    from gateway.providers.base import RetryScope
+
+    for adapter in _classifying_adapters():
+        for status in (401, 403):
+            gated = httpx.Response(
+                status, json={"error": {"message": "unauthorized client detected"}}
+            )
+            error = adapter.normalize_error(gated)
+
+            assert error.category is ErrorCategory.UPSTREAM_WAF_REJECTION, status
+            # The invariant that matters: a valid credential must survive this.
+            assert error.credential_at_fault is False, status
+            assert _passive_health(error.category) != "auth_failed", status
+            # Provider-scoped, so failover does not burn a sibling key on a refusal
+            # that has nothing to do with which key was presented.
+            assert error.retry_scope is RetryScope.PROVIDER, status
+            assert error.retryable is True, status
 
 
 def test_every_failure_state_earns_a_way_back() -> None:
