@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 
 from gateway.admin.api import _authorize
 from gateway.admin.auth import AdminClaims
+from gateway.admin.model_serviceability import mapped_model_ids, sync_model_serviceability
 from gateway.configuration import (
     configuration_checksum,
     configuration_projection,
@@ -494,8 +495,29 @@ async def update_provider(
     )
     if row is None:
         return _not_found("provider")
-    await _audit(pool, claims, "provider_updated", "provider", provider_id, _audit_fields(body))
-    return JSONResponse(jsonable_encoder(dict(row)))
+    # Flipping `enabled` here changes whether this provider's models are reachable at
+    # all, so the catalogue has to be resynced the same way the setup wizard does it.
+    # Without this, saving a provider disabled stranded its models and re-enabling it
+    # left them switched off, with nothing in the response saying so - the operator was
+    # sent hunting through routes for a flag they never touched.
+    models_disabled, models_enabled = await sync_model_serviceability(
+        pool, await mapped_model_ids(pool, provider_id)
+    )
+    await _audit(
+        pool,
+        claims,
+        "provider_updated",
+        "provider",
+        provider_id,
+        _audit_fields(body)
+        | {"models_disabled": models_disabled, "models_enabled": models_enabled},
+    )
+    return JSONResponse(
+        jsonable_encoder(
+            dict(row)
+            | {"models_disabled": models_disabled, "models_enabled": models_enabled}
+        )
+    )
 
 
 # Models that would be left with no enabled route once $1 is deleted.

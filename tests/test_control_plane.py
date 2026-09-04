@@ -1449,3 +1449,158 @@ async def test_recording_a_balance_rejects_a_negative_amount() -> None:
             json={"amount": -1, "currency": "USD"},
         )
     assert response.status_code == 422, response.text
+
+
+class ProviderUpdatePool(FakePool):
+    """Answers the serviceability queries by what they ask rather than by call order.
+
+    `FakePool.fetch` pops a positional queue, which would pair the disable rows with
+    the enable statement the moment either query moved.
+    """
+
+    def __init__(
+        self,
+        *,
+        mapped: list[str] | None = None,
+        disabled: list[str] | None = None,
+        enabled: list[str] | None = None,
+    ) -> None:
+        super().__init__()
+        self.mapped = mapped or []
+        self.disabled = disabled or []
+        self.enabled = enabled or []
+        self.fetch_calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.fetchrow_result = {
+            "id": "provider-1",
+            "name": "SeekAI",
+            "provider_type": "anthropic_compatible",
+            "protocol": "anthropic_messages",
+            "base_url": "https://seekai.example.com",
+            "enabled": True,
+            "priority": 100,
+            "capabilities": ["reasoning", "tool_calling"],
+            "timeout_seconds": 600.0,
+            "settings": {},
+            "health": "healthy",
+        }
+
+    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        self.fetch_calls.append((query, args))
+        if "select distinct model_id from public.provider_models" in query:
+            return [{"model_id": model_id} for model_id in self.mapped]
+        if "update public.models m set enabled=false" in query:
+            return [{"id": model_id} for model_id in self.disabled]
+        if "update public.models m set enabled=true" in query:
+            return [{"id": model_id} for model_id in self.enabled]
+        return []
+
+
+def _provider_body(**overrides: Any) -> dict[str, Any]:
+    return {
+        "name": "SeekAI",
+        "base_url": "https://seekai.example.com",
+        "enabled": True,
+        "priority": 100,
+    } | overrides
+
+
+def _audit_metadata(pool: FakePool, action: str) -> dict[str, Any]:
+    for query, args in pool.execute_calls:
+        if "audit_logs" in query and args[1] == action:
+            return json.loads(args[4])
+    raise AssertionError(f"no {action} audit row in {pool.execute_calls}")
+
+
+@pytest.mark.asyncio
+async def test_enabling_a_provider_revives_the_models_its_own_flag_stranded() -> None:
+    """Re-enabling a provider has to switch its stranded models back on.
+
+    Saving a provider disabled strands every model only it serves - the reconcile in
+    the setup wizard does that deliberately. Turning the provider back on went through
+    this endpoint, which never re-ran that check, so the models stayed disabled and the
+    next request 404'd with a message about routes. The operator had no reason to look
+    at the model row: they never turned it off.
+    """
+    pool = ProviderUpdatePool(mapped=["claude-fable-5"], enabled=["claude-fable-5"])
+    with client(pool) as test_client:
+        response = test_client.put(
+            "/api/admin/v1/providers/provider-1",
+            headers=auth(),
+            json=_provider_body(enabled=True),
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["models_enabled"] == ["claude-fable-5"], response.text
+    assert body["models_disabled"] == [], response.text
+    # The provider row itself still comes back, so this stays a drop-in for callers.
+    assert body["name"] == "SeekAI", response.text
+    assert _audit_metadata(pool, "provider_updated") == {
+        "changed_fields": ["base_url", "enabled", "name", "priority"],
+        "models_disabled": [],
+        "models_enabled": ["claude-fable-5"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_disabling_a_provider_says_which_models_it_stranded() -> None:
+    pool = ProviderUpdatePool(mapped=["claude-fable-5"], disabled=["claude-fable-5"])
+    pool.fetchrow_result = dict(pool.fetchrow_result or {}) | {"enabled": False}
+    with client(pool) as test_client:
+        response = test_client.put(
+            "/api/admin/v1/providers/provider-1",
+            headers=auth(),
+            json=_provider_body(enabled=False),
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["models_disabled"] == ["claude-fable-5"], response.text
+    assert _audit_metadata(pool, "provider_updated")["models_disabled"] == [
+        "claude-fable-5"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_provider_update_judges_only_the_models_that_provider_maps() -> None:
+    """A provider with no mappings must not touch models.enabled at all.
+
+    The sync is scoped to the ids passed in, so an empty mapping list has to short
+    out before the update statements - otherwise an unrelated edit would sweep the
+    whole catalogue.
+    """
+    pool = ProviderUpdatePool(mapped=[])
+    with client(pool) as test_client:
+        response = test_client.put(
+            "/api/admin/v1/providers/provider-1",
+            headers=auth(),
+            json=_provider_body(),
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["models_enabled"] == [], response.text
+    touched = [query for query, _ in pool.fetch_calls if "update public.models" in query]
+    assert not touched, touched
+
+
+@pytest.mark.asyncio
+async def test_provider_update_reports_nothing_extra_when_it_is_missing() -> None:
+    pool = ProviderUpdatePool()
+    pool.fetchrow_result = None
+    with client(pool) as test_client:
+        response = test_client.put(
+            "/api/admin/v1/providers/provider-1",
+            headers=auth(),
+            json=_provider_body(),
+        )
+
+    assert response.status_code == 404, response.text
+    assert response.json() == {"error": "provider_not_found"}
+    # The background live-state refresh shares this pool, so only the serviceability
+    # queries are interesting here.
+    synced = [
+        query
+        for query, _ in pool.fetch_calls
+        if "update public.models" in query
+        or "select distinct model_id from public.provider_models" in query
+    ]
+    assert not synced, synced
