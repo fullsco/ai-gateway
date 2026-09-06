@@ -523,6 +523,49 @@ def test_a_refusal_of_the_client_does_not_condemn_the_credential() -> None:
             assert error.retryable is True, status
 
 
+def test_an_empty_distributor_channel_is_not_the_credential_s_quota() -> None:
+    """"No available channel" is the provider's stock-out, not the key's balance.
+
+    AgentRouter's distributor answers 402/403 "no available channel for model X
+    under group default" when it has no upstream channel left to route to, for
+    every key at once. The word "quota" inside "group quota"-adjacent wording is
+    what let these park as quota_exhausted: on 2026-09-06 all twenty-one
+    credentials flipped from 200s to 402/403 within one second at 19:19:43, every
+    one of them parked out-of-quota, several with $450+ of balance. The message
+    names no credential, so it must not condemn one: MODEL_UNAVAILABLE is
+    provider-scoped and not the credential's fault.
+    """
+    import httpx
+
+    from gateway.observability import _passive_health
+    from gateway.providers import ErrorCategory
+    from gateway.providers.base import RetryScope
+
+    for adapter in _classifying_adapters():
+        for status in (402, 403):
+            message = (
+                "No available channel for model claude-opus-5 under group default "
+                "(distributor)"
+            )
+            stock_out = httpx.Response(
+                status, json={"error": {"type": "provider_unavailable", "message": message}}
+            )
+            error = adapter.normalize_error(stock_out)
+
+            assert error.category is ErrorCategory.MODEL_UNAVAILABLE, status
+            # A key with balance must not be parked by a channel outage.
+            assert error.credential_at_fault is False, status
+            assert error.retry_scope is RetryScope.PROVIDER, status
+            assert _passive_health(error.category) != "quota_exhausted", status
+
+        # A 402 that is genuinely about the key's own balance must still park as
+        # quota, so the fix cannot swallow real stock-outs of the key.
+        broke = httpx.Response(
+            402, json={"error": {"message": "insufficient balance, please top up"}}
+        )
+        assert adapter.normalize_error(broke).category is ErrorCategory.QUOTA_EXHAUSTED
+
+
 def test_every_failure_state_earns_a_way_back() -> None:
     """A credential with no cooldown can never recover, so every state needs one.
 

@@ -30,6 +30,13 @@ DEFAULT_USER_AGENT = "ai-gateway/0.1"
 # a rejected credential on the other. The shorter substrings below subsume both sets.
 QUOTA_MARKERS = ("quota", "credit balance", "insufficient balance", "billing")
 
+# A distributor in front of the upstream has no channel left to route the model to.
+# AgentRouter answers this on HTTP 402/403 for every key at once, balance included -
+# measured 2026-09-06: every credential flipped from 200s to 402/403 in one second at
+# 19:19:43, all 21 keys parked quota_exhausted, several with $450+ of balance. The
+# word "quota" inside the message is what misled the marker into parking them.
+NO_CHANNEL_MARKERS = ("no available channel", "no channel available", "no channel")
+
 # A provider that gates on client identity answers 401/403 with this wording for
 # *every* key presented, working ones included. Measured on AgentRouter while probing
 # eight credentials parked as auth_failed: with a minimal header set all eight returned
@@ -193,6 +200,13 @@ def classify_upstream_status(
         # credential rejection. Without this a Cloudflare 403 parked every working key
         # on the provider in turn.
         return ErrorCategory.UPSTREAM_WAF_REJECTION
+    if status_code in {402, 403} and _matches(searchable, NO_CHANNEL_MARKERS):
+        # The distributor has no channel for the model, which no credential can fix:
+        # not this key's fault, not its balance. AgentRouter pairs the wording with
+        # 402/403, so the QUOTA_MARKERS match on "channel quota"-style messages must
+        # not get here first. Provider-scoped: a sibling key hits the same empty
+        # channel, so fail over at provider level.
+        return ErrorCategory.MODEL_UNAVAILABLE
     if status_code == 403 and _matches(searchable, QUOTA_MARKERS):
         # Some resellers answer 403 rather than 402 or 429 when a key is out of quota.
         # Reading that as a rejected credential parked working keys as auth_failed,
