@@ -428,7 +428,18 @@ def test_absent_credential_access_is_unrestricted_not_selective() -> None:
     ), "selective_pool_membership must first require that some pool member exists"
 
     # The genuinely selective case must still be detectable, so the pair check stays.
-    assert query.count("cross join provider_mappings pm where not exists") == 2
+    assert query.count("cross join provider_mappings pm") == 2
+
+    # Access is judged per credential: one with no rows at all may serve anything, so it
+    # cannot be the evidence that somebody curated the matrix. Membership is not, because
+    # an empty membership set excludes rather than permits.
+    assert (
+        "where exists (select 1 from public.credential_model_access cma "
+        "where cma.credential_id=c.id) and not exists" in access_condition
+    ), "selective_credential_access must ignore credentials that hold no access rows"
+    assert (
+        "cross join provider_mappings pm where not exists" in membership_condition
+    ), "selective_pool_membership must still judge every credential"
 
 
 def test_shared_model_conflict_names_the_field_that_differs() -> None:

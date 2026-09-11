@@ -710,6 +710,89 @@ def test_credential_creation_encrypts_secret_and_returns_only_masked_hint() -> N
     )
 
 
+def _credential_pool() -> FakePool:
+    pool = FakePool()
+    pool.fetchrow_result = {
+        "id": "credential-id",
+        "provider_id": "provider-id",
+        "name": "spare",
+        "masked_hint": "sk-t...7890",
+        "enabled": True,
+        "priority": 100,
+        "health": "healthy",
+        "quota_limit": None,
+        "quota_used": 0,
+        "cooldown_until": None,
+    }
+    return pool
+
+
+def _issued(pool: FakePool, fragment: str) -> tuple[str, tuple[Any, ...]]:
+    for query, args in pool.execute_calls:
+        if fragment in query:
+            return query, args
+    raise AssertionError(f"no statement containing {fragment!r} in {pool.execute_calls}")
+
+
+def test_creating_a_credential_joins_the_topology_its_siblings_hold() -> None:
+    """A new credential must be routable and must not brick the provider's setup form.
+
+    It used to get neither an access row nor a pool placement, so the router refused it
+    every route with credential_not_in_route_pool while the dashboard showed it healthy,
+    and the partial matrix it left behind read to the topology guard as a curated one -
+    the provider's form then refused every save, naming restrictions nobody had set.
+    """
+    pool = _credential_pool()
+    with client(pool) as test_client:
+        response = test_client.post(
+            "/api/admin/v1/credentials",
+            headers=auth(),
+            json={"provider_id": "provider-id", "name": "spare", "secret": "sk-test-1234567890"},
+        )
+
+    assert response.status_code == 201, response.text
+    # The id the row was inserted under, not the canned row: the endpoint generates it.
+    new_id = pool.fetchrow_calls[0][1][0]
+
+    access_query, access_args = _issued(pool, "insert into public.credential_model_access")
+    assert "where pm.provider_id=$2" in access_query, access_query
+    assert access_args == (new_id, "provider-id"), access_args
+
+    member_query, member_args = _issued(pool, "insert into public.provider_pool_members")
+    # distinct over the siblings' placements: the new credential joins the pools and
+    # mappings that are already in use, and invents none.
+    assert "select distinct ppm.pool_id" in member_query, member_query
+    assert member_args == (new_id, "provider-id", 100), member_args
+
+    # Both land before the audit, and the audit says what they did.
+    audit_query, audit_args = pool.execute_calls[-1]
+    assert "audit_logs" in audit_query
+    metadata = json.loads(audit_args[4])
+    assert metadata["model_access_rows"] == 0
+    assert metadata["pool_placements"] == 0
+    assert response.json()["pool_placements"] == 0, response.text
+
+
+def test_creating_a_credential_invents_no_restriction_where_there_is_none() -> None:
+    """Access rows may only be written for a provider that already keeps them.
+
+    An empty access set means "may serve anything" to the router, so writing a full set
+    for one new credential would be the first restriction on the provider - and would
+    make every sibling, which has no rows, look restricted by comparison.
+    """
+    pool = _credential_pool()
+    with client(pool) as test_client:
+        test_client.post(
+            "/api/admin/v1/credentials",
+            headers=auth(),
+            json={"provider_id": "provider-id", "name": "spare", "secret": "sk-test-1234567890"},
+        )
+
+    access_query, _ = _issued(pool, "insert into public.credential_model_access")
+    condition = access_query[access_query.index("where pm.provider_id=$2") :]
+    assert "exists (select 1 from public.credential_model_access a" in condition, access_query
+
+
 def test_credential_creation_persists_rate_limits_with_matching_parameters() -> None:
     pool = FakePool()
     pool.fetchrow_result = {

@@ -624,6 +624,61 @@ async def delete_provider(
     return JSONResponse({"deleted": True, "stranded_models": stranded})
 
 
+def _affected(status: Any) -> int:
+    """Row count from an asyncpg command tag like 'INSERT 0 5'."""
+    try:
+        return int(str(status).rsplit(" ", 1)[-1])
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _inherit_provider_topology(
+    pool: Any, provider_id: str, credential_id: str, priority: int
+) -> dict[str, int]:
+    """Give a new credential the same access and pool placements its siblings hold.
+
+    A credential created here used to get neither, which left it in two broken states at
+    once. The router builds allowed_credential_ids from pool membership, so a credential
+    in no pool is refused every route with credential_not_in_route_pool - it is added,
+    looks healthy in the dashboard, and silently carries nothing. And the partial matrix
+    it leaves behind reads to the topology guard as a deliberately curated one, so the
+    provider's setup form then refuses every save, with a message about restrictions
+    nobody set and no UI anywhere to clear them.
+
+    Access rows are written only for a provider that already keeps them: writing them for
+    a provider with none would invent a restriction where the router currently sees none.
+    Pool rows mirror the (pool, mapping) placements the siblings already occupy, so a
+    provider with no pool gains nothing here either. Both are idempotent.
+    """
+    access = await pool.execute(
+        """insert into public.credential_model_access(credential_id, provider_model_id)
+           select $1, pm.id from public.provider_models pm
+           where pm.provider_id=$2
+             and exists (select 1 from public.credential_model_access a
+                         join public.provider_credentials c on c.id=a.credential_id
+                         where c.provider_id=$2)
+           on conflict do nothing""",
+        credential_id,
+        provider_id,
+    )
+    members = await pool.execute(
+        """insert into public.provider_pool_members(
+             pool_id, provider_model_id, credential_id, priority, weight)
+           select distinct ppm.pool_id, pm.id, $1, $3, pm.weight
+           from public.provider_pool_members ppm
+           join public.provider_models pm on pm.id=ppm.provider_model_id
+           where pm.provider_id=$2
+           on conflict(pool_id,provider_model_id,credential_id) do nothing""",
+        credential_id,
+        provider_id,
+        priority,
+    )
+    return {
+        "model_access_rows": _affected(access),
+        "pool_placements": _affected(members),
+    }
+
+
 @router.post("/credentials")
 async def create_credential(request: Request, body: CredentialInput) -> JSONResponse:
     context = await _context(request)
@@ -661,11 +716,14 @@ async def create_credential(request: Request, body: CredentialInput) -> JSONResp
         body.requests_per_minute,
         body.tokens_per_minute,
     )
+    inherited = await _inherit_provider_topology(
+        pool, body.provider_id, credential_id, body.priority
+    )
     await _audit(
         pool, claims, "credential_created", "credential", credential_id,
-        {"changed_fields": sorted(body.model_fields_set - {"secret"})},
+        {"changed_fields": sorted(body.model_fields_set - {"secret"})} | inherited,
     )
-    return JSONResponse(jsonable_encoder(dict(row)), status_code=201)
+    return JSONResponse(jsonable_encoder(dict(row) | inherited), status_code=201)
 
 
 @router.post("/credentials/{credential_id}/rotate")
