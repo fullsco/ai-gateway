@@ -47,7 +47,22 @@ export const emptyMapping = (): MappingDraft => ({
 });
 export const text = (value: unknown, fallback = "") => String(value ?? fallback);
 export const list = (value: unknown) => Array.isArray(value) ? value.map(String) : [];
-export const object = (value: unknown): GatewayRow => value && typeof value === "object" && !Array.isArray(value) ? { ...(value as GatewayRow) } : {};
+// A jsonb column may arrive as a JSON string rather than a parsed object - the
+// admin API's Postgres connection has no jsonb codec, so `settings` and `pricing`
+// cross the wire quoted. Treating that string as "not an object" made every
+// hydrated field read empty: the provider form prefilled no headers, submitted an
+// empty settings object, and the reconcile save erased headers the operator never
+// touched. Parsing here keeps the round-trip intact whichever side sends which.
+export const object = (value: unknown): GatewayRow => {
+  if (typeof value === "string") {
+    try {
+      return object(JSON.parse(value));
+    } catch {
+      return {};
+    }
+  }
+  return value && typeof value === "object" && !Array.isArray(value) ? { ...(value as GatewayRow) } : {};
+};
 
 export function parsePairs(value: unknown): { name: string; value: string }[] {
   const source = object(value);

@@ -7,7 +7,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
-from gateway.admin.api import _authorize, _pool
+from gateway.admin.api import _authorize, _decode_jsonb_columns, _pool
 from gateway.health.probes import run_health_probes
 
 router = APIRouter(prefix="/api/admin/v1", tags=["admin-operations"])
@@ -148,7 +148,13 @@ async def list_pools(request: Request) -> JSONResponse:
         group by p.id order by p.name
         """
     )
-    return JSONResponse(jsonable_encoder({"data": [dict(row) for row in rows]}))
+    # settings is jsonb: decode it the way the admin list endpoints do, so the
+    # dashboard reads a pool's health/quota awareness instead of a JSON string.
+    return JSONResponse(
+        jsonable_encoder(
+            {"data": [_decode_jsonb_columns(dict(row)) for row in rows]}
+        )
+    )
 
 
 @router.post("/provider-pools")

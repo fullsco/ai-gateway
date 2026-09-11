@@ -160,6 +160,39 @@ describe("provider setup", () => {
     vi.stubGlobal("fetch", vi.fn(() => response({ error: "not_authenticated" }, 401)));
     await expect(gatewayApi("providers")).rejects.toThrow("Session expired");
   });
+
+  it("round-trips provider headers when settings arrive as a JSON string", async () => {
+    // The admin API's Postgres connection returns jsonb columns as raw JSON strings.
+    // The form used to read that string as "no settings", prefill no headers, and
+    // submit an empty settings object - which the reconcile save then wrote over a
+    // provider whose real settings carried the client-identity headers its edge
+    // demands. AgentRouter lost exactly that way and every key came back 401
+    // "unauthorized client detected". The hydration must parse the string, and the
+    // saved payload must carry the headers back.
+    let payload: GatewayRow = {};
+    const stringSettings = {
+      ...provider,
+      settings: JSON.stringify({
+        region: "east",
+        auth_scheme: "default",
+        default_headers: { originator: "codex_cli_rs", "user-agent": "codex_cli_rs/0.145.0" },
+        endpoint_query: {},
+      }),
+    };
+    vi.stubGlobal("fetch", fetchForWorkspace((value) => { payload = value; }));
+    render(<ProviderSetup provider={stringSettings} onClose={vi.fn()} onSaved={vi.fn(async () => undefined)} />);
+
+    await screen.findByDisplayValue("primary");
+    await userEvent.click(screen.getByRole("button", { name: "Save provider workspace" }));
+
+    await waitFor(() => expect(payload.settings).toBeDefined());
+    expect(payload.settings).toMatchObject({
+      region: "east",
+      auth_scheme: "default",
+      default_headers: { originator: "codex_cli_rs", "user-agent": "codex_cli_rs/0.145.0" },
+      endpoint_query: {},
+    });
+  });
 });
 
 describe("model selection", () => {
