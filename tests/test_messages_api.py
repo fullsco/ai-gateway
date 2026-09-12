@@ -309,6 +309,59 @@ def test_repeated_transport_failures_open_live_route_circuit() -> None:
     assert calls == 3
 
 
+def test_a_rationed_out_route_opens_the_circuit_instead_of_parking_the_key() -> None:
+    """A shared budget-pool stock-out must cost attempts per circuit window, not per request.
+
+    AgentRouter rations the Claude/GPT family into daily batches; when a batch runs
+    out it answers 402 "Budget pool quota has been exhausted" for every key at once.
+    Measured 2026-09-12: every request spent an attempt on the rationed route before
+    failing over, and the classifier's "quota" marker additionally parked the keys
+    themselves as quota_exhausted. The circuit is the right memory: route-scoped, so
+    sibling models on the same keys stay served, and half-open probes re-arm it at
+    the next batch release with no operator action.
+    """
+    calls = 0
+
+    def handler(request: httpx.Request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            402,
+            json={
+                "error": {
+                    "type": "bad_response_status_code",
+                    "message": (
+                        "Budget pool quota has been exhausted. Please ask an "
+                        "administrator to increase the limit or select another "
+                        "budget pool."
+                    ),
+                },
+                "type": "error",
+            },
+        )
+
+    runtime, key = make_runtime(handler)
+    app = create_app(Settings(environment="test", _env_file=None), runtime)
+
+    with TestClient(app) as client:
+        responses = [
+            client.post(
+                "/v1/messages",
+                headers={"x-api-key": key},
+                json={"model": "alias-x", "messages": []},
+            )
+            for _ in range(4)
+        ]
+
+    # The first three requests reach the provider and report its stock-out as a 404
+    # model_unavailable. The third failure opens the route circuit, so the fourth
+    # never reaches the provider - it is refused by the circuit and surfaces as
+    # no_eligible_route (503) instead of spending another attempt on a route the
+    # provider has said is rationed out for everyone.
+    assert [response.status_code for response in responses] == [404, 404, 404, 503]
+    assert calls == 3
+
+
 def test_failover_can_be_disabled_without_changing_route_configuration() -> None:
     calls = 0
 

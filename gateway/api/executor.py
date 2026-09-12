@@ -1273,7 +1273,21 @@ async def _finish_cancelled_request(
 
 
 def _affects_circuit(error: ProviderError) -> bool:
-    return error.category in {ErrorCategory.PROVIDER_UNAVAILABLE, ErrorCategory.TIMEOUT}
+    # MODEL_UNAVAILABLE joins the two transport categories because a stock-out is
+    # route-scoped exactly like an outage: the route cannot serve anyone right now,
+    # and this circuit is the only memory the gateway keeps per route. Measured
+    # 2026-09-12 on AgentRouter: the Claude/GPT budget pool ran out, and every
+    # request spent an attempt on the rationed route before failing over - while
+    # sibling routes for the same model on other providers were live. The circuit's
+    # half-open probe re-arms the route automatically at the provider's next batch
+    # release, so no operator action is involved. It must not fire on a *credential*
+    # failure, which is why the classifier's verdict (provider-scoped, not the
+    # credential's fault) is what gates this, not the status code alone.
+    return error.category in {
+        ErrorCategory.PROVIDER_UNAVAILABLE,
+        ErrorCategory.TIMEOUT,
+        ErrorCategory.MODEL_UNAVAILABLE,
+    }
 
 
 def _submit_health(

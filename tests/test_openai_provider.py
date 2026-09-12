@@ -82,7 +82,7 @@ def test_openai_quota_error_is_normalized() -> None:
         402,
         json={
             "error": {
-                "message": "Budget pool quota has been exhausted.",
+                "message": "insufficient_quota: this key is out of budget",
                 "type": "insufficient_quota",
                 "code": "insufficient_quota",
             }
@@ -96,6 +96,35 @@ def test_openai_quota_error_is_normalized() -> None:
     # fails over to another credential rather than failing outright.
     assert error.retryable is True
     assert error.retry_scope is RetryScope.CREDENTIAL
+
+
+def test_openai_shared_budget_pool_stockout_is_not_the_key_s_quota() -> None:
+    """AgentRouter rations the Claude/GPT family as shared budget pools, released
+    in batches at 00:00/08:00/16:00 UTC. When a batch runs out every key answers
+    402 "Budget pool quota has been exhausted" at once, whatever its balance, so
+    reading the word "quota" as the key's own parks the whole pool - measured
+    2026-09-12, all 21 AgentRouter credentials parked while glm-5.3 answered 200
+    on the same keys. It is a model-family stock-out, so the verdict is
+    MODEL_UNAVAILABLE: provider-scoped, not the credential's fault.
+    """
+    response = httpx.Response(
+        402,
+        json={
+            "error": {
+                "message": "Budget pool quota has been exhausted. Please ask an "
+                "administrator to increase the limit or select another budget pool.",
+                "type": "bad_response_status_code",
+                "code": "bad_response_status_code",
+            }
+        },
+    )
+
+    error = make_adapter().normalize_error(response)
+
+    assert error.category is ErrorCategory.MODEL_UNAVAILABLE
+    assert error.retryable is True
+    assert error.retry_scope is RetryScope.PROVIDER
+    assert error.credential_at_fault is False
 
 
 def test_openai_upstream_authentication_error_is_distinct_from_client_auth() -> None:
