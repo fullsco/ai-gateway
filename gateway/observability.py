@@ -174,6 +174,52 @@ class PassiveHealthRecorder:
                 event.observed_at,
                 event.source,
             )
+            # The observation cannot condemn the credential, but it is still fresh
+            # evidence about what is wrong - and the credential may be sitting under a
+            # label that this evidence proves wrong. Measured 2026-09-12: AgentRouter's
+            # shared Claude/GPT budget pool ran out, the "quota" marker parked all 21
+            # keys quota_exhausted, the misclassification was fixed - and the labels
+            # stayed, because this branch is the only writer a not-at-fault failure
+            # reaches, and it never touched the label. The keys kept failing their
+            # trials on the stock-out, writing degraded rows here, while the dashboard
+            # kept saying quota_exhausted and the router kept burning an attempt per
+            # request re-trying them. So: when the observed state is *milder* than the
+            # stored label, replace the label with what was actually observed. The
+            # replacement never promotes (that stays success-only), never touches a
+            # label it agrees with, and leaves the cooldown alone - so a genuinely
+            # drained key keeps its existing cooldown and merely reads as the
+            # provider's problem until a success or a key-at-fault failure re-labels it.
+            if health is not None and health != "healthy":
+                await self._pool.execute(
+                    """
+                    with previous as (
+                      select health::text as old_health
+                        from public.provider_credentials where id=$1
+                    ), updated as (
+                      update public.provider_credentials
+                         set health=$2::public.gateway_health_state, updated_at=now()
+                       where id=$1
+                         and health::text in ('quota_exhausted','auth_failed')
+                         and health::text <> $2::text
+                      returning health::text as new_health
+                    )
+                    insert into public.provider_events(
+                      provider_id,credential_id,event_type,metadata
+                    )
+                    select $3,$1,'health_transition',jsonb_build_object(
+                      'old_health',previous.old_health,'new_health',updated.new_health,
+                      'error_category',$4::text,'upstream_status',$5::integer,
+                      'source',$6::text,'recovered_by','not_at_fault_observation'
+                    ) from previous,updated
+                    where previous.old_health is distinct from updated.new_health
+                    """,
+                    event.credential_id,
+                    health,
+                    event.provider_id,
+                    event.error_category,
+                    event.upstream_status,
+                    event.source,
+                )
             if event.error_category is not None:
                 await self._alert(event)
             return

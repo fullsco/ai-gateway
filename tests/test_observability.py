@@ -656,7 +656,63 @@ def test_provider_level_failure_does_not_mark_the_credential_unhealthy() -> None
 
     joined = " ".join(pool.statements)
     assert "insert into public.health_checks" in joined
-    assert "update public.provider_credentials" not in joined
+    # The observation is recorded, and a *milder* observed state replaces a
+    # condemn-level label (quota_exhausted / auth_failed) that it proves wrong - the
+    # split-brain where the check rows said degraded while the label said
+    # quota_exhausted is what stranded 21 AgentRouter keys after the 2026-09-12
+    # stock-out. But it must never update a healthy or already-agreeing label.
+    assert "update public.provider_credentials" in joined
+    assert "health::text in ('quota_exhausted','auth_failed')" in joined
+    assert "set health='healthy'" not in joined
+
+
+def test_a_not_at_fault_observation_never_relabels_a_healthy_credential() -> None:
+    """The demotion path must be unreachable for healthy credentials.
+
+    The update is guarded to ('quota_exhausted','auth_failed') in SQL, but the guard
+    is what keeps a provider blip from rewriting labels it has no evidence against.
+    Asserting the WHERE shape directly is the contract; the previous test covers the
+    positive direction.
+    """
+    import asyncio
+
+    from gateway.observability import PassiveHealthEvent, PassiveHealthRecorder
+
+    class RecordingPool:
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+
+        async def execute(self, query, *args):
+            self.statements.append(" ".join(query.split()))
+
+    pool = RecordingPool()
+
+    async def run() -> None:
+        recorder = PassiveHealthRecorder(pool)
+        await recorder._persist(  # noqa: SLF001 - exercising the persistence branch
+            PassiveHealthEvent(
+                provider_id="p1",
+                credential_id="c1",
+                provider_model_id="pm1",
+                request_id="req-2",
+                attempt_number=1,
+                observed_at=datetime.now(UTC),
+                latency_ms=12.0,
+                error_category="model_unavailable",
+                upstream_status=402,
+                credential_at_fault=False,
+            )
+        )
+
+    asyncio.run(run())
+
+    joined = " ".join(pool.statements)
+    # The stock-out observation lands in health_checks ...
+    assert "insert into public.health_checks" in joined
+    # ... and the label rewrite can only ever target the two condemn states, never
+    # healthy, degraded or unavailable - those are observations it must not touch.
+    assert "and health::text in ('quota_exhausted','auth_failed')" in joined
+    assert "and health::text <> $2::text" in joined
 
 
 def test_measured_blended_rate_prices_total_tokens() -> None:
