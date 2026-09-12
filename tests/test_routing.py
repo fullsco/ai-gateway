@@ -566,6 +566,58 @@ def test_an_empty_distributor_channel_is_not_the_credential_s_quota() -> None:
         assert adapter.normalize_error(broke).category is ErrorCategory.QUOTA_EXHAUSTED
 
 
+def test_a_spent_shared_budget_pool_is_not_the_credential_s_quota() -> None:
+    """A rationed model family is the provider's stock-out, not the key's balance.
+
+    AgentRouter publishes Claude/GPT capacity as shared budget pools released in
+    batches at 00:00/08:00/16:00 UTC. When a batch runs out it answers 402/403
+    "Budget pool quota has been exhausted" for every key at once, balance included -
+    measured 2026-09-12 21:38 UTC: all 21 credentials parked quota_exhausted, six of
+    them having served 200s on the same model minutes earlier, and the same keys
+    answered 200 on glm-5.3 the whole time. The ration is per model family, so
+    parking the key strands its healthy routes for every other model too. The word
+    "quota" inside the message is what misled the marker, exactly as with the
+    distributor's "no channel" stock-out.
+    """
+    import httpx
+
+    from gateway.observability import _passive_health
+    from gateway.providers import ErrorCategory
+    from gateway.providers.base import RetryScope
+
+    for adapter in _classifying_adapters():
+        for status in (402, 403):
+            rationed = httpx.Response(
+                status,
+                json={
+                    "error": {
+                        "type": "bad_response_status_code",
+                        "message": (
+                            "Budget pool quota has been exhausted. Please ask an "
+                            "administrator to increase the limit or select another "
+                            "budget pool. (request id: 20260913063737852509031696j5HT85pwud)"
+                        ),
+                    },
+                    "type": "error",
+                },
+            )
+            error = adapter.normalize_error(rationed)
+
+            assert error.category is ErrorCategory.MODEL_UNAVAILABLE, status
+            # A key with balance must not be parked by a family-wide ration.
+            assert error.credential_at_fault is False, status
+            assert error.retry_scope is RetryScope.PROVIDER, status
+            assert _passive_health(error.category) != "quota_exhausted", status
+
+        # The key's own balance must still park as quota - the ration cannot become
+        # an amnesty for genuinely drained keys.
+        drained = httpx.Response(
+            403,
+            json={"error": {"type": "new_api_error", "message": "user quota is not enough"}},
+        )
+        assert adapter.normalize_error(drained).category is ErrorCategory.QUOTA_EXHAUSTED
+
+
 def test_every_failure_state_earns_a_way_back() -> None:
     """A credential with no cooldown can never recover, so every state needs one.
 

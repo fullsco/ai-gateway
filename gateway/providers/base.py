@@ -37,6 +37,17 @@ QUOTA_MARKERS = ("quota", "credit balance", "insufficient balance", "billing")
 # word "quota" inside the message is what misled the marker into parking them.
 NO_CHANNEL_MARKERS = ("no available channel", "no channel available", "no channel")
 
+# A provider that rations a model family by shared daily batch answers with this
+# wording when the batch runs out, for every key at once, whatever the key's own
+# balance. AgentRouter publishes the Claude/GPT ration as budget pools released at
+# 00:00/08:00/16:00 UTC; measured 2026-09-12 21:38 UTC: "Budget pool quota has been
+# exhausted" on claude-opus-5 while the same keys answered 200 on glm-5.3, and all
+# 21 were parked quota_exhausted, including six that were serving 200s on the very
+# model minutes earlier. The batch is per model family, so the right recovery is
+# routing around the model (fail over to another provider or fallback), not
+# parking the keys - which also strands their healthy routes for every other model.
+BUDGET_POOL_MARKERS = ("budget pool",)
+
 # A provider that gates on client identity answers 401/403 with this wording for
 # *every* key presented, working ones included. Measured on AgentRouter while probing
 # eight credentials parked as auth_failed: with a minimal header set all eight returned
@@ -206,6 +217,16 @@ def classify_upstream_status(
         # 402/403, so the QUOTA_MARKERS match on "channel quota"-style messages must
         # not get here first. Provider-scoped: a sibling key hits the same empty
         # channel, so fail over at provider level.
+        return ErrorCategory.MODEL_UNAVAILABLE
+    if status_code in {402, 403} and _matches(searchable, BUDGET_POOL_MARKERS):
+        # The model family's shared daily batch is spent until the next release slot.
+        # Same evidence shape as the empty channel above, and same trap: "quota" in
+        # the wording would park every key on the provider, including the ones with
+        # balance - measured 2026-09-12, 21 of 21 AgentRouter credentials parked by a
+        # Claude/GPT ration while glm-5.3 answered 200 on the same keys. The ration
+        # is per model family, so MODEL_UNAVAILABLE (provider-scoped, not the
+        # credential's fault) both says the truth and leaves the keys free to serve
+        # every model that still has a batch.
         return ErrorCategory.MODEL_UNAVAILABLE
     if status_code == 403 and _matches(searchable, QUOTA_MARKERS):
         # Some resellers answer 403 rather than 402 or 429 when a key is out of quota.
