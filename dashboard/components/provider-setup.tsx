@@ -211,7 +211,15 @@ export default function ProviderSetup({ provider, onClose, onSaved }: { provider
         mappings: mappings.map((item) => ({
           model_id: item.model_id.trim(), upstream_model_id: item.upstream_model_id.trim(), protocol: item.protocol, serves_protocols: item.serves_protocols, capabilities: item.capabilities,
           enabled: item.enabled, max_concurrency: Number(item.max_concurrency), priority: Number(item.priority), weight: Number(item.weight), settings: JSON.parse(item.settings_json || "{}"),
-          pricing: item.input_price ? { ...item.pricing_metadata, input_per_million: Number(item.input_price), output_per_million: Number(item.output_price), ...(item.cached_price ? { cached_input_per_million: Number(item.cached_price) } : {}), currency: item.currency.trim().toUpperCase() } : {},
+          // The form only edits token rates. A mapping priced another way
+          // (per_request, blended_per_million) arrives with no input_price, and
+          // sending pricing:{} would wipe it in the database - priced usage
+          // stopped 2026-09-02 for exactly that reason. Send the untouched
+          // object through so the operator's save of unrelated fields cannot
+          // destroy a rate the form never showed.
+          pricing: item.input_price
+            ? { ...item.pricing_metadata, input_per_million: Number(item.input_price), output_per_million: Number(item.output_price), ...(item.cached_price ? { cached_input_per_million: Number(item.cached_price) } : {}), currency: item.currency.trim().toUpperCase() }
+            : { ...item.pricing_metadata, ...(Object.keys(item.pricing_metadata).length ? { currency: item.currency.trim().toUpperCase() } : {}) },
         })),
         routes: mappings.filter((item) => item.route_present).map((item) => ({ model_id: item.model_id.trim(), mapping_upstream_model_id: item.upstream_model_id.trim(), mapping_protocol: item.protocol, priority: Number(item.route_priority), enabled: item.route_enabled, allow_model_fallback: item.allow_model_fallback })),
         pool_strategy: strategy, pool_enabled: poolEnabled, ...poolMetadata.current,
