@@ -89,6 +89,18 @@ class PassiveHealthRecorder:
     async def _persist(self, event: PassiveHealthEvent) -> None:
         health = _passive_health(event.error_category)
         if event.source != "passive":
+            # A synthetic probe never condemns a credential (its evidence is weaker
+            # than real traffic), and only a stock-out observation may demote: a
+            # probe answered model_unavailable when the route it probed is rationed
+            # out for every key, which directly contradicts a per-key
+            # quota_exhausted/auth_failed label. Any other probe failure - a WAF
+            # challenge page, a 503, a timeout, an ambiguous 403 - says nothing
+            # about the credential either way, so it must leave the label alone.
+            # Without this, an idle mislabeled key never self-corrects: the router
+            # does not select it (healthy siblings win), so passive traffic never
+            # re-labels it, and the probe was its only witness.
+            if event.error_category == "model_unavailable":
+                await self._demote_wrong_condemnation(event, health)
             await self._pool.execute(
                 """
                 insert into public.health_checks(
@@ -176,50 +188,8 @@ class PassiveHealthRecorder:
             )
             # The observation cannot condemn the credential, but it is still fresh
             # evidence about what is wrong - and the credential may be sitting under a
-            # label that this evidence proves wrong. Measured 2026-09-12: AgentRouter's
-            # shared Claude/GPT budget pool ran out, the "quota" marker parked all 21
-            # keys quota_exhausted, the misclassification was fixed - and the labels
-            # stayed, because this branch is the only writer a not-at-fault failure
-            # reaches, and it never touched the label. The keys kept failing their
-            # trials on the stock-out, writing degraded rows here, while the dashboard
-            # kept saying quota_exhausted and the router kept burning an attempt per
-            # request re-trying them. So: when the observed state is *milder* than the
-            # stored label, replace the label with what was actually observed. The
-            # replacement never promotes (that stays success-only), never touches a
-            # label it agrees with, and leaves the cooldown alone - so a genuinely
-            # drained key keeps its existing cooldown and merely reads as the
-            # provider's problem until a success or a key-at-fault failure re-labels it.
-            if health is not None and health != "healthy":
-                await self._pool.execute(
-                    """
-                    with previous as (
-                      select health::text as old_health
-                        from public.provider_credentials where id=$1
-                    ), updated as (
-                      update public.provider_credentials
-                         set health=$2::public.gateway_health_state, updated_at=now()
-                       where id=$1
-                         and health::text in ('quota_exhausted','auth_failed')
-                         and health::text <> $2::text
-                      returning health::text as new_health
-                    )
-                    insert into public.provider_events(
-                      provider_id,credential_id,event_type,metadata
-                    )
-                    select $3,$1,'health_transition',jsonb_build_object(
-                      'old_health',previous.old_health,'new_health',updated.new_health,
-                      'error_category',$4::text,'upstream_status',$5::integer,
-                      'source',$6::text,'recovered_by','not_at_fault_observation'
-                    ) from previous,updated
-                    where previous.old_health is distinct from updated.new_health
-                    """,
-                    event.credential_id,
-                    health,
-                    event.provider_id,
-                    event.error_category,
-                    event.upstream_status,
-                    event.source,
-                )
+            # label that this evidence proves wrong (see _demote_wrong_condemnation).
+            await self._demote_wrong_condemnation(event, health)
             if event.error_category is not None:
                 await self._alert(event)
             return
@@ -271,6 +241,63 @@ class PassiveHealthRecorder:
         )
         if event.error_category is not None:
             await self._alert(event)
+
+    async def _demote_wrong_condemnation(
+        self, event: PassiveHealthEvent, health: str | None
+    ) -> None:
+        """Replace a condemn-level label that fresh evidence proves wrong.
+
+        A not-at-fault failure cannot condemn a credential, but it is still fresh
+        evidence about what is actually wrong - and the credential may be sitting
+        under a label that this evidence contradicts. Measured 2026-09-12:
+        AgentRouter's shared Claude/GPT budget pool ran out, the "quota" marker
+        parked all 21 keys quota_exhausted, the misclassification was fixed - and
+        the labels stayed, because the not-at-fault branch was the only writer such
+        a failure reaches, and it never touched the label. The keys kept failing
+        their recovery trials on the stock-out, writing degraded check rows, while
+        the dashboard kept saying quota_exhausted and the router kept burning an
+        attempt per request re-trying them.
+
+        The rewrite only ever demotes, and only from the two condemn states: it
+        never promotes (restoring health stays success-only), never touches a label
+        it agrees with, never reaches healthy/degraded/unavailable/rate_limited
+        labels, and leaves the cooldown alone - so a genuinely drained key keeps
+        its existing cooldown and merely reads as the provider's problem until a
+        success or a key-at-fault failure re-labels it. The transition is written
+        to provider_events like every other health change.
+        """
+        if health is None or health == "healthy":
+            return
+        await self._pool.execute(
+            """
+            with previous as (
+              select health::text as old_health
+                from public.provider_credentials where id=$1
+            ), updated as (
+              update public.provider_credentials
+                 set health=$2::public.gateway_health_state, updated_at=now()
+               where id=$1
+                 and health::text in ('quota_exhausted','auth_failed')
+                 and health::text <> $2::text
+              returning health::text as new_health
+            )
+            insert into public.provider_events(
+              provider_id,credential_id,event_type,metadata
+            )
+            select $3,$1,'health_transition',jsonb_build_object(
+              'old_health',previous.old_health,'new_health',updated.new_health,
+              'error_category',$4::text,'upstream_status',$5::integer,
+              'source',$6::text,'recovered_by','not_at_fault_observation'
+            ) from previous,updated
+            where previous.old_health is distinct from updated.new_health
+            """,
+            event.credential_id,
+            health,
+            event.provider_id,
+            event.error_category,
+            event.upstream_status,
+            event.source,
+        )
 
     async def _alert(self, event: PassiveHealthEvent) -> None:
         await evaluate_alert_rules(

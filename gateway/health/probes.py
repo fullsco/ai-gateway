@@ -137,6 +137,12 @@ async def run_health_probes(
                             ErrorCategory.UPSTREAM_WAF_REJECTION,
                             "Health probe received an ambiguous upstream 403.",
                             upstream_status=status,
+                            # Still possibly a genuine key rejection, so the event
+                            # stays at-fault and the not-at-fault label demotion must
+                            # not fire on it: demoting an auth_failed label on a
+                            # 403 the probe could not interpret would relabel a
+                            # genuinely dead key as the provider's problem.
+                            credential_at_fault=True,
                         )
             except (TimeoutError, httpx.TransportError) as exc:
                 error = build_provider_error(
@@ -189,6 +195,10 @@ async def run_health_probes(
                         upstream_status=error.upstream_status if error else status,
                         retry_after_seconds=error.retry_after_seconds if error else None,
                         source="manual" if manual else "automatic",
+                        # An ambiguous probe 403 is overridden to at-fault so it can
+                        # never demote an auth_failed label on evidence that could
+                        # not tell a WAF challenge from a real key rejection.
+                        credential_at_fault=error.credential_at_fault if error else True,
                     )
                 )
     return summary
