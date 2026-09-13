@@ -764,6 +764,15 @@ def test_creating_a_credential_joins_the_topology_its_siblings_hold() -> None:
     assert "select distinct ppm.pool_id" in member_query, member_query
     assert member_args == (new_id, "provider-id", 100), member_args
 
+    # These statements are INSERT ... SELECT, not INSERT ... VALUES: Postgres cannot
+    # infer a parameter type from the target column there, so an uncast parameter
+    # arrives as text and the prepare fails against a real database
+    # (DatatypeMismatchError, uuid vs text) - which rolled back every credential
+    # creation since the inheritance shipped. The fake pool used here cannot catch
+    # that, so the casts are pinned explicitly.
+    assert "select $1::uuid, pm.id" in access_query, access_query
+    assert "$1::uuid, $3::int" in member_query, member_query
+
     # Both land before the audit, and the audit says what they did.
     audit_query, audit_args = pool.execute_calls[-1]
     assert "audit_logs" in audit_query

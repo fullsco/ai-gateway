@@ -652,7 +652,7 @@ async def _inherit_provider_topology(
     """
     access = await pool.execute(
         """insert into public.credential_model_access(credential_id, provider_model_id)
-           select $1, pm.id from public.provider_models pm
+           select $1::uuid, pm.id from public.provider_models pm
            where pm.provider_id=$2
              and exists (select 1 from public.credential_model_access a
                          join public.provider_credentials c on c.id=a.credential_id
@@ -664,7 +664,7 @@ async def _inherit_provider_topology(
     members = await pool.execute(
         """insert into public.provider_pool_members(
              pool_id, provider_model_id, credential_id, priority, weight)
-           select distinct ppm.pool_id, pm.id, $1, $3, pm.weight
+           select distinct ppm.pool_id, pm.id, $1::uuid, $3::int, pm.weight
            from public.provider_pool_members ppm
            join public.provider_models pm on pm.id=ppm.provider_model_id
            where pm.provider_id=$2
