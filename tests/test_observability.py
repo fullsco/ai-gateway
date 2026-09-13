@@ -186,6 +186,89 @@ def test_stream_usage_accumulator_tracks_cumulative_growth() -> None:
     assert accumulator.usage == (120, 31, None, None)
 
 
+def test_extracts_usage_nested_in_a_responses_terminal_event() -> None:
+    """The Responses API streams usage only inside the terminal response object.
+
+    Captured verbatim from AgentRouter on a streamed /v1/responses request: the
+    response.completed event carries usage at response.usage, never top level,
+    so reading only the top level recorded no tokens for 97% of streamed
+    Responses traffic (gpt-6-astra: 401 attempts, 8 usage rows).
+    """
+    usage = extract_usage(
+        ClientProtocol.OPENAI_RESPONSES,
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_probe",
+                    "usage": {
+                        "input_tokens": 12,
+                        "input_tokens_details": {
+                            "cached_tokens": 0,
+                            "cache_write_tokens": 0,
+                        },
+                        "output_tokens": 5,
+                        "output_tokens_details": {"reasoning_tokens": 0},
+                        "total_tokens": 17,
+                    },
+                },
+            }
+        ).encode(),
+    )
+
+    assert usage == (12, 5, 0, 0)
+
+
+def test_responses_stream_accumulator_reads_terminal_event() -> None:
+    """A Responses SSE stream only reports usage on the terminal event.
+
+    The accumulator sees every event of the stream, so the fix must hold when
+    frames are fed whole and when the terminal event straddles a chunk
+    boundary; and the trailing zeros on non-terminal frames must not win.
+    """
+    accumulator = StreamUsageAccumulator(ClientProtocol.OPENAI_RESPONSES)
+
+    accumulator.feed(
+        b'event: response.created\ndata: {"type":"response.created","response":{}}\n\n'
+    )
+    accumulator.feed(
+        b'event: output_text.delta\ndata: {"type":"output_text.delta","delta":"ok"}\n\n'
+    )
+    accumulator.feed(
+        b'event: response.completed\ndata: {"type":"response.completed",'
+        b'"response":{"usage":{"input_tokens":12,'
+    )
+    accumulator.feed(
+        b'"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},'
+        b'"output_tokens":5,"total_tokens":17}}}\n\n'
+    )
+
+    assert accumulator.usage == (12, 5, 0, 0)
+
+
+def test_responses_cache_write_is_carried_as_its_own_dimension() -> None:
+    """Responses reports cache writes Chat Completions never does; keep them separate."""
+    usage = extract_usage(
+        ClientProtocol.OPENAI_RESPONSES,
+        json.dumps(
+            {
+                "response": {
+                    "usage": {
+                        "input_tokens": 100,
+                        "input_tokens_details": {
+                            "cached_tokens": 20,
+                            "cache_write_tokens": 80,
+                        },
+                        "output_tokens": 9,
+                    }
+                }
+            }
+        ).encode(),
+    )
+
+    assert usage == (100, 9, 20, 80)
+
+
 
 @pytest.mark.parametrize(
     ("category", "health"),

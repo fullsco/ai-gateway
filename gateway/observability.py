@@ -9,7 +9,9 @@ from typing import Any
 
 from gateway.alerts import AlertEvent, evaluate_alert_rules
 from gateway.logging import log_event
+from gateway.metrics import measured
 from gateway.protocols import ClientProtocol
+from gateway.protocols.event_buffer import EventBuffer
 
 # input total (inclusive of both cached dimensions), output, cache read, cache write
 Usage = tuple[int | None, int | None, int | None, int | None]
@@ -390,6 +392,7 @@ class RequestRecorder:
         self._pool = pool
         self.request_id = request_id
 
+    @measured("request_persistence")
     async def start_request(
         self,
         *,
@@ -413,6 +416,7 @@ class RequestRecorder:
             started_at,
         )
 
+    @measured("attempt_persistence")
     async def start_attempt(
         self,
         *,
@@ -438,6 +442,7 @@ class RequestRecorder:
             started_at,
         )
 
+    @measured("attempt_persistence")
     async def finish_attempt(
         self,
         attempt_id: int | None,
@@ -467,6 +472,7 @@ class RequestRecorder:
             latency_ms,
         )
 
+    @measured("request_persistence")
     async def finish_request(
         self,
         *,
@@ -505,6 +511,7 @@ class RequestRecorder:
             json.dumps(traces, default=str),
         )
 
+    @measured("usage_persistence")
     async def record_usage(
         self,
         attempt_id: int | None,
@@ -625,6 +632,14 @@ def extract_usage(
     except (json.JSONDecodeError, UnicodeDecodeError):
         return None
     usage = payload.get("usage") if isinstance(payload, dict) else None
+    # The Responses API streams usage only inside the terminal response object
+    # (response.completed / response.incomplete / response.failed), nested at
+    # response.usage rather than top level. Reading only the top level meant
+    # 97% of streamed Responses traffic recorded no tokens at all.
+    if not isinstance(usage, dict) and isinstance(payload, dict):
+        response = payload.get("response")
+        if isinstance(response, dict) and isinstance(response.get("usage"), dict):
+            usage = response["usage"]
     if not isinstance(usage, dict):
         return None
     if protocol is ClientProtocol.ANTHROPIC_MESSAGES:
@@ -651,12 +666,16 @@ def extract_usage(
     else:
         input_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
         cached = input_details.get("cached_tokens") if isinstance(input_details, dict) else None
+        cache_write = None
+        if isinstance(input_details, dict):
+            # Responses reports cache writes that Chat Completions never does;
+            # a write is billed above the base rate, so it must not fold into reads.
+            cache_write = input_details.get("cache_write_tokens")
         raw_values = (
             usage.get("prompt_tokens", usage.get("input_tokens")),
             usage.get("completion_tokens", usage.get("output_tokens")),
             cached,
-            # Chat Completions does not report a cache write dimension.
-            None,
+            cache_write,
         )
     if any(value is not None and _integer(value) is None for value in raw_values):
         return None
@@ -756,18 +775,13 @@ class StreamUsageAccumulator:
 
     def __init__(self, protocol: ClientProtocol) -> None:
         self._protocol = protocol
-        self._buffer = bytearray()
+        self._frames = EventBuffer(self.MAX_EVENT_BYTES, discard_oversize=True)
+        self._buffer = self._frames.buffer
         self._usage: Usage | None = None
 
     def feed(self, chunk: bytes) -> None:
-        self._buffer.extend(chunk)
-        while separator := self._separator():
-            index, length = separator
-            event = bytes(self._buffer[:index])
-            del self._buffer[: index + length]
+        for event in self._frames.feed(chunk):
             self._consume_event(event)
-        if len(self._buffer) > self.MAX_EVENT_BYTES:
-            self._buffer.clear()
 
     @property
     def usage(self) -> Usage | None:
