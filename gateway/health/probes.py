@@ -251,8 +251,27 @@ async def health_probe_loop(
 
 
 def _looks_like_api_response(response: httpx.Response) -> bool:
-    """True when the body plausibly came from the provider API, not an edge page."""
+    """True when the body plausibly came from the provider API, not an edge page.
+
+    Content-type alone cannot decide this: AgentRouter answers a successful
+    POST /v1/messages with a valid Anthropic message object under
+    `text/plain; charset=utf-8` (measured 2026-09-13 on a priority-0 claude-opus-5
+    route), so a type-only check misread every success on those routes as a WAF
+    challenge page and the probes never healed a single one of those labels -
+    the stock-out demotion machinery had nothing to demote *to*. JSON and SSE
+    content types are accepted as before; any other type is decided by the
+    body: valid JSON is an API response, markup or an empty body is not.
+    """
     content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     if content_type == "text/event-stream":
         return True
-    return content_type == "application/json" or content_type.endswith("+json")
+    if content_type == "application/json" or content_type.endswith("+json"):
+        return True
+    if content_type in {"text/plain", "text/plain-char", ""} or content_type.startswith("text/"):
+        try:
+            parsed = response.json()
+        except ValueError:
+            # HTML interstitials, parking pages and empty bodies land here.
+            return False
+        return isinstance(parsed, (dict, list))
+    return False
