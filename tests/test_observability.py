@@ -267,6 +267,47 @@ async def test_synthetic_health_observation_does_not_update_credential_state() -
     assert args[-1] == "automatic"
 
 
+@pytest.mark.asyncio
+async def test_a_probe_stock_out_observation_demotes_a_wrong_condemnation() -> None:
+    """An idle mislabeled key's only witness is the probe, so stock-outs demote there.
+
+    A credential wrongly parked quota_exhausted by a stock-out misclassification is
+    never selected while healthy siblings exist, so passive traffic never
+    re-labels it. The probe is its only witness - and when the probe's own route
+    answers model_unavailable (the rationed model family), that observation
+    contradicts the per-key label exactly as a real not-at-fault request would.
+    Any other probe failure says nothing about the key and must not demote; the
+    previous test pins that for provider_unavailable.
+    """
+    pool = TelemetryPool()
+    recorder = PassiveHealthRecorder(pool)
+    observed = datetime.now(UTC)
+
+    await recorder._persist(
+        PassiveHealthEvent(
+            provider_id="provider",
+            credential_id="credential",
+            provider_model_id="provider-model",
+            request_id="health-probe",
+            attempt_number=0,
+            observed_at=observed,
+            latency_ms=10,
+            error_category="model_unavailable",
+            upstream_status=402,
+            source="automatic",
+            credential_at_fault=False,
+        )
+    )
+
+    assert len(pool.execute_calls) == 2
+    demote_query, _ = pool.execute_calls[0]
+    assert "update public.provider_credentials" in demote_query
+    assert "health::text in ('quota_exhausted','auth_failed')" in demote_query
+    assert "recovered_by','not_at_fault_observation'" in demote_query
+    check_query, _ = pool.execute_calls[1]
+    assert "insert into public.health_checks" in check_query
+
+
 def test_passive_health_queue_saturation_drops_without_raising() -> None:
     recorder = PassiveHealthRecorder(TelemetryPool(), max_queue_size=1)
     event = PassiveHealthEvent(

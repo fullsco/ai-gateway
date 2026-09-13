@@ -174,9 +174,19 @@ def build_provider_error(
     *,
     upstream_status: int | None = None,
     retry_after_seconds: float | None = None,
+    credential_at_fault: bool | None = None,
 ) -> ProviderError:
-    """Create a ProviderError with the retry semantics for its category."""
+    """Create a ProviderError with the retry semantics for its category.
+
+    `credential_at_fault` defaults to the category's semantics, which describe
+    real traffic. A synthetic probe may override it toward "we cannot tell" - the
+    one direction a weaker source of evidence is allowed to move the verdict,
+    because a probe that cannot distinguish a WAF challenge from a key rejection
+    must neither condemn an innocent key nor vouch for a dead one.
+    """
     retryable, scope, at_fault = _RETRY_SEMANTICS[category]
+    if credential_at_fault is not None:
+        at_fault = credential_at_fault
     return ProviderError(
         category=category,
         message=message,
