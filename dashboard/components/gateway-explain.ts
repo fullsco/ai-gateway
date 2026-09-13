@@ -25,6 +25,8 @@ export function explainError(value: unknown): string {
       "The client's key is valid, but its client is not allowed this protocol or model, or the key is revoked or expired. Fix it in Clients, not at the provider.",
     quota_exhausted:
       "This credential is out of quota or balance. Another credential or provider with headroom is required.",
+    budget_pool_stockout:
+      "This credential's batch of the model family's rationed budget pool is spent, but only for that family. The provider releases the next batch periodically; other families on the same credential still work, and credentials with allotment left are used first.",
     timeout: "The provider did not respond before the configured timeout.",
     provider_unavailable:
       "The provider could not be reached or returned a server error. Traffic moves to another eligible provider.",
@@ -47,6 +49,8 @@ const EXCLUSION_REASONS: Record<string, string> = {
   provider_disabled: "The provider is turned off",
   provider_circuit_open: "Paused after repeated failures, and not yet retried",
   credential_excluded_this_request: "Already tried and failed earlier in this same request",
+  credential_budget_pool_stockout:
+    "Out of its budget-pool batch for this model family (other families still work)",
   credential_disabled: "The credential is turned off",
   credential_other_provider: "Belongs to a different provider",
   credential_in_cooldown: "Cooling down after a recent failure",

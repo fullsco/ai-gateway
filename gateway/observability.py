@@ -91,15 +91,16 @@ class PassiveHealthRecorder:
         if event.source != "passive":
             # A synthetic probe never condemns a credential (its evidence is weaker
             # than real traffic), and only a stock-out observation may demote: a
-            # probe answered model_unavailable when the route it probed is rationed
-            # out for every key, which directly contradicts a per-key
-            # quota_exhausted/auth_failed label. Any other probe failure - a WAF
-            # challenge page, a 503, a timeout, an ambiguous 403 - says nothing
-            # about the credential either way, so it must leave the label alone.
-            # Without this, an idle mislabeled key never self-corrects: the router
-            # does not select it (healthy siblings win), so passive traffic never
-            # re-labels it, and the probe was its only witness.
-            if event.error_category == "model_unavailable":
+            # probe answered model_unavailable or budget_pool_stockout when the
+            # route it probed is rationed out for every key, which directly
+            # contradicts a per-key quota_exhausted/auth_failed label. Any other
+            # probe failure - a WAF challenge page, a 503, a timeout, an ambiguous
+            # 403 - says nothing about the credential either way, so it must leave
+            # the label alone. Without this, an idle mislabeled key never
+            # self-corrects: the router does not select it (healthy siblings win),
+            # so passive traffic never re-labels it, and the probe was its only
+            # witness.
+            if event.error_category in ("model_unavailable", "budget_pool_stockout"):
                 await self._demote_wrong_condemnation(event, health)
             await self._pool.execute(
                 """
@@ -338,6 +339,12 @@ _RECOVERY_COOLDOWN_SECONDS = {
     "quota_exhausted": 900,
     "auth_failed": 3600,
 }
+# "degraded" appears for several categories; the stock-out is excluded from that
+# cooldown table on purpose: a 402 on the rationed family must not park the
+# credential at all, since it still serves every other family (measured
+# 2026-09-13: the same keys answered 200 on glm-5.3). test_every_failure_state_
+# earns_a_way_back permits an entry here to be absent when the not-at-fault
+# branch never applies a cooldown for it.
 
 
 def _recovery_cooldown(health: str | None, event: PassiveHealthEvent) -> datetime | None:
@@ -368,6 +375,13 @@ def _passive_health(error_category: str | None) -> str | None:
         # Returning None here suppressed even the health_checks row, so the single
         # largest failure category was invisible in the Health view.
         "model_unavailable": "degraded",
+        # A rationed-family stock-out is neither the key's balance nor a route-wide
+        # outage - measured 2026-09-13, drained keys answered 200 on glm-5.3. The
+        # event is not at fault (see _RETRY_SEMANTICS), so this label can never
+        # condemn the credential or set a cooldown; "degraded" merely keeps the
+        # observation visible in the Health view while the per-(credential, route)
+        # stock-out memory in live state does the actual skipping.
+        "budget_pool_stockout": "degraded",
     }.get(error_category)
 
 

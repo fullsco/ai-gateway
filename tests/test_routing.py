@@ -567,17 +567,16 @@ def test_an_empty_distributor_channel_is_not_the_credential_s_quota() -> None:
 
 
 def test_a_spent_shared_budget_pool_is_not_the_credential_s_quota() -> None:
-    """A rationed model family is the provider's stock-out, not the key's balance.
+    """A rationed family's batch drain is per credential, not the key's balance.
 
-    AgentRouter publishes Claude/GPT capacity as shared budget pools released in
-    batches at 00:00/08:00/16:00 UTC. When a batch runs out it answers 402/403
-    "Budget pool quota has been exhausted" for every key at once, balance included -
-    measured 2026-09-12 21:38 UTC: all 21 credentials parked quota_exhausted, six of
-    them having served 200s on the same model minutes earlier, and the same keys
-    answered 200 on glm-5.3 the whole time. The ration is per model family, so
-    parking the key strands its healthy routes for every other model too. The word
-    "quota" inside the message is what misled the marker, exactly as with the
-    distributor's "no channel" stock-out.
+    AgentRouter publishes Claude/GPT capacity as budget pools released in batches
+    (Beijing 07:00/19:00 = 23:00/11:00 UTC). Measured 2026-09-13 18:54 UTC: six keys
+    answered 200 on gpt-6-astra while fourteen answered 402/403 "Budget pool quota
+    has been exhausted" at the same moment - and those same fourteen answered 200
+    on glm-5.3. So the drain is per credential and per family: fail over to a
+    sibling key on this route, never park the key (that strands its healthy routes
+    for every other family), and never read the word "quota" as the key's own
+    balance - which is what parked all 21 keys on 2026-09-12.
     """
     import httpx
 
@@ -603,10 +602,15 @@ def test_a_spent_shared_budget_pool_is_not_the_credential_s_quota() -> None:
             )
             error = adapter.normalize_error(rationed)
 
-            assert error.category is ErrorCategory.MODEL_UNAVAILABLE, status
-            # A key with balance must not be parked by a family-wide ration.
+            assert error.category is ErrorCategory.BUDGET_POOL_STOCKOUT, status
+            # A key with balance must not be parked by a ration: the failure is
+            # scoped to (key, family), not to the key itself.
             assert error.credential_at_fault is False, status
-            assert error.retry_scope is RetryScope.PROVIDER, status
+            # A sibling key may still have batch allotment, so the next attempt
+            # should try one instead of abandoning the route as provider-wide.
+            assert error.retry_scope is RetryScope.CREDENTIAL, status
+            # The passive label must never condemn the credential overall: the
+            # same keys served glm-5.3 the whole time.
             assert _passive_health(error.category) != "quota_exhausted", status
 
         # The key's own balance must still park as quota - the ration cannot become
@@ -645,10 +649,16 @@ def test_every_failure_state_earns_a_way_back() -> None:
         )
 
     # Every health state the gateway can write for a failure must be recoverable.
+    # budget_pool_stockout is exempt: it maps to "degraded" but is not-at-fault, so
+    # _persist never applies a cooldown for it - the credential still serves other
+    # families and must not be parked (the route-scoped memory in live state is
+    # what skips it on the drained route).
+    exempt = {ErrorCategory.BUDGET_POOL_STOCKOUT.value}
     reachable = {
         _passive_health(category.value)
         for category in ErrorCategory
         if _passive_health(category.value) not in (None, "healthy")
+        and category.value not in exempt
     }
     missing = reachable - set(_RECOVERY_COOLDOWN_SECONDS)
     assert not missing, f"these failure states can never be retried: {sorted(missing)}"

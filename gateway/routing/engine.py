@@ -182,6 +182,7 @@ class RoutingEngine:
         now: datetime | None = None,
         excluded_credential_ids: frozenset[str] = frozenset(),
         excluded_provider_model_ids: frozenset[str] = frozenset(),
+        stockout_credential_ids: dict[str, frozenset[str]] | None = None,
         trace: RoutingTrace | None = None,
         diagnostics: dict[str, dict[str, Any]] | None = None,
     ) -> RouteDecision:
@@ -223,12 +224,16 @@ class RoutingEngine:
             for credential in credentials:
                 if credential.provider_id != provider_model.provider_id:
                     continue
+                stockouts = (stockout_credential_ids or {}).get(
+                    provider_model.id, frozenset()
+                )
                 reason = self._credential_exclusion_reason(
                     credential,
                     provider_model,
                     provider,
                     current_time,
                     excluded_credential_ids,
+                    stockout_ids=stockouts,
                 )
                 entry: dict[str, Any] = {
                     "provider_id": provider_model.provider_id,
@@ -382,9 +387,16 @@ class RoutingEngine:
         provider: ProviderState,
         now: datetime,
         excluded_ids: frozenset[str],
+        stockout_ids: frozenset[str] = frozenset(),
     ) -> str | None:
         if credential.credential_id in excluded_ids:
             return "credential_excluded_this_request"
+        if credential.credential_id in stockout_ids:
+            # This credential's batch of this route's rationed family is spent.
+            # Route-scoped by design: the same credential stays eligible on every
+            # other route (measured 2026-09-13, drained keys answered 200 on
+            # glm-5.3), and sibling credentials stay eligible on this one.
+            return "credential_budget_pool_stockout"
         if not credential.enabled:
             return "credential_disabled"
         if credential.provider_id != provider_model.provider_id:

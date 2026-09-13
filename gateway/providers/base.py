@@ -38,14 +38,16 @@ QUOTA_MARKERS = ("quota", "credit balance", "insufficient balance", "billing")
 NO_CHANNEL_MARKERS = ("no available channel", "no channel available", "no channel")
 
 # A provider that rations a model family by shared daily batch answers with this
-# wording when the batch runs out, for every key at once, whatever the key's own
-# balance. AgentRouter publishes the Claude/GPT ration as budget pools released at
-# 00:00/08:00/16:00 UTC; measured 2026-09-12 21:38 UTC: "Budget pool quota has been
-# exhausted" on claude-opus-5 while the same keys answered 200 on glm-5.3, and all
-# 21 were parked quota_exhausted, including six that were serving 200s on the very
-# model minutes earlier. The batch is per model family, so the right recovery is
-# routing around the model (fail over to another provider or fallback), not
-# parking the keys - which also strands their healthy routes for every other model.
+# wording when the batch runs out, whatever the key's own balance. AgentRouter
+# publishes the Claude/GPT ration as budget pools released at Beijing 07:00/19:00
+# (23:00/11:00 UTC). Measured 2026-09-13 18:54 UTC, per key and per family: six keys
+# answered 200 on gpt-6-astra while fourteen answered 402 "Budget pool quota has been
+# exhausted" on astra/claude-opus-5/gpt-5.6-sol at the same moment - and those same
+# fourteen answered 200 on glm-5.3. The drain is therefore per credential, not
+# provider-wide: a sibling key may still serve, and the same key still serves other
+# families. Both scopes matter, which is why this gets its own category rather than
+# borrowing MODEL_UNAVAILABLE (provider-scoped) or QUOTA_EXHAUSTED (the key's own
+# balance, all models).
 BUDGET_POOL_MARKERS = ("budget pool",)
 
 # A provider that gates on client identity answers 401/403 with this wording for
@@ -69,11 +71,19 @@ class ErrorCategory(StrEnum):
     UPSTREAM_WAF_REJECTION = "upstream_waf_rejection"
     RATE_LIMIT = "rate_limit"
     QUOTA_EXHAUSTED = "quota_exhausted"
+    # The credential's allotment of a rationed model family is spent until the
+    # provider releases the next batch, but the credential still works for other
+    # families and sibling credentials may still have allotment on this one. Both
+    # scopes at once, so neither QUOTA_EXHAUSTED (the key's own balance, every
+    # model) nor MODEL_UNAVAILABLE (the provider does not serve the model) says
+    # the truth.
+    BUDGET_POOL_STOCKOUT = "budget_pool_stockout"
     MODEL_UNAVAILABLE = "model_unavailable"
     # The model is configured, but every route or credential that could serve it
     # was ineligible at this moment: unhealthy, cooling down, out of quota, at its
-    # concurrency limit, or behind an open circuit. Distinct from
-    # MODEL_UNAVAILABLE, which means the provider does not serve the model at all.
+    # concurrency limit, behind an open circuit, or stock-out of a rationed
+    # family's batch. Distinct from MODEL_UNAVAILABLE, which means the provider
+    # does not serve the model at all.
     NO_ELIGIBLE_ROUTE = "no_eligible_route"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
     TIMEOUT = "timeout"
@@ -155,6 +165,13 @@ _RETRY_SEMANTICS: dict[ErrorCategory, tuple[bool, RetryScope, bool]] = {
     ErrorCategory.RATE_LIMIT: (True, RetryScope.CREDENTIAL, True),
     # This key is out of quota; a sibling key may still have budget.
     ErrorCategory.QUOTA_EXHAUSTED: (True, RetryScope.CREDENTIAL, True),
+    # This key's batch of the rationed family is spent, but only for that family -
+    # measured 2026-09-13: drained keys still answered 200 on glm-5.3, and sibling
+    # keys still answered 200 on the rationed model. Fail over to a sibling key, but
+    # the credential is not at fault *as a credential*: nothing here may condemn or
+    # park it, or the drain strands its healthy routes for every other family. The
+    # per-(credential, route) stock-out memory in live state is what remembers it.
+    ErrorCategory.BUDGET_POOL_STOCKOUT: (True, RetryScope.CREDENTIAL, False),
     # This provider does not serve the model; another provider might.
     ErrorCategory.MODEL_UNAVAILABLE: (True, RetryScope.PROVIDER, False),
     # Nothing was contacted, because nothing was eligible. Retrying inside this
@@ -229,15 +246,14 @@ def classify_upstream_status(
         # channel, so fail over at provider level.
         return ErrorCategory.MODEL_UNAVAILABLE
     if status_code in {402, 403} and _matches(searchable, BUDGET_POOL_MARKERS):
-        # The model family's shared daily batch is spent until the next release slot.
-        # Same evidence shape as the empty channel above, and same trap: "quota" in
-        # the wording would park every key on the provider, including the ones with
-        # balance - measured 2026-09-12, 21 of 21 AgentRouter credentials parked by a
-        # Claude/GPT ration while glm-5.3 answered 200 on the same keys. The ration
-        # is per model family, so MODEL_UNAVAILABLE (provider-scoped, not the
-        # credential's fault) both says the truth and leaves the keys free to serve
-        # every model that still has a batch.
-        return ErrorCategory.MODEL_UNAVAILABLE
+        # This credential's batch of the rationed family is spent. Same trap as the
+        # empty channel above: "quota" in the wording parked keys whose balance was
+        # fine - measured 2026-09-12, 21 of 21 AgentRouter credentials parked by a
+        # Claude/GPT ration. But measured again 2026-09-13 the drain is per
+        # credential, not per provider: six keys served the rationed model while
+        # fourteen got this 402, so a sibling key is worth the next attempt and
+        # MODEL_UNAVAILABLE's provider scope would strand the whole route.
+        return ErrorCategory.BUDGET_POOL_STOCKOUT
     if status_code == 403 and _matches(searchable, QUOTA_MARKERS):
         # Some resellers answer 403 rather than 402 or 429 when a key is out of quota.
         # Reading that as a rejected credential parked working keys as auth_failed,
