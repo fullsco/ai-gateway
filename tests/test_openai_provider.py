@@ -99,13 +99,15 @@ def test_openai_quota_error_is_normalized() -> None:
 
 
 def test_openai_shared_budget_pool_stockout_is_not_the_key_s_quota() -> None:
-    """AgentRouter rations the Claude/GPT family as shared budget pools, released
-    in batches at 00:00/08:00/16:00 UTC. When a batch runs out every key answers
-    402 "Budget pool quota has been exhausted" at once, whatever its balance, so
-    reading the word "quota" as the key's own parks the whole pool - measured
-    2026-09-12, all 21 AgentRouter credentials parked while glm-5.3 answered 200
-    on the same keys. It is a model-family stock-out, so the verdict is
-    MODEL_UNAVAILABLE: provider-scoped, not the credential's fault.
+    """AgentRouter rations the Claude/GPT family as budget pools released in
+    batches (Beijing 07:00/19:00). When a key's batch runs out it answers 402
+    "Budget pool quota has been exhausted", whatever the key's balance. Measured
+    2026-09-13 18:54 UTC the drain is per credential, not per provider: six keys
+    answered 200 on the rationed model while fourteen answered this 402 at the
+    same moment, and the same fourteen answered 200 on glm-5.3. So the verdict is
+    BUDGET_POOL_STOCKOUT: fail over to a sibling key (credential scope), but not
+    the key's fault - parking it would strand its healthy routes for other
+    families.
     """
     response = httpx.Response(
         402,
@@ -121,9 +123,9 @@ def test_openai_shared_budget_pool_stockout_is_not_the_key_s_quota() -> None:
 
     error = make_adapter().normalize_error(response)
 
-    assert error.category is ErrorCategory.MODEL_UNAVAILABLE
+    assert error.category is ErrorCategory.BUDGET_POOL_STOCKOUT
     assert error.retryable is True
-    assert error.retry_scope is RetryScope.PROVIDER
+    assert error.retry_scope is RetryScope.CREDENTIAL
     assert error.credential_at_fault is False
 
 

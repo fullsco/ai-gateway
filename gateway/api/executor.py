@@ -191,6 +191,16 @@ async def execute_request(
             trace.fallback_reason = (
                 last_error.category.value if last_error is not None else "retry"
             )
+        # Route-scoped budget-pool stock-outs, keyed provider_model_id -> the
+        # credentials currently skipped on it. Per key and per family, so a
+        # drained credential must not be offered this route again while its
+        # sibling keys are still serving it - but must stay eligible everywhere
+        # else. Expiry is inside the map's source (live state), not here.
+        stockout_ids: dict[str, frozenset[str]] = {}
+        if live_state is not None:
+            for cred_id, model_id in live_state.stockout_keys:
+                stockout_ids.setdefault(model_id, set()).add(cred_id)
+            stockout_ids = {k: frozenset(v) for k, v in stockout_ids.items()}
         try:
             route = runtime.routing_engine.select(
                 normalized,
@@ -198,6 +208,7 @@ async def execute_request(
                 credential_states,
                 excluded_credential_ids=excluded,
                 excluded_provider_model_ids=excluded_routes,
+                stockout_credential_ids=stockout_ids,
                 trace=trace,
                 diagnostics=diagnostics,
             )
@@ -491,6 +502,7 @@ async def execute_request(
                                 latency_ms=_latency_ms(
                                     attempt_started_at, datetime.now(UTC)
                                 ),
+                                provider_model_id=route.provider_model.id,
                             )
                         return StreamingResponse(
                             _stream_response(
@@ -536,6 +548,7 @@ async def execute_request(
                             credential_id=route.credential.credential_id,
                             succeeded=True,
                             latency_ms=latency_ms,
+                            provider_model_id=route.provider_model.id,
                         )
                     _submit_health(
                         health_recorder,
@@ -664,6 +677,7 @@ async def execute_request(
                 latency_ms=_latency_ms(attempt_started_at, datetime.now(UTC)),
                 retry_after_seconds=last_error.retry_after_seconds if last_error else None,
                 credential_at_fault=last_error.credential_at_fault if last_error else True,
+                provider_model_id=route.provider_model.id,
             )
 
         # Always retire the credential that just failed for this request.
@@ -745,6 +759,26 @@ async def execute_request(
     # The model is configured; nothing that could serve it was eligible right now.
     # Reporting this as model_unavailable told the operator the model was missing,
     # which sent them to look at mappings instead of at health, quota and cooldown.
+    # When the routing trace shows every exclusion was a budget-pool stock-out, say
+    # that instead: the batch is spent on those credentials, and the request
+    # deliberately spent zero attempts re-proving it (the memory expires and one
+    # re-test follows - the batch itself re-arms roughly every 12 hours).
+    excluded_reasons = {
+        entry.get("reason")
+        for trace in traces
+        for entry in trace.get("considered", [])
+        if not entry.get("eligible")
+    }
+    if excluded_reasons == {"credential_budget_pool_stockout"} and traces:
+        return client_error(
+            ErrorCategory.BUDGET_POOL_STOCKOUT,
+            "Every credential that serves this model has spent its budget-pool "
+            "allotment for the current batch. The provider releases the next batch "
+            "periodically; requests fail fast until then instead of spending "
+            "attempts on it. Other model families on the same credentials are "
+            "unaffected.",
+            503,
+        )
     return client_error(
         category,
         "No provider route for this model is currently eligible. The routing trace "
@@ -1273,16 +1307,21 @@ async def _finish_cancelled_request(
 
 
 def _affects_circuit(error: ProviderError) -> bool:
-    # MODEL_UNAVAILABLE joins the two transport categories because a stock-out is
-    # route-scoped exactly like an outage: the route cannot serve anyone right now,
-    # and this circuit is the only memory the gateway keeps per route. Measured
-    # 2026-09-12 on AgentRouter: the Claude/GPT budget pool ran out, and every
-    # request spent an attempt on the rationed route before failing over - while
-    # sibling routes for the same model on other providers were live. The circuit's
-    # half-open probe re-arms the route automatically at the provider's next batch
-    # release, so no operator action is involved. It must not fire on a *credential*
-    # failure, which is why the classifier's verdict (provider-scoped, not the
-    # credential's fault) is what gates this, not the status code alone.
+    # MODEL_UNAVAILABLE joins the two transport categories because a "no channel"
+    # stock-out is route-scoped exactly like an outage: the distributor has nothing
+    # left to route the model to, for any credential. It must not fire on a
+    # *credential* failure, which is why the classifier's verdict (provider-scoped,
+    # not the credential's fault) is what gates this, not the status code alone.
+    #
+    # BUDGET_POOL_STOCKOUT deliberately stays out. Measured 2026-09-13 18:54 UTC:
+    # the ration drain is per credential, not per route - six AgentRouter keys
+    # answered 200 on gpt-6-astra while fourteen answered 402 at the same moment.
+    # A circuit here would open the route for all twenty keys after three of the
+    # fourteen drained ones happened to be tried first, refusing service from the
+    # six that were still serving (measured again at 17:33: three 402s opened the
+    # route circuit and four requests failed in ~200ms as no_eligible_route). The
+    # per-(credential, route) stock-out memory in live state is the mechanism that
+    # skips drained keys instead, one credential at a time.
     return error.category in {
         ErrorCategory.PROVIDER_UNAVAILABLE,
         ErrorCategory.TIMEOUT,

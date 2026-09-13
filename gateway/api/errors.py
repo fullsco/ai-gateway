@@ -11,6 +11,7 @@ ERROR_STATUS = {
     ErrorCategory.UPSTREAM_WAF_REJECTION: 502,
     ErrorCategory.RATE_LIMIT: 429,
     ErrorCategory.QUOTA_EXHAUSTED: 429,
+    ErrorCategory.BUDGET_POOL_STOCKOUT: 503,
     ErrorCategory.MODEL_UNAVAILABLE: 404,
     ErrorCategory.NO_ELIGIBLE_ROUTE: 503,
     ErrorCategory.PROVIDER_UNAVAILABLE: 503,

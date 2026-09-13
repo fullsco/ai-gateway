@@ -46,6 +46,13 @@ logger = logging.getLogger("gateway.routing.live_state")
 _UNROUTABLE = set(HealthState) - ROUTABLE_HEALTH
 
 _FAILURE_WINDOW_SECONDS = 300.0
+# How long a credential's observed budget-pool stock-out on a route is remembered.
+# AgentRouter re-batches the rationed families roughly every 12 hours (Beijing
+# 07:00/19:00), but a stock-out observed at 12:00 may clear at any key-specific
+# moment within the batch window, so the memory is deliberately short and cheap to
+# re-learn: after this long the credential earns one re-test attempt on the route,
+# and if the 402 is still the answer the clock simply starts again.
+_STOCKOUT_TTL_SECONDS = 900.0
 # After a persisted non-routable health state has been in place this long, allow one
 # half-open trial so the credential can prove it recovered. Without this a credential
 # marked unavailable can never earn the success that would clear it.
@@ -203,6 +210,23 @@ class LiveOperationalState:
         self._clock = clock
         self._credentials: dict[str, _CredentialRuntime] = {}
         self._providers: dict[str, _ProviderRuntime] = {}
+        # Route-scoped budget-pool stock-outs, (credential_id, provider_model_id)
+        # -> wall-clock expiry. Survives refresh() because it is fed only by real
+        # attempt outcomes, never by configuration. Wall-clock (not the injectable
+        # monotonic clock) because `overlay` hands the expiry to the engine as a
+        # datetime to compare against `now`, and a restart clears the map anyway.
+        self._stockouts: dict[tuple[str, str], datetime] = {}
+
+    @property
+    def stockout_keys(self) -> frozenset[tuple[str, str]]:
+        """Live (credential_id, provider_model_id) stock-out pairs, expired ones
+        dropped. Exposed for diagnostics and tests; expiry is lazily enforced on
+        every read so no background sweep is needed."""
+        now = datetime.now(UTC)
+        for key, expiry in list(self._stockouts.items()):
+            if expiry <= now:
+                del self._stockouts[key]
+        return frozenset(self._stockouts)
 
     @property
     def quota_policy(self) -> QuotaPolicy:
@@ -227,6 +251,7 @@ class LiveOperationalState:
         retry_after_seconds: float | None = None,
         tokens: int | None = None,
         credential_at_fault: bool = True,
+        provider_model_id: str | None = None,
     ) -> None:
         """Fold one attempt outcome into live state, effective immediately."""
         now = self._clock()
@@ -238,6 +263,11 @@ class LiveOperationalState:
         if latency_ms is not None:
             cred.latency_ms = _smooth(cred.latency_ms, latency_ms)
             prov.latency_ms = _smooth(prov.latency_ms, latency_ms)
+
+        if provider_model_id is not None:
+            self._record_route_stockout(
+                credential_id, provider_model_id, now, succeeded, error_category
+            )
 
         if succeeded:
             cred.successes.append(now)
@@ -279,6 +309,36 @@ class LiveOperationalState:
         if tokens <= 0:
             return
         self._credential(credential_id).tokens.append((self._clock(), int(tokens)))
+
+    def _record_route_stockout(
+        self,
+        credential_id: str,
+        provider_model_id: str,
+        now: float,
+        succeeded: bool,
+        error_category: str | None,
+    ) -> None:
+        """Remember or clear this credential's budget-pool stock-out on this route.
+
+        Keyed per (credential, route) because the drain is per key and per family -
+        measured 2026-09-13, the same drained keys answered 200 on glm-5.3 - so a
+        credential skipped here stays fully eligible on every other route.
+        """
+        key = (credential_id, provider_model_id)
+        if error_category == ErrorCategory.BUDGET_POOL_STOCKOUT.value and not succeeded:
+            self._stockouts[key] = datetime.now(UTC) + timedelta(
+                seconds=_STOCKOUT_TTL_SECONDS
+            )
+        elif key in self._stockouts:
+            # Any other outcome on this credential+route - a success proving the
+            # batch refilled, or a different failure - ends the memory.
+            del self._stockouts[key]
+
+    def route_stockout_excluded(self, credential_id: str, provider_model_id: str) -> bool:
+        """Whether this credential is currently skipped on this route for a
+        remembered budget-pool stock-out whose TTL has not yet expired."""
+        expiry = self._stockouts.get((credential_id, provider_model_id))
+        return expiry is not None and expiry > datetime.now(UTC)
 
     # ----------------------------------------------------------------- refresh
 
@@ -386,6 +446,7 @@ class LiveOperationalState:
             )
 
         new_credentials: list[CredentialState] = []
+        stockouts = self.stockout_keys
         for credential in credentials:
             runtime = self._credentials.get(credential.credential_id)
             if runtime is None:
@@ -473,6 +534,10 @@ class LiveOperationalState:
                 "recent_requests": len(runtime.requests),
                 "last_error_category": runtime.last_error_category,
                 "cooldown_until": cooldown.isoformat() if cooldown else None,
+                "stockout_routes": sorted(
+                    model_id for cred_id, model_id in stockouts
+                    if cred_id == credential.credential_id
+                ),
                 "latency_ms": round(runtime.latency_ms, 1)
                 if runtime.latency_ms is not None
                 else None,
