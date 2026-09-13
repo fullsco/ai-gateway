@@ -1248,26 +1248,18 @@ async def update_provider_model(
     )
     if provider is None:
         return _not_found("provider")
-    # A save that omits pricing must not wipe it. pricing defaults to {} in the
-    # input model, and "field absent" and "deliberately blanked" are the same dict
-    # once parsed, so the only safe reading of an empty dict is "not sent" - an
-    # operator clearing a rate explicitly edits the field to nothing and the
-    # dashboard never sends {} for a mapping it loaded with prices. This is the
-    # exact path that emptied every AgentRouter row on 2026-09-11 and left all
-    # usage since unpriced.
-    pricing_json = json.dumps(body.pricing) if body.pricing else "null"
     row = await pool.fetchrow(
         """update public.provider_models set provider_id=$2,model_id=$3,upstream_model_id=$4,
                    protocol=$5,serves_protocols=$6,capabilities=$7,priority=$8,weight=$9,
-                   enabled=$10,max_concurrency=$11,settings=$12::jsonb,
-                   pricing=coalesce($13::jsonb, pricing), updated_at=now()
+                   enabled=$10,max_concurrency=$11,settings=$12::jsonb,pricing=$13::jsonb,
+                   updated_at=now()
            where id=$1 returning id,provider_id,model_id,upstream_model_id,protocol,
                                   serves_protocols,capabilities,priority,weight,enabled,
                                   max_concurrency,settings,pricing""",
         provider_model_id, body.provider_id, body.model_id, body.upstream_model_id,
         body.protocol, [protocol.value for protocol in body.serves_protocols],
         body.capabilities, body.priority, body.weight, body.enabled,
-          body.max_concurrency, json.dumps(body.settings), pricing_json,
+          body.max_concurrency, json.dumps(body.settings), json.dumps(body.pricing),
     )
     if row is None:
         return _not_found("provider_model")

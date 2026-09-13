@@ -221,22 +221,15 @@ async def reconcile_provider(request: Request, body: ProviderReconcileInput) -> 
     mapping_ids: dict[tuple[str, str, ClientProtocol], str] = {}
     mapping_weights: dict[str, float] = {}
     for item in body.mappings:
-        # Same rule as update_provider_model: an omitted pricing dict preserves
-        # whatever the row already holds. The dashboard guided form only edits
-        # token rates and sends {} for every mapping it cannot price - without
-        # this guard each save wiped per-request and blended rates it never
-        # even displayed, which is how every AgentRouter row emptied on
-        # 2026-09-11 and priced usage stopped.
-        pricing_json = json.dumps(item.pricing) if item.pricing else "null"
         mapping = await connection.fetchrow(
             """insert into public.provider_models(provider_id,model_id,upstream_model_id,protocol,
                  serves_protocols,capabilities,enabled,priority,weight,max_concurrency,settings,pricing)
-               values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,coalesce($12::jsonb,'{}'::jsonb))
+               values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb)
                on conflict(provider_id,model_id,upstream_model_id,protocol) do update set
                  serves_protocols=excluded.serves_protocols,
                  capabilities=excluded.capabilities,enabled=excluded.enabled,priority=excluded.priority,
                  weight=excluded.weight,max_concurrency=excluded.max_concurrency,settings=excluded.settings,
-                 pricing=coalesce(excluded.pricing, public.provider_models.pricing),updated_at=now()
+                 pricing=excluded.pricing,updated_at=now()
                returning id""",
             provider_id,
             item.model_id,
@@ -249,7 +242,7 @@ async def reconcile_provider(request: Request, body: ProviderReconcileInput) -> 
             item.weight,
             item.max_concurrency,
             json.dumps(item.settings),
-            pricing_json,
+            json.dumps(item.pricing),
         )
         mapping_ids[(item.model_id, item.upstream_model_id, item.protocol)] = str(mapping["id"])
         mapping_weights[str(mapping["id"])] = item.weight
