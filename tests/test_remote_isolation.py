@@ -18,6 +18,7 @@ from gateway.distributed_capacity import CapacityFull, DistributedCapacity
 from gateway.workflow_store import LeaseLost, WorkflowStore
 from scripts.dev_db_check import validate_target
 from scripts.seed_dbtest import CLIENT, CREDENTIAL, PROVIDER
+from tests.test_accounting_integration import TransactionPool
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
@@ -37,36 +38,63 @@ async def dedicated_pool():
         await pool.close()
 
 
-async def test_concurrent_capacity_acquisition_enforces_one_global_slot():
+@pytest.mark.parametrize("warm", [False, True])
+async def test_concurrent_capacity_acquisition_enforces_one_global_slot(warm):
     async with dedicated_pool() as pool:
         scope = f"qualification:{uuid4()}"
         capacity = DistributedCapacity(pool)
-        owners = []
-        ready = asyncio.Event()
+        barrier = asyncio.Barrier(2)
+        missing_reads = []
 
-        async def contender():
-            await ready.wait()
+        class ContendingConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            async def fetchval(self, query, *args):
+                value = await self.connection.fetchval(query, *args)
+                if query == (
+                    "select capacity from public.capacity_scopes where scope=$1 for update"
+                ) and value is None:
+                    missing_reads.append(self.connection.get_server_pid())
+                    await barrier.wait()
+                return value
+
+        async def contender(connection):
+            manager = DistributedCapacity(TransactionPool(ContendingConnection(connection)))
             try:
-                owner = await capacity.acquire({scope: 1})
-                owners.append(owner)
-                return "admitted"
+                return await manager.acquire({scope: 1})
             except CapacityFull:
-                return "rejected"
+                return None
 
-        tasks = [asyncio.create_task(contender()) for _ in range(2)]
-        ready.set()
         try:
-            results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=30)
-            assert sorted(results) == ["admitted", "rejected"]
-            await capacity.release(owners.pop())
-            owners.append(await capacity.acquire({scope: 1}))
-        finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            for owner in owners:
+            if warm:
+                owner = await capacity.acquire({scope: 1})
                 await capacity.release(owner)
+            async with pool.acquire() as first, pool.acquire() as second:
+                assert first.get_server_pid() != second.get_server_pid()
+                tasks = [asyncio.create_task(contender(connection))
+                         for connection in (first, second)]
+                try:
+                    results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=30)
+                finally:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            owners = [owner for owner in results if owner is not None]
+            assert len(owners) == 1
+            assert len(set(missing_reads)) == (0 if warm else 2)
+            assert await pool.fetchval(
+                "select count(*) from public.capacity_leases where scope=$1", scope,
+            ) == 1
+            await capacity.release(owners[0])
+            owner = await capacity.acquire({scope: 1})
+            await capacity.release(owner)
+        finally:
+            await pool.execute("delete from public.capacity_leases where scope=$1", scope)
             await pool.execute("delete from public.capacity_scopes where scope=$1", scope)
 
 

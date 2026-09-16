@@ -124,8 +124,18 @@ The latency gate is **not closed**. This is one sequential before/after comparis
 not proof of a repeatable improvement or a controlled estimate of the change's
 benefit. The short run does not close memory, high-load rejection latency,
 independent-generator, mixed-binary rollback or production qualification gates.
-Next verification should cover concurrent cold/warm acquisition and old/new
-locking interoperability before further performance changes.
+Follow-up at optimization commit `71f1f0d`: four dedicated-database tests passed
+(41 deselected), covering cold/warm two-backend contention, separate-process
+capacity enforcement, and stored-policy decreases against stale local settings.
+The cold test forces both backends to observe the absent row before either
+inserts; exactly one lease is committed at capacity one. Each contender holds a
+distinct backend connection, and connections are released before pooled
+assertions and cleanup. Only UUID-scoped synthetic rows are removed afterward.
+The final offline run passed 1,246 tests with 81 integration cases deselected;
+Ruff passed for gateway code and `tests/test_remote_isolation.py`.
+This is bounded single-scope concurrency evidence, not simultaneous policy-update
+contention, multi-scope cold races, or old/new binary locking interoperability.
+Those remain follow-up checks before broader qualification claims.
 
 ## Verified execution ledger
 
