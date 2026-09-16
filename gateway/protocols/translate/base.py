@@ -61,22 +61,17 @@ class SSEDecoder:
     MAX_EVENT_BYTES = 1024 * 1024
 
     def __init__(self) -> None:
-        self._buffer = bytearray()
+        from gateway.protocols.event_buffer import EventBuffer
+
+        self._frames = EventBuffer(self.MAX_EVENT_BYTES)
+        self._buffer = self._frames.buffer
 
     def feed(self, chunk: bytes) -> list[SSEEvent]:
-        self._buffer.extend(chunk)
         events: list[SSEEvent] = []
-        while (separator := self._separator()) is not None:
-            index, length = separator
-            raw = bytes(self._buffer[:index])
-            del self._buffer[: index + length]
+        for raw in self._frames.feed(chunk):
             event = self._parse(raw)
             if event is not None:
                 events.append(event)
-        if len(self._buffer) > self.MAX_EVENT_BYTES:
-            # A stream with no event boundary this large is not SSE. Dropping the
-            # buffer bounds memory rather than growing it for the life of the request.
-            self._buffer.clear()
         return events
 
     def flush(self) -> list[SSEEvent]:
@@ -84,8 +79,7 @@ class SSEDecoder:
         if not self._buffer.strip():
             self._buffer.clear()
             return []
-        raw = bytes(self._buffer)
-        self._buffer.clear()
+        raw = self._frames.flush()
         event = self._parse(raw)
         return [event] if event is not None else []
 

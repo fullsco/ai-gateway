@@ -55,6 +55,8 @@ class PassiveHealthRecorder:
         self._pool = pool
         self._queue: asyncio.Queue[PassiveHealthEvent | None] = asyncio.Queue(max_queue_size)
         self._task: asyncio.Task[None] | None = None
+        self.dropped_events = 0
+        self.write_failures = 0
 
     def start(self) -> None:
         if self._task is None:
@@ -64,6 +66,7 @@ class PassiveHealthRecorder:
         try:
             self._queue.put_nowait(event)
         except asyncio.QueueFull:
+            self.dropped_events += 1
             log_event(logger, logging.WARNING, "passive_health_event_dropped")
 
     async def close(self) -> None:
@@ -78,6 +81,7 @@ class PassiveHealthRecorder:
             try:
                 await self._persist(event)
             except Exception as exc:
+                self.write_failures += 1
                 log_event(
                     logger,
                     logging.WARNING,
@@ -640,6 +644,10 @@ def extract_usage(
         response = payload.get("response")
         if isinstance(response, dict) and isinstance(response.get("usage"), dict):
             usage = response["usage"]
+        if protocol is ClientProtocol.ANTHROPIC_MESSAGES:
+            message = payload.get("message")
+            if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+                usage = message["usage"]
     if not isinstance(usage, dict):
         return None
     if protocol is ClientProtocol.ANTHROPIC_MESSAGES:

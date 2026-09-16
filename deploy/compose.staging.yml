@@ -7,10 +7,13 @@ services:
     restart: unless-stopped
     init: true
     env_file:
-      - ../.env
+      - ../.env.staging
     environment:
       GATEWAY_ENVIRONMENT: staging
       GATEWAY_HOST: 0.0.0.0
+      GATEWAY_SERVICE_ROLE: api
+      GATEWAY_HEALTH_PROBE_ENABLED: "false"
+      GATEWAY_CREDENTIAL_USAGE_POLL_ENABLED: "false"
     ports:
       - "127.0.0.1:8320:8320"
     stop_grace_period: 30s
@@ -25,6 +28,7 @@ services:
         max-file: "5"
 
   tunnel:
+    profiles: [public-tunnel]
     image: cloudflare/cloudflared:2026.8.1
     restart: unless-stopped
     init: true
@@ -45,6 +49,51 @@ services:
       options:
         max-size: 20m
         max-file: "5"
+
+  workflow:
+    profiles: [workers]
+    image: ai-gateway:0.1.0-staging
+    restart: unless-stopped
+    init: true
+    env_file: [../.env.staging]
+    environment:
+      GATEWAY_ENVIRONMENT: staging
+      GATEWAY_SERVICE_ROLE: workflow
+      GATEWAY_WORKFLOWS_ENABLED: "true"
+      GATEWAY_DURABLE_ACCOUNTING_ENABLED: "true"
+      GATEWAY_DISTRIBUTED_ADMISSION_ENABLED: "true"
+      GATEWAY_HEALTH_PROBE_ENABLED: "false"
+      GATEWAY_CREDENTIAL_USAGE_POLL_ENABLED: "false"
+      GATEWAY_ALERT_MONITOR_ENABLED: "false"
+    healthcheck:
+      disable: true
+    stop_grace_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  maintenance:
+    profiles: [workers]
+    image: ai-gateway:0.1.0-staging
+    restart: unless-stopped
+    init: true
+    env_file: [../.env.staging]
+    environment:
+      GATEWAY_ENVIRONMENT: staging
+      GATEWAY_SERVICE_ROLE: maintenance
+      GATEWAY_DURABLE_ACCOUNTING_ENABLED: "true"
+      GATEWAY_HEALTH_PROBE_ENABLED: "false"
+      GATEWAY_CREDENTIAL_USAGE_POLL_ENABLED: "false"
+      GATEWAY_ALERT_MONITOR_ENABLED: "false"
+    healthcheck:
+      disable: true
+    stop_grace_period: 40s
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 512M
 
 secrets:
   tunnel_token:

@@ -29,6 +29,17 @@ def upstream_client_kwargs(settings: Settings | None = None) -> dict[str, object
     """Return httpx keyword arguments implementing the configured egress policy."""
     resolved = settings or get_settings()
     kwargs: dict[str, object] = {"trust_env": True}
+    kwargs["limits"] = httpx.Limits(
+        max_connections=resolved.http_max_connections,
+        max_keepalive_connections=min(
+            resolved.http_max_keepalive_connections, resolved.http_max_connections
+        ),
+        keepalive_expiry=resolved.http_keepalive_expiry_seconds,
+    )
+    kwargs["timeout"] = httpx.Timeout(
+        resolved.request_timeout_seconds, connect=resolved.http_connect_timeout_seconds,
+        pool=resolved.http_pool_timeout_seconds, write=resolved.http_write_timeout_seconds,
+    )
     proxy = resolved.upstream_proxy_url
     if proxy:
         # httpx routes every scheme through this proxy, including CONNECT for https.

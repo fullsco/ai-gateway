@@ -477,7 +477,7 @@ class ConfigSnapshot(BaseModel):
 
 
 class SnapshotRepository(Protocol):
-    async def load_published(self) -> ConfigSnapshot | None:
+    async def load_published(self, cached: ConfigSnapshot | None = None) -> ConfigSnapshot | None:
         """Return the currently published, validated configuration snapshot."""
 
 
@@ -513,8 +513,13 @@ class CachedConfiguration:
     async def refresh(self) -> ConfigSnapshot:
         async with self._lock:
             try:
+                try:
+                    load_coro = self._repository.load_published(self._snapshot)
+                except TypeError:
+                    load_coro = self._repository.load_published()
+
                 candidate = await asyncio.wait_for(
-                    self._repository.load_published(),
+                    load_coro,
                     timeout=self.LOAD_TIMEOUT_SECONDS,
                 )
                 if candidate is None:

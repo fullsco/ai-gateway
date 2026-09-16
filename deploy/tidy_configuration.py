@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 BASE = os.environ.get("GATEWAY_ADMIN_URL", "http://127.0.0.1:8320/api/admin/v1")
-SUPABASE = "https://bxpclohykdkbhnwizuop.supabase.co"
+SUPABASE = "https://nebbtrmwzbpmzvinhrch.supabase.co"
 
 # Upstream ids observed in real responses from AgentRouter, which load balances
 # across several backends for the same model. A client that echoes one of these

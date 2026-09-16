@@ -10,6 +10,7 @@ class CanonicalModel:
     aliases: frozenset[str]
     capabilities: frozenset[Capability]
     enabled: bool = True
+    context_window: int | None = None
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,8 @@ class ModelRegistry:
                     raise ValueError(f"Model alias {name!r} is assigned more than once")
                 self._aliases[normalized] = model.id
         self._provider_models = tuple(provider_models)
+        self._routes_by_model: dict[str, list[ProviderModel]] = {}
+        self._routes_by_protocol: dict[tuple[str, ClientProtocol], list[ProviderModel]] = {}
         for provider_model in provider_models:
             if provider_model.canonical_model_id not in self._models:
                 raise ValueError(
@@ -68,6 +71,14 @@ class ModelRegistry:
                 )
             if provider_model.weight <= 0:
                 raise ValueError("Provider model weight must be greater than zero")
+            if provider_model.enabled:
+                self._routes_by_model.setdefault(provider_model.canonical_model_id, []).append(
+                    provider_model
+                )
+                for protocol in provider_model.serves_protocols:
+                    self._routes_by_protocol.setdefault(
+                        (provider_model.canonical_model_id, protocol), []
+                    ).append(provider_model)
 
     def resolve(self, requested_model: str) -> CanonicalModel:
         model_id = self._aliases.get(self._normalize_name(requested_model))
@@ -85,6 +96,9 @@ class ModelRegistry:
     def list_provider_models(self) -> tuple[ProviderModel, ...]:
         return tuple(route for route in self._provider_models if route.enabled)
 
+    def provider_models_for(self, canonical_model_id: str) -> tuple[ProviderModel, ...]:
+        return tuple(self._routes_by_model.get(canonical_model_id, ()))
+
     def eligible_provider_models(self, request: NormalizedRequest) -> tuple[ProviderModel, ...]:
         model = self.resolve(request.requested_model)
         unsupported = request.required_capabilities - model.capabilities
@@ -94,7 +108,7 @@ class ModelRegistry:
 
         eligible = [
             route
-            for route in self._provider_models
+            for route in self._routes_by_protocol.get((model.id, request.protocol), ())
             if route.enabled
             and route.canonical_model_id == model.id
             # Not `route.protocol is request.protocol`: a route may answer a client

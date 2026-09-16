@@ -132,6 +132,7 @@ class SnapshotModel(BaseModel):
     aliases: frozenset[str] = frozenset()
     capabilities: frozenset[Capability]
     enabled: bool = True
+    context_window: int | None = Field(default=None, gt=0)
 
 
 class SnapshotProviderModel(BaseModel):
@@ -273,7 +274,7 @@ class RuntimeBuilder:
         self._cipher = CredentialCipher.from_base64(encryption_key)
         self._key_hasher = GatewayKeyHasher(self._decode_pepper(key_pepper))
 
-    def build(self, payload: dict[str, Any]) -> GatewayRuntime:
+    def build(self, payload: dict[str, Any], *, http_client=None) -> GatewayRuntime:
         report_unknown_snapshot_fields(payload)
         snapshot = RuntimeSnapshot.model_validate(payload)
         clients = [
@@ -305,6 +306,7 @@ class RuntimeBuilder:
                 aliases=model.aliases,
                 capabilities=model.capabilities,
                 enabled=model.enabled,
+                context_window=model.context_window,
             )
             for model in snapshot.models
         ]
@@ -376,7 +378,7 @@ class RuntimeBuilder:
             provider_model_adapters=adapters,
             translating_adapters=translating,
             credentials=credentials,
-            http_client=build_upstream_client(),
+            http_client=http_client if http_client is not None else build_upstream_client(),
             route_controls=RouteControls(
                 {model.id: model.max_concurrency for model in snapshot.provider_models}
             ),

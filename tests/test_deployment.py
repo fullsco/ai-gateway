@@ -24,6 +24,10 @@ def test_staging_compose_supervises_gateway_and_orders_tunnel_after_health() -> 
     }
     assert tunnel["secrets"] == ["tunnel_token"]
     assert "--token-file" in tunnel["command"]
+    assert gateway["env_file"] == ["../.env.staging"]
+    assert tunnel["profiles"] == ["public-tunnel"]
+    assert compose["services"]["workflow"]["environment"]["GATEWAY_SERVICE_ROLE"] == "workflow"
+    assert compose["services"]["maintenance"]["deploy"]["replicas"] == 1
 
 
 def test_gateway_image_is_non_root_single_process_and_health_checked() -> None:
@@ -78,7 +82,8 @@ def test_qualification_script_reports_local_mock_host(tmp_path: Path) -> None:
     server = subprocess.Popen(
         [
             sys.executable,
-            "-m",
+            "scripts/dev_check.py",
+            "--module",
             "uvicorn",
             "gateway.app:app",
             "--host",
@@ -111,6 +116,8 @@ def test_qualification_script_reports_local_mock_host(tmp_path: Path) -> None:
         result = subprocess.run(
             [
                 sys.executable,
+                "scripts/dev_check.py",
+                "--script",
                 "deploy/qualify.py",
                 "--local",
                 "http://127.0.0.1:18320",

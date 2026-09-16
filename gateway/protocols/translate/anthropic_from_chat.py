@@ -27,6 +27,7 @@ from gateway.protocols.translate.base import (
     TranslationContext,
     format_sse,
 )
+from gateway.protocols.translate.responses_stream import _StreamRetention
 
 # Passed through untouched because both protocols spell them the same way and mean the
 # same thing. `top_k` is absent on purpose: Chat Completions has no equivalent, and
@@ -230,23 +231,29 @@ class _ChatToAnthropicStream(StreamTranslator):
     def __init__(self, context: TranslationContext) -> None:
         self._context = context
         self._decoder = SSEDecoder()
+        self._retained = _StreamRetention()
         self._started = False
         self._stopped = False
         self._next_index = 0
         self._open: tuple[int, str] | None = None
-        self._tool_blocks: dict[Any, int] = {}
+        self._tool_blocks: dict[Any, dict[str, Any]] = {}
         self._stop_reason: str | None = None
         self._saw_tool_use = False
         self._usage: dict[str, Any] = {}
         self._message_id = "msg_gateway_translated"
+        self._retained.metadata("id", self._message_id)
 
     def feed(self, chunk: bytes) -> bytes:
+        self._retained.check()
+        if self._stopped:
+            return b""
         out = bytearray()
         for event in self._decoder.feed(chunk):
             out += self._handle(event)
         return bytes(out)
 
     def finish(self) -> bytes:
+        self._retained.check()
         out = bytearray()
         for event in self._decoder.flush():
             out += self._handle(event)
@@ -254,6 +261,8 @@ class _ChatToAnthropicStream(StreamTranslator):
         return bytes(out)
 
     def _handle(self, event: SSEEvent) -> bytes:
+        if self._stopped:
+            return b""
         if event.is_done:
             return self._close()
         payload = event.json()
@@ -266,9 +275,11 @@ class _ChatToAnthropicStream(StreamTranslator):
             return self._error_event(payload["error"])
         identifier = payload.get("id")
         if isinstance(identifier, str) and identifier and not self._started:
+            self._retained.metadata("id", _message_id(identifier))
             self._message_id = _message_id(identifier)
         usage = payload.get("usage")
         if isinstance(usage, dict):
+            self._retained.metadata("usage", usage)
             self._usage = usage
         out = bytearray()
         choice = _first_choice(payload)
@@ -326,45 +337,44 @@ class _ChatToAnthropicStream(StreamTranslator):
     def _tool_deltas(self, calls: Any) -> bytes:
         if not isinstance(calls, list):
             return b""
-        out = bytearray()
         for position, call in enumerate(calls):
             if not isinstance(call, dict):
                 continue
-            key = call.get("index", position)
+            key = self._retained.tool_key(call, position)
             function = call.get("function")
             function = function if isinstance(function, dict) else {}
             if key not in self._tool_blocks:
-                out += self._ensure_started()
-                out += self._close_block()
-                self._tool_blocks[key] = self._next_index
+                self._retained.reserve(str(key), calls=1)
+                self._tool_blocks[key] = {"id": "", "name": "", "arguments": []}
                 self._saw_tool_use = True
-                out += self._start_block(
-                    "tool_use",
-                    {
-                        "type": "tool_use",
-                        "id": str(call.get("id") or f"toolu_{key}"),
-                        "name": str(function.get("name") or ""),
-                        "input": {},
-                    },
-                )
+            block = self._tool_blocks[key]
+            for field, value in (("id", call.get("id")), ("name", function.get("name"))):
+                if isinstance(value, str):
+                    self._retained.reserve(value)
+                    block[field] += value
             arguments = function.get("arguments")
-            if not isinstance(arguments, str) or not arguments:
-                continue
-            index = self._tool_blocks[key]
-            if self._open is None or self._open[0] != index:
-                # Arguments for a block that is no longer open cannot be framed:
-                # Anthropic has no way to reopen a stopped block. Every provider
-                # observed streams a tool call's arguments contiguously, so this is
-                # a guard against corruption rather than a path taken in practice.
-                continue
-            out += format_sse(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": index,
+            if isinstance(arguments, str) and arguments:
+                self._retained.reserve(arguments, fragments=1)
+                block["arguments"].append(arguments)
+        return b""
+
+    def _flush_tools(self) -> bytes:
+        # Chat has no per-call end marker. Buffer until termination so interleaved
+        # arguments can be serialized without reopening a stopped Anthropic block.
+        out = bytearray()
+        for key, block in self._tool_blocks.items():
+            index = self._next_index
+            out += self._start_block("tool_use", {
+                "type": "tool_use", "id": block["id"] or f"toolu_{key}",
+                "name": block["name"], "input": {},
+            })
+            for arguments in block["arguments"]:
+                out += format_sse("content_block_delta", {
+                    "type": "content_block_delta", "index": index,
                     "delta": {"type": "input_json_delta", "partial_json": arguments},
-                },
-            )
+                })
+            out += self._close_block()
+        self._tool_blocks.clear()
         return bytes(out)
 
     def _open_block(self, block_type: str, block: dict[str, Any]) -> bytes:
@@ -396,6 +406,7 @@ class _ChatToAnthropicStream(StreamTranslator):
         self._stopped = True
         out = bytearray(self._ensure_started())
         out += self._close_block()
+        out += self._flush_tools()
         stop_reason = "tool_use" if self._saw_tool_use else (self._stop_reason or "end_turn")
         out += format_sse(
             "message_delta",

@@ -569,6 +569,7 @@ def test_completed_stream_persists_committed_attempt_and_usage() -> None:
     stream = [
         b'event: message_start\ndata: {"usage":{"input_tokens":7}}\n\n',
         b'event: message_delta\ndata: {"usage":{"output_tokens":4}}\n\n',
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
     ]
     runtime, key = make_runtime(
         lambda _: httpx.Response(

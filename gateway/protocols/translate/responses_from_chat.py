@@ -119,6 +119,15 @@ def _input_to_messages(value: Any) -> list[dict[str, Any]]:
             continue
         kind = item.get("type")
         if kind == "function_call":
+            previous = messages[-1] if messages else None
+            if previous is not None and previous.get("role") == "assistant":
+                previous.setdefault("tool_calls", []).append({
+                    "id": str(item.get("call_id") or item.get("id") or ""),
+                    "type": "function",
+                    "function": {"name": str(item.get("name") or ""),
+                                 "arguments": str(item.get("arguments") or "{}")},
+                })
+                continue
             messages.append(
                 {
                     "role": "assistant",
@@ -244,4 +253,3 @@ def _function_calls(tool_calls: Any) -> list[dict[str, Any]]:
             }
         )
     return items
-

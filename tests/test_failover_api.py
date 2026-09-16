@@ -144,7 +144,9 @@ def test_empty_stream_fails_over_before_committing_response() -> None:
 
     def handler(request: httpx.Request):
         used_keys.append(request.headers["x-api-key"])
-        chunks = [] if request.headers["x-api-key"] == "provider-key-a" else [b"data: ok\n\n"]
+        chunks = [] if request.headers["x-api-key"] == "provider-key-a" else [
+            b'data: ok\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n'
+        ]
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
@@ -162,7 +164,7 @@ def test_empty_stream_fails_over_before_committing_response() -> None:
         )
 
     assert response.status_code == 200
-    assert response.content == b"data: ok\n\n"
+    assert response.content == b'data: ok\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n'
     assert used_keys == ["provider-key-a", "provider-key-b"]
 
 
@@ -174,7 +176,9 @@ def test_first_event_timeout_releases_route_and_fails_over() -> None:
         stream = (
             DelayedStream()
             if request.headers["x-api-key"] == "provider-key-a"
-            else BytesStream([b"data: ok\n\n"])
+            else BytesStream([
+                b'data: ok\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n'
+            ])
         )
         return httpx.Response(
             200,
@@ -196,7 +200,7 @@ def test_first_event_timeout_releases_route_and_fails_over() -> None:
         )
 
     assert response.status_code == 200
-    assert response.content == b"data: ok\n\n"
+    assert response.content == b'data: ok\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n'
     assert used_keys == ["provider-key-a", "provider-key-b"]
 
 

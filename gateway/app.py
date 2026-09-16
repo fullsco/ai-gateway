@@ -1,21 +1,26 @@
 import asyncio
 import logging
-from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from gateway import __version__
+from gateway.accounting_worker import accounting_loop
+from gateway.admin.accounting import router as accounting_router
 from gateway.admin.api import router as admin_router
 from gateway.admin.auth import SupabaseJWTVerifier
 from gateway.admin.control_plane import router as control_plane_router
+from gateway.admin.metrics import router as metrics_router
 from gateway.admin.operations import router as operations_router
 from gateway.admin.reconcile import router as reconcile_router
+from gateway.admission import InferenceAdmissionMiddleware
 from gateway.alerts_monitor import alert_monitor_loop
+from gateway.api.artifacts import router as artifacts_router
 from gateway.api.messages import router as messages_router
 from gateway.api.models import router as models_router
 from gateway.api.openai import router as openai_router
+from gateway.api.workflows import router as workflows_router
 from gateway.config import Settings, get_settings
 from gateway.configuration import (
     CachedConfiguration,
@@ -25,14 +30,19 @@ from gateway.configuration import (
     create_pool,
 )
 from gateway.context import get_request_id
+from gateway.dependency_health import DependencyHealth, requires_database
+from gateway.draining import DrainState
 from gateway.health.limits import HealthProbeLimiter, ProbeLimitConfig
 from gateway.health.probes import health_probe_loop
 from gateway.health.usage import usage_poll_loop
+from gateway.lifecycle import managed_lifespan
 from gateway.logging import configure_logging, log_event
+from gateway.metrics import sample_event_loop
 from gateway.middleware import RequestContextMiddleware
 from gateway.observability import PassiveHealthRecorder
 from gateway.routing.live_state import LiveOperationalState, QuotaPolicy
 from gateway.runtime import GatewayRuntime
+from gateway.schema_checks import require_circuit_schema, require_execution_schema
 
 logger = logging.getLogger("gateway.lifecycle")
 
@@ -77,26 +87,23 @@ def create_app(
     app_settings = settings or get_settings()
     configure_logging(app_settings.log_level, app_settings.log_format)
 
-    @asynccontextmanager
+    @managed_lifespan
     async def lifespan(app: FastAPI):
+        resources = app.state.lifecycle_resources
+        resources.task(sample_event_loop())
         app.state.ready = app_settings.environment in {"development", "test"} or runtime is not None
         log_event(logger, logging.INFO, "gateway_started", environment=app_settings.environment)
-        refresh_task: asyncio.Task[None] | None = None
         pool = None
         manager = None
         health_recorder = None
         health_probe_limiter = None
-        probe_task = None
-        live_state_task = None
-        usage_task = None
-        alert_task = None
         if app_settings.database_url:
             try:
                 if not app_settings.credential_encryption_key or not app_settings.key_pepper:
                     raise ValueError(
                         "Database runtime requires credential_encryption_key and key_pepper"
                     )
-                pool = await create_pool(app_settings.database_url)
+                pool = resources.resource(await create_pool(app_settings.database_url))
                 app.state.db_pool = pool
                 manager = RuntimeManager(
                     CachedConfiguration(PostgresSnapshotRepository(pool)),
@@ -105,8 +112,9 @@ def create_app(
                         key_pepper=app_settings.key_pepper,
                     ),
                 )
+                resources.resource(manager)
                 app.state.runtime_manager = manager
-                refresh_task = asyncio.create_task(_refresh_runtime(app, manager))
+                resources.task(_refresh_runtime(app, manager))
                 try:
                     app.state.runtime = await manager.refresh()
                 except Exception as exc:
@@ -128,8 +136,32 @@ def create_app(
                     error_type=type(exc).__name__,
                 )
         active_pool = getattr(app.state, "db_pool", None)
+        resources.resource(app.state.dependency_health)
+        required_tables = []
+        if app_settings.workflows_enabled or app_settings.service_role == "workflow":
+            if not app_settings.durable_accounting_enabled:
+                raise RuntimeError("Workflow execution requires durable accounting")
+            required_tables.extend(("workflow_jobs", "workflow_events", "capacity_leases"))
+        if app_settings.distributed_admission_enabled:
+            required_tables.extend(("capacity_leases", "route_circuits"))
+        for table in required_tables:
+            if active_pool is None or not await active_pool.fetchval(
+                "select to_regclass($1)", f"public.{table}"
+            ):
+                raise RuntimeError("Required workflow/coordination migration is missing")
+        if app_settings.durable_accounting_enabled:
+            if active_pool is None:
+                raise RuntimeError("Durable accounting requires a database")
+            if not await active_pool.fetchval("select to_regclass('public.settlement_outbox')"):
+                raise RuntimeError("Durable accounting migration is required")
+            await require_execution_schema(active_pool)
+            if app_settings.service_role in {"combined", "maintenance"}:
+                resources.task(accounting_loop(active_pool))
+        if app_settings.distributed_admission_enabled:
+            await require_circuit_schema(active_pool)
         if active_pool is not None:
             health_recorder = PassiveHealthRecorder(active_pool)
+            resources.resource(health_recorder)
             health_recorder.start()
             app.state.health_recorder = health_recorder
             health_probe_limiter = HealthProbeLimiter(
@@ -157,14 +189,15 @@ def create_app(
         app.state.live_state = live_state
         if getattr(app.state, "db_pool", None) is not None:
             await live_state.refresh()
-            live_state_task = asyncio.create_task(
+            resources.task(
                 _refresh_live_state(app_settings.live_state_refresh_seconds, live_state)
             )
         if (
             app_settings.credential_usage_poll_enabled
+            and app_settings.service_role in {"combined", "maintenance"}
             and getattr(app.state, "db_pool", None) is not None
         ):
-            usage_task = asyncio.create_task(
+            resources.task(
                 usage_poll_loop(
                     app_settings.credential_usage_poll_interval_seconds,
                     lambda: getattr(app.state, "db_pool", None),
@@ -173,16 +206,18 @@ def create_app(
             )
         if (
             app_settings.alert_monitor_enabled
+            and app_settings.service_role in {"combined", "maintenance"}
             and getattr(app.state, "db_pool", None) is not None
         ):
-            alert_task = asyncio.create_task(
+            resources.task(
                 alert_monitor_loop(
                     app_settings.alert_monitor_interval_seconds,
                     lambda: getattr(app.state, "db_pool", None),
                 )
             )
-        if app_settings.health_probe_enabled:
-            probe_task = asyncio.create_task(
+        if (app_settings.health_probe_enabled
+                and app_settings.service_role in {"combined", "maintenance"}):
+            resources.task(
                 health_probe_loop(
                     app_settings.health_probe_interval_seconds,
                     lambda: getattr(app.state, "runtime", None),
@@ -196,35 +231,13 @@ def create_app(
                 audience=app_settings.supabase_jwt_audience,
                 admin_role=app_settings.admin_role,
             )
+        if app_settings.workflows_enabled and app_settings.service_role == "combined":
+            from gateway.worker_service import workflow_loop
+
+            resources.task(workflow_loop(app))
         try:
             yield
         finally:
-            if refresh_task is not None:
-                refresh_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await refresh_task
-            if probe_task is not None:
-                probe_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await probe_task
-            if live_state_task is not None:
-                live_state_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await live_state_task
-            if alert_task is not None:
-                alert_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await alert_task
-            if usage_task is not None:
-                usage_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await usage_task
-            if health_recorder is not None:
-                await health_recorder.close()
-            if manager is not None:
-                await manager.close()
-            if pool is not None:
-                await pool.close()
             app.state.ready = False
             log_event(logger, logging.INFO, "gateway_stopped")
 
@@ -238,6 +251,7 @@ def create_app(
     app.state.settings = app_settings
     app.state.runtime = runtime
     app.state.db_pool = db_pool
+    app.state.dependency_health = DependencyHealth()
     app.state.admin_verifier = admin_verifier
     app.state.health_recorder = None
     app.state.live_state = LiveOperationalState(
@@ -247,7 +261,7 @@ def create_app(
         )
     )
     app.state.ready = False
-    app.add_middleware(RequestContextMiddleware, settings=app_settings)
+    app.state.drain = DrainState()
 
     @app.exception_handler(RequestValidationError)
     async def sanitized_validation_error(
@@ -269,12 +283,15 @@ def create_app(
         is_control_plane = request.url.path.startswith("/api/admin/v1/")
         is_snapshot_operation = "/config/" in request.url.path
         is_manual_probe = request.url.path.endswith("/health/probe")
+        is_drain = (request.url.path in {"/api/admin/v1/drain", "/api/admin/v1/capacity"}
+                    or request.url.path.startswith("/api/admin/v1/accounting/"))
         pool = getattr(request.app.state, "db_pool", None)
         transactional = (
             is_mutation
             and is_control_plane
             and not is_snapshot_operation
             and not is_manual_probe
+            and not is_drain
             and pool is not None
         )
         if not transactional:
@@ -293,13 +310,21 @@ def create_app(
             else:
                 await transaction.commit()
             return response
+    # Keep admission outside BaseHTTPMiddleware so a slot includes the entire
+    # response/background lifetime. Request context also covers early rejections.
+    app.add_middleware(InferenceAdmissionMiddleware, settings=app_settings, drain=app.state.drain)
+    app.add_middleware(RequestContextMiddleware, settings=app_settings)
     app.include_router(messages_router)
     app.include_router(models_router)
     app.include_router(openai_router)
+    app.include_router(workflows_router)
+    app.include_router(artifacts_router)
     app.include_router(admin_router)
     app.include_router(reconcile_router)
     app.include_router(control_plane_router)
     app.include_router(operations_router)
+    app.include_router(metrics_router)
+    app.include_router(accounting_router)
 
     @app.get("/health", include_in_schema=False)
     @app.head("/health", include_in_schema=False)
@@ -309,8 +334,16 @@ def create_app(
     @app.get("/ready", include_in_schema=False)
     @app.head("/ready", include_in_schema=False)
     async def ready(request: Request) -> JSONResponse:
-        if not request.app.state.ready:
+        if not request.app.state.ready or request.app.state.drain.draining:
             return JSONResponse({"status": "not_ready"}, status_code=503)
+        if requires_database(request.app.state.settings):
+            pool = request.app.state.db_pool
+            if not await request.app.state.dependency_health.healthy(pool):
+                return JSONResponse({"status": "not_ready"}, status_code=503)
+            # Drain or shutdown may have started while the shared probe was pending.
+            if (not request.app.state.ready or request.app.state.drain.draining
+                    or pool is not request.app.state.db_pool):
+                return JSONResponse({"status": "not_ready"}, status_code=503)
         return JSONResponse({"status": "ready"})
 
     @app.get("/version", include_in_schema=False)

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from gateway.logging import log_event
+from gateway.metrics import measured
 
 logger = logging.getLogger("gateway.quotas")
 
@@ -44,11 +45,13 @@ class QuotaRequest:
     estimated_tokens: int
 
 
+@measured("token_estimation")
 def estimate_tokens(payload: dict[str, Any]) -> int:
     """Conservative request estimate used before upstream usage is available."""
     return max(1, (len(json.dumps(payload, separators=(",", ":"), ensure_ascii=True)) + 3) // 4)
 
 
+@measured("client_quota")
 async def reserve_client_quota(pool: Any, client_id: str, request: QuotaRequest) -> None:
     if pool is None or not any(
         value is not None
@@ -72,6 +75,7 @@ async def reserve_client_quota(pool: Any, client_id: str, request: QuotaRequest)
         raise QuotaExceeded(str(result))
 
 
+@measured("provider_quota")
 async def reserve_provider_quota(
     pool: Any,
     credential_id: str,
@@ -105,6 +109,7 @@ class ClientSpendingLimitExceeded(BudgetExceeded):
     """
 
 
+@measured("client_reservation")
 async def reserve_client_spending(
     pool: Any, client_id: str, estimated_cost: object | None
 ) -> None:
@@ -157,6 +162,7 @@ limit 1
 """
 
 
+@measured("budget_reservation")
 async def reserve_budgets(
     pool: Any,
     *,
@@ -222,6 +228,7 @@ async def reserve_budgets(
         raise BudgetExceeded(str(result))
 
 
+@measured("budget_settlement")
 async def settle_budgets(
     pool: Any,
     *,
@@ -268,6 +275,7 @@ async def settle_budgets(
         )
 
 
+@measured("client_settlement")
 async def settle_client_spending(pool: Any, client_id: str, delta: object | None) -> None:
     """Correct a client spending reservation to the actual cost."""
     if pool is None or delta in (None, 0):

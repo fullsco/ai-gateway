@@ -31,6 +31,15 @@ ai-gateway = "gateway.__main__:main"
 [tool.hatch.build.targets.wheel]
 packages = ["gateway"]
 
+[tool.hatch.build.targets.sdist]
+include = [
+  "/gateway", "/migrations", "/tests", "/pyproject.toml", "/requirements.lock",
+  "/scripts/dev_check.py", "/scripts/dev_db_check.py", "/scripts/prepare_dbtest.py",
+  "/scripts/seed_dbtest.py", "/scripts/benchmark_admission.py",
+  "/scripts/benchmark_fixtures.py", "/scripts/benchmark_database.py",
+  "/scripts/qualify_accounting_load.py", "/scripts/qualify_bounded_soak.py",
+]
+
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]

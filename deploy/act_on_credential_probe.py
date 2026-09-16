@@ -40,7 +40,7 @@ import sys
 import urllib.error
 import urllib.request
 
-SUPABASE = "https://bxpclohykdkbhnwizuop.supabase.co"
+SUPABASE = "https://nebbtrmwzbpmzvinhrch.supabase.co"
 ADMIN = "http://127.0.0.1:8320/api/admin/v1"
 PROBED_AT = "2026-08-22"
 

@@ -16,7 +16,9 @@ from gateway.providers.egress import build_upstream_client, upstream_client_kwar
 def test_no_proxy_configured_keeps_trust_env() -> None:
     settings = Settings(upstream_proxy_url=None)
     kwargs = upstream_client_kwargs(settings)
-    assert kwargs == {"trust_env": True}
+    assert kwargs["trust_env"] is True
+    assert kwargs["limits"].max_connections == 64
+    assert kwargs["timeout"].pool == 1
     assert "proxy" not in kwargs
 
 

@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
+from gateway.metrics import measured
 from gateway.models import ModelRegistry, ProviderModel
 from gateway.protocols import NormalizedRequest
 
@@ -130,9 +131,18 @@ class RoutingTrace:
     attempt_number: int = 1
     is_fallback: bool = False
     fallback_reason: str | None = None
+    max_entries: int | None = None
+    candidate_count: int = 0
+    eligible_count: int = 0
+    exclusion_reasons: set[str] = field(default_factory=set)
 
     def add(self, entry: dict[str, Any]) -> None:
-        self.considered.append(entry)
+        self.candidate_count += 1
+        self.eligible_count += int(bool(entry.get("eligible")))
+        if not entry.get("eligible") and entry.get("reason"):
+            self.exclusion_reasons.add(entry["reason"])
+        if self.max_entries is None or len(self.considered) < self.max_entries:
+            self.considered.append(entry)
 
     @property
     def excluded(self) -> list[dict[str, Any]]:
@@ -147,8 +157,9 @@ class RoutingTrace:
             "is_fallback": self.is_fallback,
             "fallback_reason": self.fallback_reason,
             "selected": self.selected,
-            "candidate_count": len(self.considered),
-            "eligible_count": sum(1 for c in self.considered if c.get("eligible")),
+            "candidate_count": self.candidate_count,
+            "eligible_count": self.eligible_count,
+            "exclusion_reasons": sorted(self.exclusion_reasons),
             "considered": self.considered,
         }
 
@@ -173,6 +184,7 @@ class RoutingEngine:
         self.policy = policy or RoutingPolicy()
         self._rng = rng or random.Random()
 
+    @measured("routing")
     def select(
         self,
         request: NormalizedRequest,
@@ -188,6 +200,9 @@ class RoutingEngine:
     ) -> RouteDecision:
         current_time = now or datetime.now(UTC)
         provider_states = {provider.provider_id: provider for provider in providers}
+        credentials_by_provider: dict[str, list[CredentialState]] = {}
+        for credential in credentials:
+            credentials_by_provider.setdefault(credential.provider_id, []).append(credential)
         canonical_model = self.registry.resolve(request.requested_model)
         candidates: list[RouteDecision] = []
 
@@ -221,9 +236,7 @@ class RoutingEngine:
                 continue
 
             assert provider is not None
-            for credential in credentials:
-                if credential.provider_id != provider_model.provider_id:
-                    continue
+            for credential in credentials_by_provider.get(provider_model.provider_id, ()):
                 stockouts = (stockout_credential_ids or {}).get(
                     provider_model.id, frozenset()
                 )

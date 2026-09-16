@@ -1,5 +1,8 @@
 # AI Gateway Implementation Plan
 
+Current upgrade work: [Scalability and durable workflows](docs/SCALABILITY_UPGRADE_PLAN.md).
+The upgrade is development-only until qualification and the eventual production release.
+
 Status: approved for implementation
 Project: greenfield implementation in `/root/ai-gateway`.
 Historical context: `/root/agentrouter_proxy.py` is outside this repository. It may inform client compatibility tests, but the new gateway does not depend on or modify it.

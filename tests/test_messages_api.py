@@ -302,7 +302,7 @@ def test_streaming_response_is_relayed_without_full_buffering() -> None:
         lambda _: httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            stream=BytesStream([b"event: done\ndata: {}\n\n"]),
+            stream=BytesStream([b'event: message_stop\ndata: {"type":"message_stop"}\n\n']),
         )
     )
     app = create_app(Settings(environment="test", _env_file=None), runtime)
@@ -315,7 +315,7 @@ def test_streaming_response_is_relayed_without_full_buffering() -> None:
         )
 
     assert response.status_code == 200
-    assert response.content == b"event: done\ndata: {}\n\n"
+    assert response.content == b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
 
 
 def test_labeled_stream_accepts_a_split_first_event_field() -> None:
@@ -323,7 +323,7 @@ def test_labeled_stream_accepts_a_split_first_event_field() -> None:
         lambda _: httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            stream=BytesStream([b"eve", b"nt: done\ndata: {}\n\n"]),
+            stream=BytesStream([b"eve", b'nt: message_stop\ndata: {"type":"message_stop"}\n\n']),
         )
     )
     app = create_app(Settings(environment="test", _env_file=None), runtime)
@@ -336,7 +336,7 @@ def test_labeled_stream_accepts_a_split_first_event_field() -> None:
         )
 
     assert response.status_code == 200
-    assert response.content == b"event: done\ndata: {}\n\n"
+    assert response.content == b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
 
 
 def test_retryable_error_returns_normalized_error_after_routes_exhausted() -> None:
