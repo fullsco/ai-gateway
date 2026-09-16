@@ -4,6 +4,7 @@ import json
 
 from gateway.api.errors import client_error
 from gateway.distributed_capacity import CapacityFull, CapacityUnavailable, DistributedCapacity
+from gateway.metrics import timed
 from gateway.protocols import Capability
 from gateway.protocols.output_limits import output_limit
 from gateway.providers import ErrorCategory
@@ -96,7 +97,8 @@ async def admit_authenticated(request, normalized, runtime, authenticated):
             scopes["interactive:streams"] = settings.distributed_max_streams
         manager = DistributedCapacity(request.app.state.db_pool)
         try:
-            owner = await manager.acquire(scopes)
+            with timed("capacity_admission"):
+                owner = await manager.acquire(scopes)
             request.state.start_distributed_admission(manager, owner, len(scopes))
         except (CapacityFull, CapacityUnavailable) as exc:
             status = 429 if isinstance(exc, CapacityFull) else 503

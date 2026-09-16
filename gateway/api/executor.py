@@ -28,7 +28,7 @@ from gateway.distributed_capacity import (
     verify_route_ownership,
 )
 from gateway.logging import log_event
-from gateway.metrics import metrics, request_started
+from gateway.metrics import metrics, request_started, timed
 from gateway.observability import (
     PassiveHealthEvent,
     PassiveHealthRecorder,
@@ -280,7 +280,8 @@ async def execute_request(
                 if candidate.id != route.provider_model.id
             }
         try:
-            route_allowed = await runtime.route_controls.allow(route.provider_model.id)
+            with timed("shared_circuit_allow"):
+                route_allowed = await runtime.route_controls.allow(route.provider_model.id)
         except CapacityUnavailable:
             return client_error(ErrorCategory.PROVIDER_UNAVAILABLE,
                                 "Shared route coordination is unavailable.", 503)
@@ -297,13 +298,14 @@ async def execute_request(
         translator = get_translator(normalized.protocol, upstream_protocol)
         credential = runtime.credentials[route.credential.credential_id]
         try:
-            lease = await runtime.route_controls.acquire(
-                route.provider_model.id,
-                timeout_seconds=min(
-                    settings.concurrency_acquire_timeout_seconds,
-                    max(0, (deadline - datetime.now(UTC)).total_seconds()),
-                ),
-            )
+            with timed("route_concurrency_acquire"):
+                lease = await runtime.route_controls.acquire(
+                    route.provider_model.id,
+                    timeout_seconds=min(
+                        settings.concurrency_acquire_timeout_seconds,
+                        max(0, (deadline - datetime.now(UTC)).total_seconds()),
+                    ),
+                )
         except BaseException:
             await runtime.route_controls.abandon(route.provider_model.id)
             raise
@@ -328,7 +330,8 @@ async def execute_request(
         try:
             if settings.distributed_admission_enabled:
                 try:
-                    await reserve_route_capacity(db_pool, route, settings)
+                    with timed("route_capacity_admission"):
+                        await reserve_route_capacity(db_pool, route, settings)
                 except CapacityFull:
                     raise
                 except CapacityUnavailable as exc:
@@ -505,10 +508,12 @@ async def execute_request(
             raise
         try:
             if settings.distributed_admission_enabled:
-                await verify_route_ownership()
+                with timed("ownership_verify"):
+                    await verify_route_ownership()
             if ledger is not None:
                 try:
-                    await ledger.dispatch(reservation_id)
+                    with timed("durable_dispatch"):
+                        await ledger.dispatch(reservation_id)
                 except QuotaUnavailable:
                     await ledger.settle(reservation_id, actual=Decimal(0))
                     lease.release()

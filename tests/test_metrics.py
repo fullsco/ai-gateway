@@ -10,7 +10,45 @@ import pytest
 from fastapi import Request
 
 from gateway.admin.metrics import operational_health
-from gateway.metrics import TRACE_LIMIT, StageMetrics, current_trace, measured, metrics
+from gateway.metrics import TRACE_LIMIT, StageMetrics, current_trace, measured, metrics, timed
+
+
+@pytest.mark.parametrize("stage", [
+    "capacity_admission", "route_capacity_admission", "shared_circuit_allow",
+    "route_concurrency_acquire", "ownership_verify", "durable_dispatch",
+])
+@pytest.mark.parametrize("failure", [None, RuntimeError, asyncio.CancelledError])
+def test_timed_records_success_failure_and_cancellation(monkeypatch, stage, failure):
+    import importlib
+
+    module = importlib.import_module("gateway.metrics")
+    local = StageMetrics()
+    monkeypatch.setattr(module, "metrics", local)
+    clock = iter([10., 10.125])
+    monkeypatch.setattr(module, "perf_counter", lambda: next(clock))
+    spans = []
+    token = current_trace.set(spans)
+    error = failure("synthetic") if failure else None
+    try:
+        if error is None:
+            with timed(stage):
+                pass
+        else:
+            with pytest.raises(failure) as caught, timed(stage):
+                raise error
+            assert caught.value is error
+    finally:
+        current_trace.reset(token)
+    histogram = local.histograms[stage]
+    assert histogram.count == 1
+    assert histogram.errors == int(failure is not None)
+    assert histogram.total_seconds == .125
+    assert spans == [{"stage": stage, "seconds": .125, "error": failure is not None}]
+
+
+def test_timed_rejects_unknown_stage_before_entering_body():
+    with pytest.raises(ValueError, match="Unknown measurement stage"), timed("private-client-id"):
+        pytest.fail("Invalid measurement stage was accepted")
 
 
 def test_histogram_memory_is_constant_and_contains_no_caller_data():

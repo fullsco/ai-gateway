@@ -46,6 +46,52 @@ the plan. This report performs no new target verification.
 not authorized.** They are future approval-dependent work, not failed experiments
 and not actions to perform in order to finish this reporting task.
 
+## Latest bounded attribution evidence
+
+The instrumented staging run used `scripts/staging_qualify.py --seconds 120
+--clients 4 --skip-faults --separate-services --profile --direct-db`. Evidence is
+`/tmp/opencode/attribution-4-120s.json`; systemd invocation
+`2fdbdcaab0dd48bba1ba83374afbdf56` exited 0. No qualification services remained
+running afterward. The generator and services used separate CPU-limited slices
+on the same host, not independent machines.
+
+Functional assertions passed: 2,283 HTTP 200 responses, 209 accepted/completed
+workflows, successful reservations settled, and provider active count zero.
+Pre-dispatch latency remains **FAIL**: combined mean 68.07 ms, p95 (100,250] ms;
+2,014 of 2,283 samples were at or below 100 ms. Total-response p95 was 357.23 ms
+and must not substitute for pre-dispatch latency. The 120-second run cannot close
+the memory/soak gate; high-load rejection latency was not exercised.
+
+The two `stage_deltas` entries represent API processes, not sequential windows.
+The six new non-overlapping foreground spans each recorded 2,283 observations
+across those processes with zero errors:
+
+| Stage | Combined mean (ms) |
+| --- | ---: |
+| Interactive capacity admission | 13.32 |
+| Route capacity admission | 12.08 |
+| Shared circuit allow | 6.44 |
+| Local route concurrency acquisition | 0.039 |
+| Ownership verification | 5.95 |
+| Durable dispatch | 5.72 |
+
+Together these spans account for approximately 43.56 ms, or 64% of the mean
+pre-dispatch duration. Pre-dispatch is their enclosing interval and must not be
+added to their sum. Aggregate histograms do not identify which operation caused
+an individual slow request; individual stage percentiles cannot be summed.
+These measurements support investigating capacity transactions first, but do not
+prove that changing them will satisfy the latency target. No coordination or
+accounting behavior was intentionally changed by the timing instrumentation.
+
+Local verification after instrumentation: 1,227 offline tests passed with 77
+integration tests deselected; the subsequently added timing-helper tests were
+verified in a separate 38-test metrics run. Gateway and metrics-test Ruff checks
+passed, and wheel/sdist builds succeeded in `/tmp/opencode/timing-build`.
+The helper tests cover all six labels, success, exception identity, cancellation,
+trace recording, and rejection of unknown labels. Earlier artifact hashes do not
+identify this newly instrumented source. Historical tables below retain their
+original execution scopes rather than implying a final release qualification.
+
 ## Verified execution ledger
 
 | Evidence | Result | Proven scope and limits |

@@ -4,6 +4,7 @@ import asyncio
 import functools
 import inspect
 from collections import deque
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from time import perf_counter
@@ -14,7 +15,9 @@ STAGES = frozenset({
     "budget_settlement", "client_settlement", "request_persistence", "attempt_persistence",
     "usage_persistence", "routing_persistence", "request_total", "request_upload",
     "event_loop_lag", "durable_reservation", "durable_settlement", "upstream_headers",
-    "gateway_pre_dispatch",
+    "gateway_pre_dispatch", "capacity_admission", "route_capacity_admission",
+    "shared_circuit_allow", "route_concurrency_acquire", "ownership_verify",
+    "durable_dispatch",
 })
 BUCKETS = (.001, .005, .01, .025, .05, .1, .25, .5, 1., 5., 30.)
 current_trace: ContextVar[list | None] = ContextVar("metric_trace", default=None)
@@ -64,6 +67,19 @@ class StageMetrics:
 
 
 metrics = StageMetrics()
+
+
+@contextmanager
+def timed(stage: str):
+    if stage not in STAGES:
+        raise ValueError("Unknown measurement stage")
+    started = perf_counter()
+    error = True
+    try:
+        yield
+        error = False
+    finally:
+        metrics.observe(stage, perf_counter() - started, error)
 
 
 def measured(stage: str):
