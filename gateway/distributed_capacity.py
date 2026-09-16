@@ -128,14 +128,19 @@ class DistributedCapacity:
             async with self.pool.acquire() as connection, connection.transaction():
                 effective_scopes = {}
                 for scope, capacity in sorted(scopes.items()):
-                    await connection.execute(
-                        "insert into public.capacity_scopes(scope,capacity) values($1,$2) "
-                        "on conflict do nothing", scope, capacity,
-                    )
                     stored = await connection.fetchval(
                         "select capacity from public.capacity_scopes where scope=$1 for update",
                         scope,
                     )
+                    if stored is None:
+                        await connection.execute(
+                            "insert into public.capacity_scopes(scope,capacity) values($1,$2) "
+                            "on conflict do nothing", scope, capacity,
+                        )
+                        stored = await connection.fetchval(
+                            "select capacity from public.capacity_scopes where scope=$1 for update",
+                            scope,
+                        )
                     # Replicas cannot independently raise global configuration.
                     effective = min(capacity, stored)
                     if scope.startswith("workflow-share:"):

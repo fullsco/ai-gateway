@@ -92,6 +92,41 @@ trace recording, and rejection of unknown labels. Earlier artifact hashes do not
 identify this newly instrumented source. Historical tables below retain their
 original execution scopes rather than implying a final release qualification.
 
+## Warm-row capacity optimization — preliminary result
+
+Capacity acquisition now locks each scope first and inserts only if the row is
+missing, then re-reads it under lock. Scope ordering, stored-policy limits, the
+separate lease-count statement, and atomic lease insertion remain in place.
+For N scopes, warm acquisition uses N+3 explicit statements instead of 2N+3;
+cold acquisition uses 3N+3 instead of 2N+3, excluding transaction control.
+
+Verification: five isolated PostgreSQL capacity tests passed, including cold/warm
+statement counts for 1/3/6 scopes, ordered locking statements, exhaustion, changed
+stored policy, workflow-share limits and expired ownership. These rollback-scoped
+tests do not prove concurrent cold insertion, policy-update contention or
+mixed-binary compatibility. The offline suite passed 1,246 tests with 80 deselected;
+Ruff passed for gateway code and the capacity test file. Wheel/sdist builds passed
+in `/tmp/opencode/warmrow-build`. No typecheck command is configured in pyproject.toml.
+
+The same 120-second/four-client staging workload completed successfully under
+systemd invocation `7f4b4a6382534dd78d3651e012498a0d`. Evidence is
+`/tmp/opencode/warmrow-4-120s.json`. It recorded 2,401 HTTP 200 responses and 211
+workflow submissions; no qualification services remained running afterward.
+
+| Combined mean | Before (ms) | Warm-row (ms) |
+| --- | ---: | ---: |
+| Gateway pre-dispatch | 68.07 | 60.50 |
+| Interactive capacity admission | 13.32 | 10.60 |
+| Route capacity admission | 12.08 | 9.17 |
+
+One API's pre-dispatch p95 remained in (100,250] ms; the other was in (50,100] ms.
+The latency gate is **not closed**. This is one sequential before/after comparison,
+not proof of a repeatable improvement or a controlled estimate of the change's
+benefit. The short run does not close memory, high-load rejection latency,
+independent-generator, mixed-binary rollback or production qualification gates.
+Next verification should cover concurrent cold/warm acquisition and old/new
+locking interoperability before further performance changes.
+
 ## Verified execution ledger
 
 | Evidence | Result | Proven scope and limits |

@@ -57,3 +57,66 @@ async def test_batched_capacity_shares_respect_parent_policy_and_start_together(
             await capacity.acquire({prefix: 8})
         await capacity.release(first)
         await capacity.release(second)
+
+
+class RecordingConnection:
+    def __init__(self, connection):
+        self.connection = connection
+        self.statements = []
+
+    def transaction(self):
+        return self.connection.transaction()
+
+    async def execute(self, query, *args):
+        self.statements.append((query, args))
+        return await self.connection.execute(query, *args)
+
+    async def fetch(self, query, *args):
+        self.statements.append((query, args))
+        return await self.connection.fetch(query, *args)
+
+    async def fetchval(self, query, *args):
+        self.statements.append((query, args))
+        return await self.connection.fetchval(query, *args)
+
+    async def fetchrow(self, query, *args):
+        self.statements.append((query, args))
+        return await self.connection.fetchrow(query, *args)
+
+
+@pytest.mark.parametrize("scope_count", [1, 3, 6])
+async def test_warm_capacity_skips_inserts_and_enforces_changed_policy(scope_count):
+    async with fixture() as (_, db, _, _):
+        recorded = RecordingConnection(db)
+        capacity = DistributedCapacity(TransactionPool(recorded))
+        prefix = f"synthetic-{uuid4()}"
+        names = [f"{prefix}:{index}" for index in range(scope_count)]
+        scopes = dict.fromkeys(reversed(names), 2)
+        first = await capacity.acquire(scopes)
+        assert len(recorded.statements) == 3 * scope_count + 3
+        assert sum(query.startswith("insert into public.capacity_scopes")
+                   for query, _ in recorded.statements) == scope_count
+        await capacity.release(first)
+        recorded.statements.clear()
+        second = await capacity.acquire(scopes)
+        assert len(recorded.statements) == scope_count + 3
+        assert not any(query.startswith("insert into public.capacity_scopes")
+                       for query, _ in recorded.statements)
+        locked = [(query, args) for query, args in recorded.statements
+                  if query.startswith("select capacity from public.capacity_scopes")]
+        assert [args[0] for _, args in locked] == names
+        assert all(query.endswith("for update") for query, _ in locked)
+        third = await capacity.acquire(scopes)
+        with pytest.raises(CapacityFull):
+            await capacity.acquire(scopes)
+        assert await db.fetchval(
+            "select count(*) from public.capacity_leases where scope=any($1::text[])", names,
+        ) == 2 * scope_count
+        await capacity.release(third)
+        changed = await capacity.configure(names[0], 1, expected_version=0)
+        assert changed["version"] == 1
+        with pytest.raises(CapacityFull):
+            await capacity.acquire(scopes)
+        await capacity.release(second)
+        fourth = await capacity.acquire(scopes)
+        await capacity.release(fourth)
