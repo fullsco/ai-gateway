@@ -31,12 +31,13 @@ QUERY_PROFILE = Counter()
 
 def query_observed(record):
     # Driver wall time includes scheduling/transport; never persist SQL or arguments.
-    operation = record.query.strip().split(None, 1)[0].upper() if record.query.strip() else "EMPTY"
-    if operation not in {"SELECT", "INSERT", "UPDATE", "DELETE", "BEGIN", "COMMIT", "ROLLBACK"}:
-        operation = "OTHER"
+    from scripts.qualification_tracing import driver_query_observed, query_operation
+
+    operation = query_operation(record.query)
     QUERY_PROFILE[operation + "_calls"] += 1
     QUERY_PROFILE[operation + "_seconds"] += record.elapsed
     QUERY_PROFILE["errors"] += int(record.exception is not None)
+    driver_query_observed(record)
 
 
 def settings(role):
@@ -94,6 +95,7 @@ async def database():
     import asyncpg
 
     from gateway.configuration.measured_pool import MeasuredPool
+    from scripts.qualification_tracing import TracedConnection
 
     async def initialize(connection):
         connection.add_query_logger(query_observed)
@@ -105,6 +107,7 @@ async def database():
         dsn, min_size=1, max_size=5, command_timeout=10, timeout=5,
         statement_cache_size=100, server_settings={"application_name": "ai-gateway"},
         init=initialize,
+        connection_class=TracedConnection if args.trace_queries else asyncpg.Connection,
     ))
 
 
@@ -125,6 +128,16 @@ async def api(port):
             return AdminClaims("synthetic", None, "admin")
 
     app = create_app(settings("api"), runtime, db_pool=pool, admin_verifier=Verifier())
+    if args.trace_queries:
+        from scripts.qualification_tracing import (
+            RequestTraceCollector,
+            RequestTraceMiddleware,
+            archive_on_shutdown,
+        )
+
+        collector = RequestTraceCollector()
+        app.add_middleware(RequestTraceMiddleware, collector=collector)
+        archive_on_shutdown(app, collector, ROOT / "evidence" / f"request-traces-api-{port}.json")
     from fastapi import Request
     from fastapi.responses import JSONResponse
 
@@ -263,6 +276,7 @@ if __name__ == "__main__":
     parser.add_argument("role", choices=["api", "workflow", "maintenance", "provider", "proxy"])
     parser.add_argument("--port", type=int, default=18330, choices=[18330, 18331])
     parser.add_argument("--direct-db", action="store_true")
+    parser.add_argument("--trace-queries", action="store_true")
     args = parser.parse_args()
     functions = {"api": lambda: api(args.port), "workflow": lambda: worker("workflow"),
                  "maintenance": lambda: worker("maintenance"), "provider": provider, "proxy": proxy}

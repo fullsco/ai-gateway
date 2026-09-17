@@ -165,9 +165,10 @@ def main() -> int:
     print(f"PostgreSQL qualification target: development project {args.project_ref}")
     files = ("tests/test_remote_isolation.py", "tests/test_workflow_e2e_remote.py",
              "tests/test_artifacts_remote.py", "tests/test_shared_circuit_remote.py",
+             "tests/test_qualification_tracing_remote.py",
              "tests/test_lane_fairness_remote.py", "tests/test_execution_crash_remote.py",
-              "tests/test_mixed_workload_remote.py", "tests/test_workflow_races_remote.py",
-               "tests/test_workflow_protocol_matrix_remote.py", "tests/test_rollback_remote.py") \
+             "tests/test_mixed_workload_remote.py", "tests/test_workflow_races_remote.py",
+             "tests/test_workflow_protocol_matrix_remote.py", "tests/test_rollback_remote.py") \
         if args.isolated else TEST_FILES
     selection = ["-k", args.match] if args.match else []
     return pytest.main(["-m", "integration", *files, *selection, "-x", "-ra", "--tb=short"])

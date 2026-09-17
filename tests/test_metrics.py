@@ -13,6 +13,63 @@ from gateway.admin.metrics import operational_health
 from gateway.metrics import TRACE_LIMIT, StageMetrics, current_trace, measured, metrics, timed
 
 
+@pytest.mark.asyncio
+async def test_diagnostic_observer_tracks_nested_scopes_and_preserves_original_errors():
+    from gateway.metrics import active_measurement, measurement_observer
+
+    observations = []
+
+    def observe(stage, elapsed, error):
+        scope = active_measurement.get()
+        observations.append((stage, scope.stage, scope.task, error))
+        assert elapsed >= 0
+
+    @measured("token_estimation")
+    def estimate():
+        return active_measurement.get().stage
+
+    @measured("durable_reservation")
+    async def reserve():
+        outer = active_measurement.get()
+        assert estimate() == "token_estimation"
+        assert active_measurement.get() is outer
+        await asyncio.sleep(0)
+        raise failure
+
+    failure = asyncio.CancelledError("synthetic")
+    token = measurement_observer.set(observe)
+    try:
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await reserve()
+        assert caught.value is failure
+        assert active_measurement.get() is None
+    finally:
+        measurement_observer.reset(token)
+    assert observations == [
+        ("token_estimation", "token_estimation", asyncio.current_task(), False),
+        ("durable_reservation", "durable_reservation", asyncio.current_task(), True),
+    ]
+
+
+def test_failed_diagnostic_observer_does_not_replace_result_or_exception():
+    from gateway.metrics import active_measurement, measurement_observer
+
+    def broken(*args):
+        raise ValueError("diagnostic failed")
+
+    token = measurement_observer.set(broken)
+    try:
+        with timed("routing"):
+            assert active_measurement.get().stage == "routing"
+        failure = RuntimeError("inference failed")
+        with pytest.raises(RuntimeError) as caught, timed("routing"):
+            raise failure
+        assert caught.value is failure
+        assert active_measurement.get() is None
+    finally:
+        measurement_observer.reset(token)
+
+
 @pytest.mark.parametrize("stage", [
     "capacity_admission", "route_capacity_admission", "shared_circuit_allow",
     "route_concurrency_acquire", "ownership_verify", "durable_dispatch",

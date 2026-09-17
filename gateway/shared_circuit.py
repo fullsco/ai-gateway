@@ -8,6 +8,10 @@ from uuid import uuid4
 from gateway.distributed_capacity import CapacityUnavailable, lifetime_owner, owned_probes
 
 trial_owners: ContextVar[dict | None] = ContextVar("route_trial_owners", default=None)
+_LOCK_CIRCUIT = (
+    "select *,clock_timestamp() as current_time from public.route_circuits "
+    "where route_id=$1 for update"
+)
 
 
 class SharedRouteControls:
@@ -23,71 +27,79 @@ class SharedRouteControls:
         if owners is None:
             owners = {}
             trial_owners.set(owners)
-        owner = uuid4()
         try:
-            async with self.pool.acquire() as connection, connection.transaction():
-                query = (
-                    "select *,clock_timestamp() as current_time from public.route_circuits "
-                    "where route_id=$1 for update"
-                )
-                row = await connection.fetchrow(query, route_id)
-                if row is None:
-                    await connection.execute(
-                        "insert into public.route_circuits(route_id) values($1) "
-                        "on conflict do nothing", route_id,
-                    )
-                    row = await connection.fetchrow(query, route_id)
-                clock = row["current_time"]
-                if row["state"] == "closed":
+            async with self.pool.acquire() as connection:
+                # A closed route needs no mutation. Autocommit still takes the row lock
+                # and observes a concurrent writer before admitting its generation.
+                row = await connection.fetchrow(_LOCK_CIRCUIT, route_id)
+                if row is not None and row["state"] == "closed":
                     owners[route_id] = (None, row["generation"])
                     return True
-                if row["retry_at"] and row["retry_at"] > clock:
-                    return False
-                if row["probe_owner"] and row["probe_expires_at"] > clock:
-                    return False
-                await connection.execute(
-                    "update public.route_circuits set state='half_open',probe_owner=$2,"
-                    "probe_expires_at=clock_timestamp()+interval '15 minutes',updated_at=now() "
-                    "where route_id=$1", route_id, owner,
-                )
-                owners[route_id] = (owner, row["generation"])
-                probes = owned_probes.get()
-                if probes is not None:
-                    task = lifetime_owner.get() or asyncio.current_task()
-
-                    async def renew():
-                        try:
-                            while True:
-                                await asyncio.sleep(30)
-                                async with asyncio.timeout(10):
-                                    changed = await self.pool.fetchval(
-                                        "update public.route_circuits set probe_expires_at="
-                                        "clock_timestamp()+interval '15 minutes' "
-                                        "where route_id=$1 and probe_owner=$2 and generation=$3 "
-                                        "and state='half_open' "
-                                        "and probe_expires_at>clock_timestamp() "
-                                        "returning route_id", route_id, owner, row["generation"],
-                                    )
-                                    if changed is None:
-                                        raise CapacityUnavailable("Shared probe ownership lost")
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception:
-                            task.cancel()
-
-                    async def release():
-                        await self.pool.execute(
-                            "update public.route_circuits set probe_owner=null,"
-                            "probe_expires_at=null "
-                            "where route_id=$1 and probe_owner=$2", route_id, owner,
-                        )
-
-                    pulse = asyncio.create_task(renew())
-                    self.pulses[owner] = pulse
-                    probes.append((pulse, release))
-                return True
+                return await self._allow_probe(connection, route_id, owners)
         except Exception as exc:
             raise CapacityUnavailable("Shared route circuit is unavailable") from exc
+
+    async def _allow_probe(self, connection, route_id, owners):
+        async with connection.transaction():
+            # The autocommit lock has been released. Re-read under a transaction before
+            # deciding or mutating: another replica may have claimed a probe meanwhile.
+            row = await connection.fetchrow(_LOCK_CIRCUIT, route_id)
+            if row is None:
+                await connection.execute(
+                    "insert into public.route_circuits(route_id) values($1) "
+                    "on conflict do nothing", route_id,
+                )
+                row = await connection.fetchrow(_LOCK_CIRCUIT, route_id)
+            clock = row["current_time"]
+            if row["state"] == "closed":
+                owners[route_id] = (None, row["generation"])
+                return True
+            if row["retry_at"] and row["retry_at"] > clock:
+                return False
+            if row["probe_owner"] and row["probe_expires_at"] > clock:
+                return False
+            owner = uuid4()
+            await connection.execute(
+                "update public.route_circuits set state='half_open',probe_owner=$2,"
+                "probe_expires_at=clock_timestamp()+interval '15 minutes',updated_at=now() "
+                "where route_id=$1", route_id, owner,
+            )
+            owners[route_id] = (owner, row["generation"])
+            probes = owned_probes.get()
+            if probes is not None:
+                task = lifetime_owner.get() or asyncio.current_task()
+
+                async def renew():
+                    try:
+                        while True:
+                            await asyncio.sleep(30)
+                            async with asyncio.timeout(10):
+                                changed = await self.pool.fetchval(
+                                    "update public.route_circuits set probe_expires_at="
+                                    "clock_timestamp()+interval '15 minutes' "
+                                    "where route_id=$1 and probe_owner=$2 and generation=$3 "
+                                    "and state='half_open' "
+                                    "and probe_expires_at>clock_timestamp() "
+                                    "returning route_id", route_id, owner, row["generation"],
+                                )
+                                if changed is None:
+                                    raise CapacityUnavailable("Shared probe ownership lost")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        task.cancel()
+
+                async def release():
+                    await self.pool.execute(
+                        "update public.route_circuits set probe_owner=null,"
+                        "probe_expires_at=null "
+                        "where route_id=$1 and probe_owner=$2", route_id, owner,
+                    )
+
+                pulse = asyncio.create_task(renew())
+                self.pulses[owner] = pulse
+                probes.append((pulse, release))
+            return True
 
     async def outcome(self, route_id, outcome):
         owners = trial_owners.get() or {}

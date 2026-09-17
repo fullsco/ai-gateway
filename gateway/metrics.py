@@ -4,7 +4,8 @@ import asyncio
 import functools
 import inspect
 from collections import deque
-from contextlib import contextmanager
+from collections.abc import Callable
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from time import perf_counter
@@ -23,6 +24,22 @@ BUCKETS = (.001, .005, .01, .025, .05, .1, .25, .5, 1., 5., 30.)
 current_trace: ContextVar[list | None] = ContextVar("metric_trace", default=None)
 request_started: ContextVar[float | None] = ContextVar("metric_request_started", default=None)
 TRACE_LIMIT = 64
+
+
+@dataclass(frozen=True)
+class ActiveMeasurement:
+    stage: str
+    started: float
+    task: asyncio.Task | None
+
+
+# Optional diagnostic observer; production histograms and trace payloads stay bounded.
+measurement_observer: ContextVar[Callable[[str, float, bool], None] | None] = ContextVar(
+    "measurement_observer", default=None,
+)
+active_measurement: ContextVar[ActiveMeasurement | None] = ContextVar(
+    "active_measurement", default=None,
+)
 
 
 @dataclass
@@ -53,6 +70,11 @@ class StageMetrics:
         trace = current_trace.get()
         if trace is not None and len(trace) < TRACE_LIMIT:
             trace.append({"stage": stage, "seconds": elapsed, "error": error})
+        observer = measurement_observer.get()
+        if observer is not None:
+            # An optional diagnostic must not alter inference results or mask its error.
+            with suppress(Exception):
+                observer(stage, elapsed, error)
 
     def snapshot(self):
         return {
@@ -74,12 +96,23 @@ def timed(stage: str):
     if stage not in STAGES:
         raise ValueError("Unknown measurement stage")
     started = perf_counter()
+    token = None
+    if measurement_observer.get() is not None:
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        token = active_measurement.set(ActiveMeasurement(stage, started, task))
     error = True
     try:
         yield
         error = False
     finally:
-        metrics.observe(stage, perf_counter() - started, error)
+        try:
+            metrics.observe(stage, perf_counter() - started, error)
+        finally:
+            if token is not None:
+                active_measurement.reset(token)
 
 
 def measured(stage: str):
@@ -90,24 +123,14 @@ def measured(stage: str):
         if inspect.iscoroutinefunction(function):
             @functools.wraps(function)
             async def asynchronous(*args, **kwargs):
-                started, error = perf_counter(), True
-                try:
-                    value = await function(*args, **kwargs)
-                    error = False
-                    return value
-                finally:
-                    metrics.observe(stage, perf_counter() - started, error)
+                with timed(stage):
+                    return await function(*args, **kwargs)
             return asynchronous
 
         @functools.wraps(function)
         def synchronous(*args, **kwargs):
-            started, error = perf_counter(), True
-            try:
-                value = function(*args, **kwargs)
-                error = False
-                return value
-            finally:
-                metrics.observe(stage, perf_counter() - started, error)
+            with timed(stage):
+                return function(*args, **kwargs)
         return synchronous
     return decorate
 

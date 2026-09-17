@@ -205,12 +205,21 @@ pre-dispatch p95: (100,250] ms against the 100 ms target.
 | --- | ---: | ---: | ---: | ---: |
 | `/tmp/opencode/directdb-post034.json` | 2,162 | 73.19 ms | 81.73% | 374.04 ms |
 | `/tmp/opencode/directdb-post034-repeat.json` | 2,361 | 62.91 ms | 90.94% | 352.83 ms |
+| `/tmp/opencode/run-4-120s-dcecf5db3bd84e8ca64fe40e15405720.json` (staging, autocommit shared-circuit closed path + `--trace-queries`) | 2,312 | 63.84 ms (mean of the two api processes' per-request means, 74.05/73.82 s sums over 1,156 each) | 89.66% (1,037+1,051 of 2,312) | 356.14 ms |
 
 The earlier warm-row run had a 60.50 ms pre-dispatch mean and additionally enabled
 `--profile`; these executions are not fully matched controlled comparisons.
 Observed differences do not establish an outlier, identify a causal regression,
 or rule one out. Means do not close the failing tail-latency gate. These short
 runs also cannot establish memory stability or independent-generator qualification.
+
+The autocommit shared-circuit closed path (single `SELECT … FOR UPDATE` statement
+with no surrounding transaction on the warm path; select-first admission skips the
+redundant insert) was qualified on staging in the latest direct-DB run above. Its
+`shared_circuit_allow` stage recorded zero errors with 75.4% of samples ≤5 ms under
+soak, and pre-dispatch stayed inside the previously observed 62.7–73.2 ms mean
+variance band. The p95 remains bounded in (100,250] ms; the latency gate is still
+FAIL and no causal claim between the change and the mean movement is made.
 
 | Evidence | Result | Proven scope and limits |
 | --- | --- | --- |

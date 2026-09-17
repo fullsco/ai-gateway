@@ -57,11 +57,12 @@ async def seed():
 
 
 class Services:
-    def __init__(self, separate=False, direct_db=False):
+    def __init__(self, separate=False, direct_db=False, trace_queries=False):
         self.processes = {}
         self.logs = []
         self.separate = separate
         self.direct_db = direct_db
+        self.trace_queries = trace_queries
         self.service_pids = {}
 
     def unit(self, name):
@@ -75,6 +76,8 @@ class Services:
             args += ["--port", str(port)]
         if self.direct_db:
             args += ["--direct-db"]
+        if self.trace_queries and role == "api":
+            args += ["--trace-queries"]
         if self.separate:
             args = ["sudo", "-n", "systemd-run", "--quiet", "--collect", "--wait", "--pipe",
                     "--unit=" + self.unit(name), "--property=User=ubuntu",
@@ -144,19 +147,21 @@ def percentile(values, fraction):
 
 async def qualify(
     seconds, concurrency=4, faults=True, separate=False, profile=False, direct_db=False,
+    trace_queries=False,
 ):
     import asyncpg
     import httpx
 
     config = await seed()
-    services = Services(separate, direct_db)
+    services = Services(separate, direct_db, trace_queries)
     db = await asyncpg.connect((ROOT / ".staging-dsn").read_text().strip(), command_timeout=10)
     headers = {"Authorization": "Bearer " + config["clients"]["interactive"]["key"]}
     workflow_headers = {"Authorization": "Bearer " + config["clients"]["workflow"]["key"]}
     admin = {"Authorization": "Bearer " + config["admin_token"]}
-    report = {"host": socket.gethostname(), "duration_target_seconds": seconds,
-              "interactive_clients": concurrency, "fault_drills": faults,
-              "separate_service_slice": separate, "direct_database": direct_db, "phases": {}}
+    report = dict(host=socket.gethostname(), duration_target_seconds=seconds,
+                  interactive_clients=concurrency, fault_drills=faults, phases={},
+                  separate_service_slice=separate, direct_database=direct_db,
+                  request_query_tracing=trace_queries)
     try:
         services.start("dbproxy", "proxy")
         services.start("provider", "provider")
@@ -464,6 +469,7 @@ if __name__ == "__main__":
                         help="Launch services in a separately resource-limited systemd slice")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--direct-db", action="store_true")
+    parser.add_argument("--trace-queries", action="store_true")
     args = parser.parse_args()
     if args.profile and not args.separate_services:
         parser.error("--profile requires --separate-services")
@@ -471,10 +477,8 @@ if __name__ == "__main__":
         parser.error("--direct-db requires --skip-faults; partition drills require the proxy")
     (ROOT / "evidence").mkdir(exist_ok=True)
     try:
-        report = asyncio.run(qualify(
-            args.seconds, args.clients, not args.skip_faults, args.separate_services, args.profile,
-            args.direct_db,
-        ))
+        report = asyncio.run(qualify(args.seconds, args.clients, not args.skip_faults,
+            args.separate_services, args.profile, args.direct_db, args.trace_queries))
     except Exception as error:
         (ROOT / "evidence/failure.json").write_text(json.dumps({"error_type": type(error).__name__,
                                                               "message": str(error)[:1000]}))

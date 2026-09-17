@@ -38,6 +38,7 @@ include = [
   "/scripts/seed_dbtest.py", "/scripts/benchmark_admission.py",
   "/scripts/benchmark_fixtures.py", "/scripts/benchmark_database.py",
   "/scripts/qualify_accounting_load.py", "/scripts/qualify_bounded_soak.py",
+  "/scripts/qualification_tracing.py",
 ]
 
 [tool.pytest.ini_options]
