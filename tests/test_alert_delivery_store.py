@@ -265,3 +265,17 @@ def test_migration_only_real_transitions_emit_and_upserts_cannot_emit_phantoms()
     assert "new.status, prior_status, now()" in capture
     assert "occurrence_count" not in query
     assert "update public.alerts" not in query
+
+
+def test_migration_036_only_open_and_resolved_transitions_advance_sequences():
+    query = " ".join(
+        (MIGRATION.parent / "036_alert_delivery_sequence_fix.sql").read_text().lower().split()
+    )
+    assert query.startswith("begin;") and query.endswith("commit;")
+    assert "create or replace function public.set_alert_delivery_sequence()" in query
+    sequence = query.split("create or replace function public.set_alert_delivery_sequence()")[1]
+    assert "subscribed" in sequence
+    assert "new.status in ('open','resolved')" in sequence
+    assert "new.delivery_sequence := old.delivery_sequence + 1" in sequence
+    assert "new.delivery_sequence := 0" in sequence
+    assert "insert into" not in sequence
