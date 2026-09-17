@@ -2,7 +2,7 @@ import base64
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,6 +26,14 @@ class Settings(BaseSettings):
     # How often live operational state (health, cooldown, quota) is re-read from the
     # database. In-process attempt outcomes apply immediately regardless of this.
     live_state_refresh_seconds: float = Field(default=30, gt=0)
+    alert_delivery_enabled: bool = False
+    alert_delivery_url: SecretStr | None = Field(default=None, repr=False)
+    alert_delivery_secret: SecretStr | None = Field(default=None, repr=False)
+    alert_delivery_destination: str = Field(default="default", pattern=r"^[a-zA-Z0-9_-]{1,64}$")
+    alert_delivery_timeout_seconds: float = Field(default=10, ge=1, le=30, allow_inf_nan=False)
+    alert_delivery_poll_seconds: float = Field(default=5, ge=1, le=60, allow_inf_nan=False)
+    alert_delivery_max_attempts: int = Field(default=8, ge=1, le=20)
+    alert_delivery_max_age_seconds: int = Field(default=86400, ge=60, le=604800)
     alert_monitor_enabled: bool = True
     alert_monitor_interval_seconds: float = Field(default=60, gt=0)
     credential_usage_poll_enabled: bool = False
@@ -111,6 +119,19 @@ class Settings(BaseSettings):
     supabase_url: str | None = None
     supabase_jwt_audience: str = "authenticated"
     admin_role: str = "admin"
+
+    @model_validator(mode="after")
+    def validate_alert_delivery(self):
+        from gateway.alert_delivery import validate_destination
+
+        if self.alert_delivery_url is not None:
+            validate_destination(self.alert_delivery_url.get_secret_value())
+        if self.alert_delivery_enabled:
+            if self.alert_delivery_url is None or self.alert_delivery_secret is None:
+                raise ValueError("Alert delivery requires a destination URL and signing secret")
+            if len(self.alert_delivery_secret.get_secret_value().encode()) < 32:
+                raise ValueError("Alert delivery signing secret must contain at least 32 bytes")
+        return self
 
     @field_validator("request_id_header")
     @classmethod

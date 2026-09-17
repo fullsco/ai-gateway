@@ -205,7 +205,7 @@ pre-dispatch p95: (100,250] ms against the 100 ms target.
 | --- | ---: | ---: | ---: | ---: |
 | `/tmp/opencode/directdb-post034.json` | 2,162 | 73.19 ms | 81.73% | 374.04 ms |
 | `/tmp/opencode/directdb-post034-repeat.json` | 2,361 | 62.91 ms | 90.94% | 352.83 ms |
-| `/tmp/opencode/run-4-120s-dcecf5db3bd84e8ca64fe40e15405720.json` (staging, autocommit shared-circuit closed path + `--trace-queries`) | 2,312 | 63.84 ms (mean of the two api processes' per-request means, 74.05/73.82 s sums over 1,156 each) | 89.66% (1,037+1,051 of 2,312) | 356.14 ms |
+| `/tmp/opencode/run-4-120s-dcecf5db3bd84e8ca64fe40e15405720.json` (staging, autocommit shared-circuit closed path + `--trace-queries`) | 2,312 | 63.96 ms (147.8714 s over 2,312 requests) | 90.31% (1,037+1,051 of 2,312) | 356.14 ms |
 
 The earlier warm-row run had a 60.50 ms pre-dispatch mean and additionally enabled
 `--profile`; these executions are not fully matched controlled comparisons.
@@ -216,10 +216,42 @@ runs also cannot establish memory stability or independent-generator qualificati
 The autocommit shared-circuit closed path (single `SELECT … FOR UPDATE` statement
 with no surrounding transaction on the warm path; select-first admission skips the
 redundant insert) was qualified on staging in the latest direct-DB run above. Its
-`shared_circuit_allow` stage recorded zero errors with 75.4% of samples ≤5 ms under
+`shared_circuit_allow` stage recorded zero errors with 76.34% of samples ≤5 ms under
 soak, and pre-dispatch stayed inside the previously observed 62.7–73.2 ms mean
 variance band. The p95 remains bounded in (100,250] ms; the latency gate is still
 FAIL and no causal claim between the change and the mean movement is made.
+
+The subsequent 1,800-second run is **INVALID for stable-resource qualification**:
+`/tmp/opencode/run-4-1800s-8902cdda017046d08354f68d147cfcab.json`
+(SHA-256 `64c046329e888efc42f253938b33bb3e2d61e9c4bb77650c7288d83d580a990d`).
+During this run the operator incorrectly limited the ancestor `gateway.slice` to
+15% CPU / 300 MiB, constraining the services rather than the generator. The
+20,041 HTTP 200 responses and 2,690 completed workflows remain functional
+observations, but its 1,104.85 ms response p95 and RSS cannot establish a
+stable-budget comparison or close memory qualification. Parent limits were
+subsequently reset and verified as unlimited; the service slice retained
+65% CPU / 1,200 MiB. The original generator ran outside a capped generator unit.
+
+A five-minute recovery check then completed with unchanged limits: generator
+unit `qualification-generator-recovery` in `system.slice` at 15% CPU / 300 MiB,
+services at 65% CPU / 1,200 MiB, and unlimited `gateway.slice` parent limits.
+Command: `scripts/staging_qualify.py --seconds 300 --clients 4 --skip-faults
+--separate-services --direct-db`. Staging evidence:
+`evidence/run-4-300s-609cdd315dd24fb6963d06201b0a786a.json`.
+Functional validation passed with 5,865 HTTP 200 responses and 520 completed
+workflows; response p95 was 352.55 ms. Pre-dispatch p95 remains **FAIL**, bounded
+in (100,250] ms, with 5,397/5,865 samples (92.02%) within 100 ms. Memory remains
+**OPEN** with 298 samples, below the required 900. These colocated, synthetic,
+fault-skipping checks do not close independent-generator or representative soak
+qualification. Cleanup verified zero tasks in the staging slices and active
+pre-existing API, dashboard and nginx services. No further soak is scheduled.
+
+External alert delivery remains **OPEN**: current alert code persists,
+deduplicates and resolves database records but has no outbound delivery worker.
+The next implementation needs durable transition delivery, bounded retries and
+mocked transport tests. Real delivery qualification additionally needs an approved
+destination, notification policy and permission to send synthetic notifications;
+no outbound notification was sent during this assessment.
 
 | Evidence | Result | Proven scope and limits |
 | --- | --- | --- |

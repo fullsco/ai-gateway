@@ -15,6 +15,7 @@ from gateway.admin.metrics import router as metrics_router
 from gateway.admin.operations import router as operations_router
 from gateway.admin.reconcile import router as reconcile_router
 from gateway.admission import InferenceAdmissionMiddleware
+from gateway.alert_delivery import start_alert_delivery
 from gateway.alerts_monitor import alert_monitor_loop
 from gateway.api.artifacts import router as artifacts_router
 from gateway.api.messages import router as messages_router
@@ -214,6 +215,14 @@ def create_app(
                     app_settings.alert_monitor_interval_seconds,
                     lambda: getattr(app.state, "db_pool", None),
                 )
+            )
+        if (
+            app_settings.alert_delivery_enabled
+            and app_settings.service_role in {"combined", "maintenance"}
+            and getattr(app.state, "db_pool", None) is not None
+        ):
+            await start_alert_delivery(
+                resources, getattr(app.state, "db_pool", None), app_settings
             )
         if (app_settings.health_probe_enabled
                 and app_settings.service_role in {"combined", "maintenance"}):
