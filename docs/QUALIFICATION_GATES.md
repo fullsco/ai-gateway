@@ -197,6 +197,21 @@ latency, representative translated soak, independent-generator, real-cost or rel
 gates. A fresh offline regression before `48cde32` passed 1,301 tests with 87 deselected;
 Ruff passed excluding the two unrelated credential-bearing scripts.
 
+Two subsequent direct-DB runs used `--seconds 120 --clients 4 --skip-faults
+--separate-services --direct-db`. Both passed functional assertions but failed
+pre-dispatch p95: (100,250] ms against the 100 ms target.
+
+| Direct-DB evidence | HTTP 200 count | Pre-dispatch mean | Samples ≤100 ms | Total-response p95 |
+| --- | ---: | ---: | ---: | ---: |
+| `/tmp/opencode/directdb-post034.json` | 2,162 | 73.19 ms | 81.73% | 374.04 ms |
+| `/tmp/opencode/directdb-post034-repeat.json` | 2,361 | 62.91 ms | 90.94% | 352.83 ms |
+
+The earlier warm-row run had a 60.50 ms pre-dispatch mean and additionally enabled
+`--profile`; these executions are not fully matched controlled comparisons.
+Observed differences do not establish an outlier, identify a causal regression,
+or rule one out. Means do not close the failing tail-latency gate. These short
+runs also cannot establish memory stability or independent-generator qualification.
+
 | Evidence | Result | Proven scope and limits |
 | --- | --- | --- |
 | `scripts/dev_check.py`; offline selection under `tests/` | PASS: 989 passed, 69 deselected, 1 xfail | Lead-verified snapshot before new network fixes. Deselected DB tests and the expected failure are not passes. Exact xfail identity/reason and a final post-fix full run remain to be attached. |
