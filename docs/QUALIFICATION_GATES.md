@@ -178,10 +178,24 @@ Those remain follow-up checks before broader qualification claims.
   test (1). Full offline regression passed 1,301 tests with 86 deselected before
   the final persisted-alert integration test was added. Counts are snapshots.
 
-The dedicated DB is migrated through 034; historical entries below retain their
-original schema scopes. AWS staging has not received 034 or new monitoring/maintenance
-code yet. Latency, representative translated soak, independent-generator, real-cost
-and full release gates remain open or failed as previously recorded.
+The dedicated DB and AWS staging are migrated through 034; historical entries below
+retain their original schema scopes. Staging received tracked source from `48cde32`.
+The post-migration operations probe exited 0 with `qualified: true`; archived evidence
+is `/tmp/opencode/operations-final-post034.json`.
+
+The subsequent staging command used `--seconds 120 --clients 4 --skip-faults
+--separate-services`, with the database proxy enabled. Its evidence is staging file
+`evidence/run-4-120s-f0d6d0c64d824a57a1ffcf0fecc1b8be.json`. Functional assertions
+passed: 1,556 HTTP 200 responses, 204 completed workflows, successful reservations
+settled, provider active count zero and no recorded stage errors. Overall analysis
+remains **FAIL**: pre-dispatch p95 is (100,250] ms against a 100 ms target; only
+449/1,556 samples met that target. Total-response p95 was 477.30 ms. Memory remains
+**OPEN** with only 119 samples, and fault drills were explicitly skipped.
+This proxy-enabled run is not an equivalent before/after comparison with the earlier
+`--direct-db` warm-row run. Neither functional success nor `qualified: true` closes
+latency, representative translated soak, independent-generator, real-cost or release
+gates. A fresh offline regression before `48cde32` passed 1,301 tests with 87 deselected;
+Ruff passed excluding the two unrelated credential-bearing scripts.
 
 | Evidence | Result | Proven scope and limits |
 | --- | --- | --- |
