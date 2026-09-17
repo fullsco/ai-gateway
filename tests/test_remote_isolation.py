@@ -3,11 +3,12 @@
 import asyncio
 import json
 import os
+import subprocess
 import sys
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -93,6 +94,52 @@ async def test_concurrent_capacity_acquisition_enforces_one_global_slot(warm):
             await capacity.release(owners[0])
             owner = await capacity.acquire({scope: 1})
             await capacity.release(owner)
+        finally:
+            await pool.execute("delete from public.capacity_leases where scope=$1", scope)
+            await pool.execute("delete from public.capacity_scopes where scope=$1", scope)
+
+
+async def test_old_and_new_capacity_binaries_share_scopes_and_lease_ownership():
+    """Load the pre-warm-row capacity module and the current one on separate backends."""
+    async with dedicated_pool() as pool:
+        scope = f"qualification:{uuid4()}"
+        try:
+            blob = subprocess.check_output(
+                ["git", "-C", str(Path(__file__).resolve().parents[1]),
+                 "show", "0bac80ee1db12dda4cb6103df00b54ad824958e2:"
+                 "gateway/distributed_capacity.py"],
+                text=True, timeout=15,
+            )
+        except subprocess.CalledProcessError:
+            pytest.fail("Rollback baseline 0bac80e must exist in local history")
+        module = ModuleType("distributed_capacity_baseline")
+        exec(compile(blob, "distributed_capacity_baseline.py", "exec"), module.__dict__)
+        LegacyCapacity = module.DistributedCapacity
+        from gateway.distributed_capacity import DistributedCapacity as CurrentCapacity
+
+        legacy_owners, current_owners = [], []
+        try:
+            async with pool.acquire() as old_connection, pool.acquire() as second:
+                assert old_connection.get_server_pid() != second.get_server_pid()
+                legacy = LegacyCapacity(TransactionPool(old_connection))
+                current = CurrentCapacity(TransactionPool(second))
+                # Old binary acquires; new binary must see the committed lease as full.
+                legacy_owners.append(await legacy.acquire({scope: 1}))
+                with pytest.raises(CapacityFull):
+                    await current.acquire({scope: 1})
+                # New binary takes over after release; old binary then renews a live
+                # lease and the new binary observes the renewed expiry as full.
+                await legacy.release(legacy_owners.pop())
+                current_owners.append(await current.acquire({scope: 1}))
+                await current.release(current_owners.pop())
+                legacy_owners.append(await legacy.acquire({scope: 1}))
+                await legacy.renew(legacy_owners[0], 1)
+                with pytest.raises(CapacityFull):
+                    await current.acquire({scope: 1})
+            # Neither version may leak leases into the other's accounting.
+            assert await pool.fetchval(
+                "select count(*) from public.capacity_leases where scope=$1", scope,
+            ) == 1
         finally:
             await pool.execute("delete from public.capacity_leases where scope=$1", scope)
             await pool.execute("delete from public.capacity_scopes where scope=$1", scope)

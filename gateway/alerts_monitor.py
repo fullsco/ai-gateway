@@ -14,6 +14,7 @@ problem from one that has already recovered.
 import asyncio
 import json
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,6 +28,39 @@ logger = logging.getLogger("gateway.alerts.monitor")
 # threshold values come from the rule, so the same condition serves several rules
 # at different sensitivities.
 _CONDITIONS: dict[str, tuple[str, str, tuple[str, ...]]] = {
+    "workflow_queue_age": (
+        "client",
+        "select client_id::text as scope_id, 'Workflow queue' as label, count(*) as queued, "
+        "greatest(0,extract(epoch from now()-min(updated_at))) as queue_age_seconds "
+        "from public.workflow_jobs where status='queued' group by client_id "
+        "having greatest(0,extract(epoch from now()-min(updated_at))) >= $1::numeric",
+        ("threshold",),
+    ),
+    "settlement_backlog": (
+        "client",
+        "select f.client_id::text as scope_id, 'Pending settlements' as label, "
+        "count(*) as pending, "
+        "greatest(0,extract(epoch from now()-min(o.created_at))) as oldest_seconds "
+        "from public.settlement_outbox o join public.financial_reservations f "
+        "on f.id=o.reservation_id where o.applied_at is null group by f.client_id "
+        "having count(*) >= $1::numeric",
+        ("threshold",),
+    ),
+    "unknown_usage": (
+        "client",
+        "select client_id::text as scope_id, 'Unknown usage' as label, count(*) as unknown "
+        "from public.financial_reservations where status='unknown' group by client_id "
+        "having count(*) >= $1::numeric",
+        ("threshold",),
+    ),
+    "workflow_approval_backlog": (
+        "client",
+        "select client_id::text as scope_id, 'Workflows requiring approval' as label, "
+        "count(*) as awaiting_approval from public.workflow_jobs "
+        "where status='waiting_for_approval' group by client_id "
+        "having count(*) >= $1::numeric",
+        ("threshold",),
+    ),
     "credential_quota_low": (
         "credential",
         """
@@ -224,10 +258,12 @@ def _threshold(condition: dict[str, Any]) -> float:
     """The single sensitivity value a condition compares against."""
     for key in ("at_least", "at_most", "threshold", "value"):
         if key in condition:
-            try:
-                return float(condition[key])
-            except (TypeError, ValueError):
-                continue
+            if isinstance(condition[key], bool):
+                raise ValueError("Boolean threshold is invalid")
+            value = float(condition[key])
+            if not math.isfinite(value):
+                raise ValueError("Threshold must be finite")
+            return value
     return 0.0
 
 
@@ -255,13 +291,27 @@ async def evaluate_monitored_rules(pool: Any) -> MonitorResult:
         if spec is None:
             continue
         scope_type, query, bindings = spec
-        condition = rule["condition"] or {}
-        if isinstance(condition, str):
-            condition = json.loads(condition)
-        window = int(condition.get("window_minutes", 15) or 15)
-        threshold = _threshold(condition)
-        floor = int(condition.get("min_requests", condition.get("min_samples", 1)) or 1)
-        available = {"window": window, "threshold": threshold, "floor": floor}
+        try:
+            condition = rule["condition"]
+            if condition is None:
+                condition = {}
+            if isinstance(condition, str):
+                condition = json.loads(condition)
+            if not isinstance(condition, dict):
+                raise ValueError("Condition must be an object")
+            window = condition.get("window_minutes", 15)
+            floor = condition.get("min_requests", condition.get("min_samples", 1))
+            if type(window) is not int or not 1 <= window <= 10080:
+                raise ValueError("Window must be 1–10080 minutes")
+            if type(floor) is not int or not 1 <= floor <= 1000000:
+                raise ValueError("Sample floor must be 1–1000000")
+            threshold = _threshold(condition)
+            available = {"window": window, "threshold": threshold, "floor": floor}
+        except (TypeError, ValueError, OverflowError) as exc:
+            log_event(logger, logging.WARNING, "alert_condition_invalid",
+                      condition_kind=kind, error_type=type(exc).__name__)
+            # Invalid/missing observations must not falsely resolve existing alerts.
+            continue
         try:
             rows = await pool.fetch(query, *(available[name] for name in bindings))
         except Exception as exc:

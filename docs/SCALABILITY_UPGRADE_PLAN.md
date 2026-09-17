@@ -2,6 +2,9 @@
 
 Status: development implementation and bounded deployed staging qualification verified;
 remaining performance/operational gates open (not release-approved).
+Latest follow-up (2026-09-17): source-version rollback probes, operational alert
+conditions and bounded opt-in telemetry maintenance verified in dedicated development.
+See `QUALIFICATION_GATES.md` for current test scopes and unresolved release blockers.
 Production release: deferred until all release gates pass and cutover is scheduled.
 Baseline: `230183e` plus pre-existing, uncommitted configuration-cache changes.
 
@@ -24,7 +27,7 @@ settings point elsewhere and must not be used.
 Dedicated isolated qualification uses `kpmxgwflgyzjvitwlfvs` (`ai-gateway-tests`,
 eu-west-1), provided by the user in `.env.dbtest` as `POOLER` and `TOKEN`. This project
 was verified empty before applying migration files and synthetic fixture rows. The dedicated
-project is now migrated through 033 (34 files, including the two historical 003 files).
+project is now migrated through 034 (35 files, including the two historical 003 files).
 Use `.venv/bin/python scripts/prepare_dbtest.py --env-file .env.dbtest` to verify/reuse
 its checksum-tracked preparation. The script refuses other projects and untracked schemas.
 Local PostgreSQL initialization or daemon startup is prohibited in this Pro Distro/OpenCode

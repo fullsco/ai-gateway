@@ -77,6 +77,10 @@ class BudgetInput(BaseModel):
 
 
 CONDITION_KINDS = (
+    "workflow_queue_age",
+    "settlement_backlog",
+    "unknown_usage",
+    "workflow_approval_backlog",
     "budget_utilization",
     "credential_quota_low",
     "credential_balance_low",

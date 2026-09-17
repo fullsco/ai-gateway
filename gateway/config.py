@@ -54,6 +54,17 @@ class Settings(BaseSettings):
     http_pool_timeout_seconds: float = Field(default=1, gt=0, allow_inf_nan=False)
     http_write_timeout_seconds: float = Field(default=30, gt=0, allow_inf_nan=False)
     durable_accounting_enabled: bool = False
+    # Opt-in telemetry pruning alongside accounting; artifact expiry is always on.
+    maintenance_enabled: bool = False
+    # Telemetry cadence; artifacts retain the accounting worker's five-second cadence.
+    maintenance_interval_seconds: float = Field(
+        default=3600, ge=60, le=86400, allow_inf_nan=False,
+    )
+    # Separate deadline for artifact GC and telemetry pruning.
+    maintenance_timeout_seconds: float = Field(
+        default=5, ge=0.1, le=60, allow_inf_nan=False,
+    )
+    telemetry_retention_days: int = Field(default=30, ge=7, le=365)
     workflows_enabled: bool = False
     workflow_global_capacity: int = Field(default=4, ge=1, le=32)
     workflow_per_client_capacity: int = Field(default=1, ge=1, le=8)

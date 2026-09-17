@@ -9,8 +9,10 @@ from uuid import uuid4
 import httpx
 import pytest
 
+from gateway.alerts_monitor import _CONDITIONS, evaluate_monitored_rules
 from gateway.app import create_app
 from gateway.config import Settings
+from gateway.maintenance import prune_telemetry
 from gateway.operating_envelope import OperatingEnvelopePolicy
 from gateway.schema_checks import require_circuit_schema, require_execution_schema
 from gateway.workflow_store import WorkflowStore
@@ -238,3 +240,119 @@ async def test_operations_observes_live_provider_leases_and_pending_unknown_hold
         assert await db.fetchval(
             "select reserved_cost from public.client_spend_windows where client_id=$1", tenant,
         ) == 2
+
+
+async def test_operational_alert_queries_use_real_pending_state(monkeypatch):
+    async with operations_fixture(monkeypatch) as (_, _, pool, ledger, db, tenant, route):
+        async def observations(kind, threshold=1):
+            _, query, bindings = _CONDITIONS[kind]
+            assert bindings == ("threshold",)
+            return await db.fetch(query, threshold)
+
+        for kind in ("workflow_queue_age", "workflow_approval_backlog",
+                     "unknown_usage", "settlement_backlog"):
+            await db.execute(
+                "insert into public.alert_rules(name,condition_kind,condition,enabled) "
+                "values($2,$1,'{\"at_least\":1}'::jsonb,false)", kind, f"Synthetic {uuid4()}",
+            )
+
+        store = WorkflowStore(pool)
+        job = await store.submit(tenant, str(uuid4()), {"max_cost": "1"})
+        await db.execute("update public.workflow_jobs set updated_at=now()-interval '2 minutes' "
+                         "where id=$1", job["id"])
+        rows = await observations("workflow_queue_age", 60)
+        assert len(rows) == 1 and rows[0]["queue_age_seconds"] == 120
+        await db.execute("update public.workflow_jobs set attempts=1,updated_at=now() where id=$1",
+                         job["id"])
+        assert not await observations("workflow_queue_age", 60)
+        owner = uuid4()
+        claimed = await store.claim(owner)
+        await store.transition(job["id"], owner, claimed["version"], "waiting_for_approval", {})
+        assert (await observations("workflow_approval_backlog"))[0]["awaiting_approval"] == 1
+        await store.cancel(tenant, job["id"])
+        assert not await observations("workflow_approval_backlog")
+
+        reservation = await accounting.reserve(ledger, tenant, route, Decimal(1))
+        await ledger.dispatch(reservation)
+        await ledger.settle(reservation, actual=None)
+        assert (await observations("unknown_usage"))[0]["unknown"] == 1
+        original = ledger.apply
+
+        async def interrupted(_):
+            raise RuntimeError("Synthetic apply interruption")
+
+        monkeypatch.setattr(ledger, "apply", interrupted)
+        await ledger.settle(reservation, actual=Decimal("0.25"))
+        assert not await observations("unknown_usage")
+        rows = await observations("settlement_backlog")
+        assert len(rows) == 1 and rows[0]["pending"] == 1
+        await original(reservation)
+        assert not await observations("settlement_backlog")
+
+
+async def test_retention_batches_preserve_recent_telemetry_and_unknown_holds(monkeypatch):
+    async with operations_fixture(monkeypatch) as (_, _, pool, ledger, db, tenant, route):
+        # Refuse to prune any pre-existing eligible rows, even though this rolls back.
+        for table, timestamp in (("health_checks", "checked_at"),
+                                 ("provider_events", "created_at")):
+            assert not await db.fetchval(
+                f"select exists(select 1 from public.{table} "
+                f"where {timestamp}<now()-interval '30 days')",
+            )
+        provider = route.provider_model.provider_id
+        await db.execute(
+            "insert into public.health_checks(provider_id,status,checked_at) "
+            "select $1,'healthy',now()-interval '31 days' from generate_series(1,105)", provider,
+        )
+        await db.execute(
+            "insert into public.provider_events(provider_id,event_type,created_at) "
+            "select $1,'synthetic',now()-interval '31 days' from generate_series(1,105)", provider,
+        )
+        await db.execute("insert into public.health_checks(provider_id,status) "
+                         "values($1,'healthy')", provider)
+        await db.execute("insert into public.provider_events(provider_id,event_type) "
+                         "values($1,'synthetic')", provider)
+        reservation = await accounting.reserve(ledger, tenant, route, Decimal(1))
+        await ledger.dispatch(reservation)
+        await ledger.settle(reservation, actual=None)
+        assert await prune_telemetry(pool) == {
+            "health_checks": "DELETE 100", "provider_events": "DELETE 100",
+        }
+        assert await prune_telemetry(pool) == {
+            "health_checks": "DELETE 5", "provider_events": "DELETE 5",
+        }
+        for table in ("health_checks", "provider_events"):
+            assert await db.fetchval(
+                f"select count(*) from public.{table} where provider_id=$1", provider,
+            ) == 1
+        assert await db.fetchval(
+            "select status from public.financial_reservations where id=$1", reservation,
+        ) == "unknown"
+
+
+async def test_queue_alert_is_persisted_deduplicated_and_resolved(monkeypatch):
+    async with operations_fixture(monkeypatch) as (_, _, pool, _, db, tenant, _):
+        assert not await db.fetchval(
+            "select exists(select 1 from public.alert_rules where enabled "
+            "and condition_kind is not null)",
+        ), "Only this rollback-scoped rule may run in the dedicated fixture"
+        rule_id = await db.fetchval(
+            "insert into public.alert_rules(name,condition_kind,condition,enabled,scope_id,"
+            "cooldown_seconds) values($1,'workflow_queue_age','{\"at_least\":60}'::jsonb,"
+            "true,$2,0) returning id", f"Synthetic queue {uuid4()}", str(tenant),
+        )
+        store = WorkflowStore(pool)
+        job = await store.submit(tenant, str(uuid4()), {"max_cost": "1"})
+        await db.execute("update public.workflow_jobs set updated_at=now()-interval '2 minutes' "
+                         "where id=$1", job["id"])
+        assert (await evaluate_monitored_rules(pool)).raised == 1
+        assert (await evaluate_monitored_rules(pool)).raised == 1
+        rows = await db.fetch(
+            "select status,occurrence_count from public.alerts where rule_id=$1", rule_id,
+        )
+        assert len(rows) == 1 and dict(rows[0]) == {"status": "open", "occurrence_count": 2}
+        await store.cancel(tenant, job["id"])
+        assert (await evaluate_monitored_rules(pool)).resolved == 1
+        assert await db.fetchval(
+            "select status from public.alerts where rule_id=$1", rule_id,
+        ) == "resolved"

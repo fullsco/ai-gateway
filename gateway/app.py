@@ -156,7 +156,7 @@ def create_app(
                 raise RuntimeError("Durable accounting migration is required")
             await require_execution_schema(active_pool)
             if app_settings.service_role in {"combined", "maintenance"}:
-                resources.task(accounting_loop(active_pool))
+                resources.task(accounting_loop(active_pool, settings=app_settings))
         if app_settings.distributed_admission_enabled:
             await require_circuit_schema(active_pool)
         if active_pool is not None:

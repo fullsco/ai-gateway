@@ -1,6 +1,6 @@
 # Qualification gates — evidence snapshot
 
-**2026-09-16: not release-qualified.** Functional qualification has substantial
+**2026-09-17: not release-qualified.** Functional qualification has substantial
 bounded evidence; latency fails at the four-client operating point and operational
 integration, mixed-binary rollback, and real cost evidence remain open.
 
@@ -20,8 +20,8 @@ this reporting task. The lead should update statuses as further work is verified
   fails; otherwise OPEN while required scope remains unproven.
 - Test counts below are separate execution snapshots, not additive totals. Tests and
   worktree contents changed between runs; overlapping selections must not be summed.
-- The full offline result predates the latest network fixes. Targeted post-fix passes
-  do not establish a fresh full-suite pass or a newly qualified release artifact.
+- Historical full-suite results retain their original scope. Later dated verification
+  below supersedes them only for the tested source; it is not release approval.
 - Raw `qualified: true` in staging JSON covers functional runner assertions; it does
   not override memory, latency, operational, or release gates.
 
@@ -138,6 +138,50 @@ contention, multi-scope cold races, or old/new binary locking interoperability.
 Those remain follow-up checks before broader qualification claims.
 
 ## Verified execution ledger
+
+### September 17 follow-up: rollback, monitoring and maintenance
+
+- `tests/test_rollback_remote.py` passed forward and rollback switches between
+  gateway source exports at `0bac80ee1db12dda4cb6103df00b54ad824958e2` and
+  `8bd1ff0299aa4390125a06ae6ffcf635bd4c220c`. Fresh Python processes share a committed
+  queued workflow, pending settlement and capacity lease. The consumer completes
+  the workflow with the real executor and synthetic HTTP transport, replays the
+  prior intent idempotently, and verifies two settled charges totaling 0.50 fixture
+  units and one inference attempt. Source roots are verified. Owner-token handoff
+  tests representation compatibility, not automatic stale-owner takeover.
+- Scope: gateway Python sources, shared interpreter/dependencies, expanded schema,
+  sequential processes. No installed-artifact deployment, ingress/lifespan switch,
+  simultaneous versions or downgrade DDL. Original baseline `230183e` lacks the
+  workflow/accounting modules and cannot drain jobs alone. Full baseline rollback
+  remains **OPEN**, requiring compatible drainers and the uncommitted baseline snapshot.
+- All 48 isolated tests passed in disjoint 37- and 11-test batches. An initial
+  whole-suite attempt exceeded its 900-second timeout during the protocol matrix.
+  Its identified synthetic fixture was removed and the matrix rerun. One expired
+  lease from the first failed compatibility-test draft was removed by exact scope
+  and owner after inspection. The complete rollback-scoped DB selection then
+  passed 36 tests. These cleanups were test cleanup, not financial reconciliation.
+- Added monitored queue age, settlement backlog, unknown usage and workflow approval
+  backlog. Malformed rule parameters no longer abort later rules or falsely resolve
+  unknown observations. Migration 034 expands allowed condition names, seeds no
+  rules and was applied only to the dedicated project. Real-DB tests passed for
+  rule insertion, SQL breach/recovery, alert persistence, deduplication and resolution.
+  External delivery and process/fleet lag/config/scaling integration remain **OPEN**.
+- Telemetry pruning has opt-in bounded scheduling: `maintenance_enabled=false`,
+  interval 3,600 seconds (60–86,400), timeout 5 seconds (0.1–60), retention 30 days
+  (7–365). Existing expired-artifact GC remains automatic. Cleanup runs separately
+  from reconciliation with owned cancellation and per-operation deadlines, sharing
+  the pool. Batches delete at most 100 rows per table. Real-DB tests removed 105 old
+  synthetic rows in 100/5 batches while preserving recent telemetry and unknown
+  holds. No financial/job retention or deduplication-evidence deletion was added.
+- On schema 034, old/new module and both process switches passed again (3 tests);
+  operations/retention passed (6 tests), plus a separate persisted-alert lifecycle
+  test (1). Full offline regression passed 1,301 tests with 86 deselected before
+  the final persisted-alert integration test was added. Counts are snapshots.
+
+The dedicated DB is migrated through 034; historical entries below retain their
+original schema scopes. AWS staging has not received 034 or new monitoring/maintenance
+code yet. Latency, representative translated soak, independent-generator, real-cost
+and full release gates remain open or failed as previously recorded.
 
 | Evidence | Result | Proven scope and limits |
 | --- | --- | --- |
