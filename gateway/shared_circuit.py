@@ -26,14 +26,17 @@ class SharedRouteControls:
         owner = uuid4()
         try:
             async with self.pool.acquire() as connection, connection.transaction():
-                await connection.execute(
-                    "insert into public.route_circuits(route_id) values($1) on conflict do nothing",
-                    route_id,
-                )
-                row = await connection.fetchrow(
+                query = (
                     "select *,clock_timestamp() as current_time from public.route_circuits "
-                    "where route_id=$1 for update", route_id,
+                    "where route_id=$1 for update"
                 )
+                row = await connection.fetchrow(query, route_id)
+                if row is None:
+                    await connection.execute(
+                        "insert into public.route_circuits(route_id) values($1) "
+                        "on conflict do nothing", route_id,
+                    )
+                    row = await connection.fetchrow(query, route_id)
                 clock = row["current_time"]
                 if row["state"] == "closed":
                     owners[route_id] = (None, row["generation"])
