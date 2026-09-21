@@ -690,3 +690,63 @@ describe("unpublished changes banner", () => {
     expect(screen.queryByText(/You have unpublished changes/)).not.toBeInTheDocument();
   });
 });
+
+describe("workflows view", () => {
+  it("lists jobs and inspects one, showing what it is waiting on", async () => {
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes("workflows/job-1")) return response({
+        id: "job-1", client_name: "Acme", client_id: "c1", status: "waiting_for_tool",
+        version: 2, attempts: 1, max_attempts: 3, deadline: "2026-09-20T00:00:00Z",
+        updated_at: "2026-09-19T00:00:00Z",
+        input: { protocol: "chat" },
+        checkpoint: { step: 1, pending_tools: [{ id: "call-1" }], tool: { name: "search" } },
+        events: [{ sequence: 1, kind: "submitted", data: {}, created_at: "2026-09-19T00:00:00Z" }],
+      });
+      if (path.includes("workflows")) return response({ data: [{
+        id: "job-1", client_name: "Acme", status: "waiting_for_tool", version: 2,
+        attempts: 1, max_attempts: 3, deadline: "2026-09-20T00:00:00Z", updated_at: "2026-09-19T00:00:00Z",
+      }] });
+      return response(overview);
+    }));
+    render(<ControlPlane />);
+    await userEvent.click(screen.getByRole("button", { name: "Workflows" }));
+    expect(await screen.findByText("Acme")).toBeVisible();
+    await userEvent.click(await screen.findByRole("button", { name: "Inspect" }));
+    expect(await screen.findByRole("dialog", { name: "Workflow job" })).toBeVisible();
+    expect(screen.getByText("Waiting for tool result")).toBeVisible();
+    expect(screen.getByText("search")).toBeVisible();
+    expect(screen.getByText("submitted")).toBeVisible();
+    expect(document.body.textContent).not.toContain("[object Object]");
+  });
+});
+
+describe("operations view", () => {
+  it("reads live health, backlog, and the advisory scaling recommendation", async () => {
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes("operations/health")) return response({
+        ready: true, draining: false, active_requests: 3,
+        database: "available",
+        pool: { size: 5, idle: 1, maximum: 20 },
+        warnings: ["settlement_backlog"],
+        workflows: [{ status: "queued", count: 2, oldest_seconds: 120 }],
+        accounting: { settlement_backlog: 4, unknown_usage: 0, oldest_settlement_seconds: 75 },
+        capacity: { provider_utilization: 0.42 },
+        operating_envelope: { recommendation: "investigate", reasons: ["current_replicas_unknown"], advisory_only: true },
+      });
+      return response(overview);
+    }));
+    render(<ControlPlane />);
+    await userEvent.click(screen.getByRole("button", { name: "Operations" }));
+    // Backlog is surfaced both as a warning and as a counted figure.
+    expect(await screen.findByText(/Settlements are waiting to be applied/i)).toBeVisible();
+    expect(screen.getByText("Settlements pending")).toBeVisible();
+    // The recommendation is shown, and marked as advice rather than an action.
+    expect(screen.getByText(/Investigate/i)).toBeVisible();
+    expect(screen.getByText(/does not scale from this endpoint/i)).toBeVisible();
+    expect(screen.getByText(/Peak provider utilization/i)).toBeVisible();
+    expect(screen.getByText("42.0%")).toBeVisible();
+    expect(document.body.textContent).not.toContain("[object Object]");
+  });
+});

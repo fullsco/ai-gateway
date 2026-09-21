@@ -7,14 +7,38 @@
  * lists are ordered the way they are because the obvious order misled somebody.
  */
 
-import { Activity, Cable, Coins, KeyRound, Network, Route, ScrollText, Settings2, ShieldCheck, Users } from "lucide-react";
+import { Activity, Cable, Coins, Gauge, KeyRound, Network, Route, ScrollText, Settings2, ShieldCheck, Users } from "lucide-react";
 
-export type View = "overview" | "providers" | "credentials" | "clients" | "models" | "provider-models" | "routing" | "routing-policies" | "requests" | "health" | "usage" | "analytics" | "audit" | "events" | "configuration" | "pools" | "budgets" | "alerts" | "alert-rules";
-export type ResourceView = Exclude<View, "overview">;
+export type View = "overview" | "operations" | "providers" | "credentials" | "clients" | "models" | "provider-models" | "routing" | "routing-policies" | "requests" | "workflows" | "health" | "usage" | "analytics" | "audit" | "events" | "configuration" | "pools" | "budgets" | "alerts" | "alert-rules";
+// overview and operations are bespoke views backed by single-object endpoints, not
+// the generic resource table, so they are excluded from the resource map below.
+export type ResourceView = Exclude<View, "overview" | "operations">;
 export type Notice = { kind: "success" | "error"; message: string } | null;
+
+// The monitored conditions the alert monitor knows how to evaluate, in the same
+// order and with the same keys the gateway accepts (gateway/admin/operations.py).
+// A rule written against one of these does not need to know internal event names.
+export const CONDITION_KINDS: [string, string][] = [
+  ["workflow_queue_age", "Workflow queue is falling behind"],
+  ["settlement_backlog", "Settlements are backing up"],
+  ["unknown_usage", "Usage outcomes are unresolved"],
+  ["workflow_approval_backlog", "Workflows are waiting for approval"],
+  ["budget_utilization", "Budget nearly spent"],
+  ["credential_quota_low", "Credential quota nearly used up"],
+  ["credential_balance_low", "Credential balance nearly gone"],
+  ["credential_auth_failures", "Credential repeatedly rejected"],
+  ["provider_failure_rate", "Provider failing a share of attempts"],
+  ["provider_unreachable", "Provider cannot be reached"],
+  ["model_no_eligible_route", "Model had nowhere to run"],
+  ["credential_pool_exhausted", "Provider has no usable credentials"],
+  ["request_failure_rate", "Requests failing for a model"],
+  ["cost_spike", "Spend spike in a window"],
+  ["unpriced_traffic", "Traffic without pricing"],
+];
 
 export const navigation: [View, typeof Activity, string][] = [
   ["overview", Activity, "Overview"],
+  ["operations", Gauge, "Operations"],
   ["providers", Cable, "Providers"],
   ["pools", Network, "Provider pools (Advanced)"],
   ["credentials", KeyRound, "Credentials (Advanced)"],
@@ -24,6 +48,7 @@ export const navigation: [View, typeof Activity, string][] = [
   ["routing", Route, "Routes (Advanced)"],
   ["routing-policies", Settings2, "Policies (Advanced)"],
   ["requests", ScrollText, "Requests"],
+  ["workflows", ScrollText, "Workflows"],
   ["health", ShieldCheck, "Health"],
   ["usage", Coins, "Usage"],
   ["analytics", Activity, "Analytics"],
@@ -97,6 +122,15 @@ export const resources: Record<ResourceView, { endpoint: string; title: string; 
     title: "Requests",
     mutable: false,
     columns: ["id", "protocol", "requested_model", "status", "latency_ms", "retry_count", "fallback_count"],
+  },
+  workflows: {
+    endpoint: "workflows",
+    title: "Workflows",
+    mutable: false,
+    // status leads: an operator opens this page to find jobs that are stuck waiting
+    // or have failed, not to read ids. attempts/max shows how close a job is to
+    // giving up; deadline is when the gateway will expire it if it does not finish.
+    columns: ["id", "client_name", "status", "version", "attempts", "max_attempts", "deadline", "updated_at"],
   },
   health: {
     endpoint: "health",

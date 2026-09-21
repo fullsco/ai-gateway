@@ -129,17 +129,25 @@ export function buildPayload(view: ResourceView, data: FormData, row?: Row) {
       enforcement: value("enforcement"),
       enabled: bool("enabled"),
     };
-  if (view === "alert-rules")
+  if (view === "alert-rules") {
+    // The server rejects a rule carrying both an event_type and a condition_kind,
+    // so the trigger_kind select decides which one is sent; the other is null.
+    const triggerByCondition = value("trigger_kind") !== "event";
     return {
       name: value("name"),
       enabled: bool("enabled"),
       severity: value("severity"),
-      event_type: value("event_type"),
+      event_type: triggerByCondition ? null : value("event_type"),
+      condition_kind: triggerByCondition ? value("condition_kind") : null,
       scope_type: value("scope_type") || null,
       scope_id: value("scope_id") || null,
       condition: json("condition"),
       cooldown_seconds: Number(value("cooldown_seconds")),
+      description: value("description") || null,
+      impact: value("impact") || null,
+      recommended_action: value("recommended_action") || null,
     };
+  }
   return {
     name: value("name"),
     enabled: bool("enabled"),

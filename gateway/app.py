@@ -14,6 +14,7 @@ from gateway.admin.control_plane import router as control_plane_router
 from gateway.admin.metrics import router as metrics_router
 from gateway.admin.operations import router as operations_router
 from gateway.admin.reconcile import router as reconcile_router
+from gateway.admin.workflows import router as admin_workflows_router
 from gateway.admission import InferenceAdmissionMiddleware
 from gateway.alert_delivery import start_alert_delivery
 from gateway.alerts_monitor import alert_monitor_loop
@@ -334,6 +335,7 @@ def create_app(
     app.include_router(operations_router)
     app.include_router(metrics_router)
     app.include_router(accounting_router)
+    app.include_router(admin_workflows_router)
 
     @app.get("/health", include_in_schema=False)
     @app.head("/health", include_in_schema=False)

@@ -356,3 +356,123 @@ async def test_queue_alert_is_persisted_deduplicated_and_resolved(monkeypatch):
         assert await db.fetchval(
             "select status from public.alerts where rule_id=$1", rule_id,
         ) == "resolved"
+
+
+# ── Admin workflow API (gateway/admin/workflows.py) ─────────────────────────
+# Operator-authorized, read-only inspection across tenants. The client workflow
+# API is tenant-scoped and key-authenticated; this one authenticates with the
+# same synthetic admin session the operations health probe uses, so the guard,
+# the client-name join and the JSONB decode are all exercised against real rows.
+LIST_URL = "/api/admin/v1/workflows"
+
+
+async def test_admin_workflow_list_requires_admin_and_never_leaks_rows(monkeypatch):
+    async with operations_fixture(monkeypatch) as (http, _, pool, _, _, tenant, _):
+        for headers in ({}, {"Authorization": "Bearer invalid"}):
+            response = await http.get(LIST_URL, headers=headers)
+            assert response.status_code == 401
+            assert "data" not in response.json()
+        # A rejected caller must not have reached the workflow tables at all.
+        assert pool.queries == []
+
+
+async def test_admin_workflow_list_joins_client_name_and_filters(monkeypatch):
+    async with operations_fixture(monkeypatch) as (http, _, pool, _, db, tenant, _):
+        client_name = await db.fetchval(
+            "select name from public.gateway_clients where id=$1", tenant,
+        )
+        store = WorkflowStore(pool)
+        older = await store.submit(tenant, str(uuid4()), {"max_cost": "1"})
+        newer = await store.submit(tenant, str(uuid4()), {"max_cost": "2"})
+        # created_at defaults to the transaction's now(), so both share a timestamp;
+        # age one row to make the created_at-desc order deterministic to assert.
+        await db.execute(
+            "update public.workflow_jobs set created_at=now()-interval '1 minute' where id=$1",
+            older["id"],
+        )
+
+        listed = await http.get(LIST_URL, headers=HEADERS)
+        assert listed.status_code == 200, listed.text
+        data = listed.json()["data"]
+        assert [row["id"] for row in data] == [str(newer["id"]), str(older["id"])]
+        row = data[0]
+        assert row["client_id"] == str(tenant)
+        assert row["client_name"] == client_name
+        assert row["status"] == "queued"
+        # The list is a summary: the input payload and checkpoint stay in the detail view.
+        assert "input" not in row and "checkpoint" not in row
+
+        # client_id filter: the tenant's rows come back, an unrelated client sees none.
+        mine = await http.get(LIST_URL, params={"client_id": str(tenant)}, headers=HEADERS)
+        assert {r["id"] for r in mine.json()["data"]} == {str(older["id"]), str(newer["id"])}
+        stranger = await http.get(LIST_URL, params={"client_id": str(uuid4())}, headers=HEADERS)
+        assert stranger.json()["data"] == []
+
+        # status filter: a claimed job leaves the queued set and joins the running one.
+        claimed = await store.claim(uuid4())
+        queued = await http.get(LIST_URL, params={"status": "queued"}, headers=HEADERS)
+        assert {r["id"] for r in queued.json()["data"]} == {
+            str(older["id"]),
+            str(newer["id"]),
+        } - {str(claimed["id"])}
+        running = await http.get(LIST_URL, params={"status": "running"}, headers=HEADERS)
+        assert [r["id"] for r in running.json()["data"]] == [str(claimed["id"])]
+
+        rejected = await http.get(LIST_URL, params={"status": "nonsense"}, headers=HEADERS)
+        assert rejected.status_code == 400
+        assert rejected.json() == {"error": "invalid_status"}
+
+
+async def test_admin_workflow_detail_decodes_checkpoint_and_orders_events(monkeypatch):
+    async with operations_fixture(monkeypatch) as (http, _, pool, _, db, tenant, _):
+        client_name = await db.fetchval(
+            "select name from public.gateway_clients where id=$1", tenant,
+        )
+        store = WorkflowStore(pool)
+        payload = {"max_cost": "1", "goal": "settle invoice"}
+        job = await store.submit(tenant, str(uuid4()), payload)
+        owner = uuid4()
+        claimed = await store.claim(owner)
+        checkpoint = {"awaiting": "human approval", "step": 3}
+        await store.transition(
+            job["id"], owner, claimed["version"], "waiting_for_approval", checkpoint,
+        )
+
+        detail = await http.get(f"{LIST_URL}/{job['id']}", headers=HEADERS)
+        assert detail.status_code == 200, detail.text
+        body = detail.json()
+        assert body["id"] == str(job["id"])
+        assert body["client_name"] == client_name
+        assert body["status"] == "waiting_for_approval"
+        # JSONB columns arrive decoded, not as strings.
+        assert body["input"] == payload
+        assert body["checkpoint"] == checkpoint
+        # queued(0) -> running -> waiting_for_approval, newest first, capped at 200.
+        assert [event["kind"] for event in body["events"]] == [
+            "waiting_for_approval", "running", "queued",
+        ]
+        assert [event["sequence"] for event in body["events"]] == sorted(
+            (event["sequence"] for event in body["events"]), reverse=True,
+        )
+
+        missing = await http.get(f"{LIST_URL}/{uuid4()}", headers=HEADERS)
+        assert missing.status_code == 404
+        assert missing.json() == {"error": "workflow_not_found"}
+
+
+async def test_admin_workflow_api_is_404_when_workflows_disabled(monkeypatch):
+    async with operations_fixture(monkeypatch) as (http, app, pool, _, _, tenant, _):
+        store = WorkflowStore(pool)
+        job = await store.submit(tenant, str(uuid4()), {"max_cost": "1"})
+        # The router reads the flag off app.state at request time, so flipping it
+        # exercises the disabled branch without standing up a second app/runtime.
+        app.state.settings.workflows_enabled = False
+        try:
+            listed = await http.get(LIST_URL, headers=HEADERS)
+            detail = await http.get(f"{LIST_URL}/{job['id']}", headers=HEADERS)
+        finally:
+            app.state.settings.workflows_enabled = True
+        assert listed.status_code == 404 and listed.json() == {"error": "workflows_disabled"}
+        assert detail.status_code == 404 and detail.json() == {"error": "workflows_disabled"}
+        # With the flag restored the same job is inspectable again.
+        assert (await http.get(f"{LIST_URL}/{job['id']}", headers=HEADERS)).status_code == 200

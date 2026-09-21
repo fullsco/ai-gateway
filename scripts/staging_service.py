@@ -13,14 +13,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-if socket.gethostname() != "ip-172-31-42-222":
-    raise SystemExit("Staging services are restricted to the authorized AWS host")
-
-for name in list(os.environ):
-    if name.startswith(("GATEWAY_", "SUPABASE_")) or name in {
-        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-    }:
-        os.environ.pop(name)
+if __name__ == "__main__":
+    if socket.gethostname() != "ip-172-31-42-222":
+        raise SystemExit("Staging services are restricted to the authorized AWS host")
+    for name in list(os.environ):
+        if name.startswith(("GATEWAY_", "SUPABASE_")) or name in {
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        }:
+            os.environ.pop(name)
 
 from gateway.config import Settings, get_settings  # noqa: E402
 
@@ -42,7 +42,7 @@ def query_observed(record):
 
 def settings(role):
     return Settings(_env_file=None, database_url=None, environment="test", service_role=role,
-        health_probe_enabled=False, alert_monitor_enabled=False,
+        health_probe_enabled=False, alert_monitor_enabled=False, alert_delivery_enabled=False,
         credential_usage_poll_enabled=False,
         workflows_enabled=True, durable_accounting_enabled=True, distributed_admission_enabled=True,
         max_in_flight_requests=16, max_in_flight_per_client=8, max_in_flight_streams=12,
@@ -52,29 +52,35 @@ def settings(role):
         shutdown_timeout_seconds=20, stream_keepalive_seconds=.5, log_level="WARNING")
 
 
-async def make_runtime():
+async def make_runtime(translated=False, config=None, http_client=None):
     import httpx
 
     from gateway.auth import ClientPermissions, GatewayClient, InMemoryGatewayKeyStore
     from gateway.models import CanonicalModel, ModelRegistry, ProviderModel
     from gateway.protocols import Capability, ClientProtocol
+    from gateway.protocols.translate import get_translator
     from gateway.providers import Credential, ProviderConfig
     from gateway.providers.openai import OpenAICompatibleAdapter
+    from gateway.providers.translating import TranslatingAdapter
     from gateway.routing import CredentialState, ProviderState, RouteControls, RoutingEngine
     from gateway.runtime import GatewayRuntime
     from gateway.security.gateway_keys import GatewayKey, GatewayKeyHasher
     from scripts.seed_dbtest import CREDENTIAL, MAPPING, PROVIDER
+    from scripts.staging_translated import CAPABILITIES, PROTOCOLS
 
-    config = json.loads((ROOT / ".staging-config").read_text())
+    if config is None:
+        config = json.loads((ROOT / ".staging-config").read_text())
     protocol = ClientProtocol.OPENAI_CHAT_COMPLETIONS
-    caps = frozenset({Capability.STREAMING})
-    clients = [GatewayClient(item["id"], name, ClientPermissions(frozenset({protocol})))
+    caps = CAPABILITIES if translated else frozenset({Capability.STREAMING})
+    protocols = frozenset(PROTOCOLS) if translated else frozenset({protocol})
+    clients = [GatewayClient(item["id"], name, ClientPermissions(protocols))
                for name, item in config["clients"].items()]
     keys = [GatewayKey(id=item["key_id"], client_id=item["id"], key_prefix=item["prefix"],
                        digest=item["digest"]) for item in config["clients"].values()]
     model = CanonicalModel("qualification-model", frozenset(), caps)
     mapping = ProviderModel(str(MAPPING), model.id, str(PROVIDER), "synthetic", protocol, caps,
-                            max_concurrency=8, pricing={"per_request": "0.01", "currency": "USD"})
+                            max_concurrency=8, pricing={"per_request": "0.01", "currency": "USD"},
+                            serves_protocols=protocols)
     registry = ModelRegistry([model], [mapping])
     adapter = OpenAICompatibleAdapter(ProviderConfig(id=str(PROVIDER), name="synthetic",
         base_url="http://127.0.0.1:18340", protocol=protocol, capabilities=caps,
@@ -85,8 +91,11 @@ async def make_runtime():
         provider_states=(ProviderState(str(PROVIDER)),),
         credential_states=(CredentialState(str(CREDENTIAL), str(PROVIDER)),),
         provider_model_adapters={str(MAPPING): adapter},
+        translating_adapters={(str(MAPPING), client): TranslatingAdapter(adapter, get_translator(
+            client, protocol)) for client in protocols if client != protocol},
         credentials={str(CREDENTIAL): Credential(id=str(CREDENTIAL), secret="synthetic")},
-        http_client=httpx.AsyncClient(trust_env=False, limits=httpx.Limits(max_connections=16)),
+        http_client=http_client or httpx.AsyncClient(
+            trust_env=False, limits=httpx.Limits(max_connections=16)),
         route_controls=RouteControls({str(MAPPING): 8}),
     )
 
@@ -116,7 +125,7 @@ async def api(port):
 
     from gateway.app import create_app
 
-    pool, runtime = await database(), await make_runtime()
+    pool, runtime = await database(), await make_runtime(args.translated)
 
     class Verifier:
         async def verify(self, token):
@@ -161,7 +170,7 @@ async def worker(role):
     from gateway.app import create_app
     from gateway.worker_service import workflow_loop
 
-    pool, runtime = await database(), await make_runtime()
+    pool, runtime = await database(), await make_runtime(args.translated)
     app = create_app(settings(role), runtime, db_pool=pool)
     stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -190,13 +199,15 @@ async def worker(role):
         await pool.close()
 
 
-async def provider():
-    import uvicorn
+def provider_app(translated=False):
     from fastapi import FastAPI, Request
-    from fastapi.responses import StreamingResponse
+    from fastapi.responses import JSONResponse, StreamingResponse
+
+    from scripts.staging_translated import DELAY, PROMPT, synthetic_frames, synthetic_response
 
     app = FastAPI()
-    state = {"requests": 0, "active": 0, "peak": 0}
+    state = {"requests": 0, "active": 0, "peak": 0, "validation_failures": 0,
+             "translated_turns": 0}
 
     @app.get("/health")
     async def health():
@@ -205,10 +216,21 @@ async def provider():
     @app.post("/v1/chat/completions")
     async def completion(request: Request):
         body = await request.json()
+        rich = translated and PROMPT in json.dumps(body, ensure_ascii=False)
+        full = None
+        if rich:
+            try:
+                full = synthetic_response(body)
+            except (AssertionError, KeyError, ValueError, TypeError):
+                state["validation_failures"] += 1
+                return JSONResponse({"error": "Synthetic transcript validation failed"},
+                                    status_code=422)
+            state["translated_turns"] += 1
         state["requests"] += 1
         state["active"] += 1
         state["peak"] = max(state["peak"], state["active"])
-        delay = min(45, max(.01, float(body.get("metadata", {}).get("delay", .05))))
+        delay = DELAY if rich else min(
+            45, max(.01, float(body.get("metadata", {}).get("delay", .05))))
         if body.get("stream"):
             # For HTTP ASGI spec >=2.4, Starlette relies on send errors instead of
             # listening for disconnects. A sleeping synthetic generator needs the
@@ -216,6 +238,13 @@ async def provider():
             request.scope["asgi"]["spec_version"] = "2.3"
             async def events():
                 try:
+                    if full is not None:
+                        for frame in synthetic_frames(full):
+                            await asyncio.sleep(delay)
+                            if await request.is_disconnected():
+                                return
+                            yield frame
+                        return
                     yield b'data: {"choices":[{"index":0,"delta":{"content":"synthetic"}}]}\n\n'
                     deadline = asyncio.get_running_loop().time() + delay
                     while asyncio.get_running_loop().time() < deadline:
@@ -231,6 +260,8 @@ async def provider():
             return StreamingResponse(events(), media_type="text/event-stream")
         try:
             await asyncio.sleep(delay)
+            if full is not None:
+                return full
             return {"id": "synthetic", "object": "chat.completion", "choices": [
                 {"index": 0, "message": {"role": "assistant", "content": "ok"},
                  "finish_reason": "stop"}
@@ -238,6 +269,13 @@ async def provider():
         finally:
             state["active"] -= 1
 
+    return app
+
+
+async def provider():
+    import uvicorn
+
+    app = provider_app(args.translated)
     await uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=18340,
                                        access_log=False, log_level="warning")).serve()
 
@@ -277,6 +315,7 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=18330, choices=[18330, 18331])
     parser.add_argument("--direct-db", action="store_true")
     parser.add_argument("--trace-queries", action="store_true")
+    parser.add_argument("--translated", action="store_true")
     args = parser.parse_args()
     functions = {"api": lambda: api(args.port), "workflow": lambda: worker("workflow"),
                  "maintenance": lambda: worker("maintenance"), "provider": provider, "proxy": proxy}

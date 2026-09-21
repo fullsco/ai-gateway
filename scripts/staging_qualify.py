@@ -57,12 +57,13 @@ async def seed():
 
 
 class Services:
-    def __init__(self, separate=False, direct_db=False, trace_queries=False):
+    def __init__(self, separate=False, direct_db=False, trace_queries=False, translated=False):
         self.processes = {}
         self.logs = []
         self.separate = separate
         self.direct_db = direct_db
         self.trace_queries = trace_queries
+        self.translated = translated
         self.service_pids = {}
 
     def unit(self, name):
@@ -78,6 +79,8 @@ class Services:
             args += ["--direct-db"]
         if self.trace_queries and role == "api":
             args += ["--trace-queries"]
+        if self.translated:
+            args += ["--translated"]
         if self.separate:
             args = ["sudo", "-n", "systemd-run", "--quiet", "--collect", "--wait", "--pipe",
                     "--unit=" + self.unit(name), "--property=User=ubuntu",
@@ -147,13 +150,13 @@ def percentile(values, fraction):
 
 async def qualify(
     seconds, concurrency=4, faults=True, separate=False, profile=False, direct_db=False,
-    trace_queries=False,
+    trace_queries=False, translated=False,
 ):
     import asyncpg
     import httpx
 
     config = await seed()
-    services = Services(separate, direct_db, trace_queries)
+    services = Services(separate, direct_db, trace_queries, translated)
     db = await asyncpg.connect((ROOT / ".staging-dsn").read_text().strip(), command_timeout=10)
     headers = {"Authorization": "Bearer " + config["clients"]["interactive"]["key"]}
     workflow_headers = {"Authorization": "Bearer " + config["clients"]["workflow"]["key"]}
@@ -161,7 +164,8 @@ async def qualify(
     report = dict(host=socket.gethostname(), duration_target_seconds=seconds,
                   interactive_clients=concurrency, fault_drills=faults, phases={},
                   separate_service_slice=separate, direct_database=direct_db,
-                  request_query_tracing=trace_queries)
+                  request_query_tracing=trace_queries,
+                  workload_profile="translated" if translated else "native")
     try:
         services.start("dbproxy", "proxy")
         services.start("provider", "provider")
@@ -200,44 +204,9 @@ async def qualify(
                 await profiler.start(db)
             start = monotonic()
 
-            async def interactive(index):
-                number = index
-                while monotonic() - start < seconds:
-                    port = 18330 if number % 4 < 2 else 18331
-                    payload = {**body, "stream": number % 2 == 0,
-                               "metadata": {"delay": .03 if number % 3 else .2}}
-                    if number % 5 == 0:
-                        payload["messages"] = [{"role": "user", "content": "x" * 262144}]
-                    began = monotonic()
-                    try:
-                        response = await http.post(f"http://127.0.0.1:{port}/v1/chat/completions",
-                                                   headers=headers, json=payload)
-                        results[str(response.status_code)] += 1
-                        if response.status_code == 200:
-                            assert not payload["stream"] or "[DONE]" in response.text
-                        else:
-                            assert response.status_code == 429, response.text
-                        elapsed = (monotonic() - began) * 1000
-                        latencies.append(elapsed)
-                        status_latencies.setdefault(str(response.status_code), []).append(elapsed)
-                        # Bound offered retry pressure; report this pacing with the workload.
-                        if response.status_code == 429:
-                            await asyncio.sleep(.05)
-                    except httpx.HTTPError:
-                        results["transport_error"] += 1
-                    number += 1
+            from scripts.staging_workload import interactive, new_coverage, workflows
 
-            async def workflows():
-                while monotonic() - start < seconds:
-                    response = await http.post("http://127.0.0.1:18330/v1/workflows",
-                        headers={**workflow_headers, "Idempotency-Key": str(uuid4())},
-                        json={"protocol": "openai_chat_completions",
-                              "request": {**body, "metadata": {"delay": .1}}})
-                    assert response.status_code in {202, 409, 429}, response.text
-                    workflow_responses[str(response.status_code)] += 1
-                    if response.status_code == 202:
-                        workflow_ids.append(response.json()["id"])
-                    await asyncio.sleep(.5)
+            coverage = new_coverage() if translated else None
 
             async def sample():
                 while monotonic() - start < seconds:
@@ -248,16 +217,23 @@ async def qualify(
                     await asyncio.sleep(1)
 
             await asyncio.gather(
-                *(interactive(i) for i in range(concurrency)), workflows(), sample(),
+                *(interactive(http, headers, body, i, start, seconds, results, latencies,
+                              status_latencies, coverage) for i in range(concurrency)),
+                workflows(http, workflow_headers, body, start, seconds, workflow_ids,
+                          workflow_responses, coverage), sample(),
             )
             load_elapsed = monotonic() - start
             report["memory_samples_bytes"] = rss
+            if coverage is not None:
+                report["phases"]["translated_coverage"] = coverage
             if profiler:
                 report["profile"] = await profiler.finish(db)
             pending = 1
             for _ in range(180):
-                pending = await db.fetchval("select count(*) from public.workflow_jobs "
-                                            "where status in ('queued','running')")
+                pending = await db.fetchval(
+                    "select count(*) from public.workflow_jobs where "
+                    "status in ('queued','running','waiting_for_tool','waiting_for_approval')"
+                )
                 if pending == 0:
                     break
                 await asyncio.sleep(.5)
@@ -285,6 +261,13 @@ async def qualify(
                     for status, values in status_latencies.items()
                 },
                 "workflow_statuses": [dict(r) for r in statuses]}
+            mixed_soak = report["phases"]["mixed_soak"]
+            if coverage is not None:
+                missing = sorted(key for key, row in coverage.items()
+                                 if row["completed"] == 0)
+                assert not missing, f"Translated journeys absent: {missing}"
+                assert all(row["failed"] == 0 for row in coverage.values()), coverage
+                mixed_soak["translated_coverage_required"] = True
             report["phases"]["mixed_soak"]["stage_deltas"] = []
             for index, port in enumerate((18330, 18331)):
                 snapshot = (await http.get(
@@ -470,6 +453,7 @@ if __name__ == "__main__":
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--direct-db", action="store_true")
     parser.add_argument("--trace-queries", action="store_true")
+    parser.add_argument("--translated", action="store_true")
     args = parser.parse_args()
     if args.profile and not args.separate_services:
         parser.error("--profile requires --separate-services")
@@ -478,7 +462,8 @@ if __name__ == "__main__":
     (ROOT / "evidence").mkdir(exist_ok=True)
     try:
         report = asyncio.run(qualify(args.seconds, args.clients, not args.skip_faults,
-            args.separate_services, args.profile, args.direct_db, args.trace_queries))
+            args.separate_services, args.profile, args.direct_db, args.trace_queries,
+            args.translated))
     except Exception as error:
         (ROOT / "evidence/failure.json").write_text(json.dumps({"error_type": type(error).__name__,
                                                               "message": str(error)[:1000]}))

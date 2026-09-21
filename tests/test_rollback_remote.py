@@ -19,7 +19,7 @@ from tests.test_remote_isolation import dedicated_pool
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = "0bac80ee1db12dda4cb6103df00b54ad824958e2"
-CURRENT = "8bd1ff0299aa4390125a06ae6ffcf635bd4c220c"
+CURRENT = "9ebe1821529bc8607fd754ba736e2bfe601e9e73"
 
 
 def export_gateway(commit, destination):

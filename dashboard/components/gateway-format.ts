@@ -99,6 +99,10 @@ const STATES: Record<string, State> = {
   degraded: "warn", cooldown: "warn", rate_limited: "warn", pending: "warn", draft: "warn", warning: "warn",
   failed: "bad", auth_failed: "bad", unavailable: "bad", quota_exhausted: "bad", error: "bad", critical: "bad", firing: "bad",
   disabled: "idle", unknown: "idle", info: "idle",
+  // workflow job statuses: waiting states recover on their own input; expired is a
+  // hard stop, completed is done, cancelled was deliberate.
+  queued: "warn", running: "ok", waiting_for_tool: "warn", waiting_for_approval: "warn",
+  completed: "ok", cancelled: "idle", expired: "bad",
   // routing_state, which says what the router will do rather than what last happened
   "in service": "ok", "on trial": "warn", "cooling down": "warn", "needs attention": "bad",
   // quota_confidence

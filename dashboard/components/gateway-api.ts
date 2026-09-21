@@ -47,6 +47,10 @@ export async function gatewayApi(path: string, init?: RequestInit) {
   });
   const data = await response.json().catch(() => ({}));
   if (response.status === 401) {
+    // A hard navigation is intended here: this shared fetch helper runs outside any
+    // component/router context, and a full reload re-runs the server-side auth check
+    // so the session is re-established rather than patched in the client.
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination
     window.location.assign("/login");
     throw new Error("Session expired");
   }

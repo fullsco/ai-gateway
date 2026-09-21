@@ -100,6 +100,33 @@ def validate_functional_report(report: Mapping) -> None:
         raise ValueError(f"provider.active must be zero; got {active}")
     if peak > 8:
         raise ValueError(f"provider.peak must be <= 8; got {peak}")
+    _translated_coverage(report, soak)
+
+
+def _translated_coverage(report, soak):
+    if soak.get("translated_coverage_required") is not True:
+        if report.get("workload_profile") == "translated":
+            raise ValueError(
+                "translated run must include translated_coverage_required evidence"
+            )
+        return
+    coverage = _mapping(report.get("phases", {}).get("translated_coverage"),
+                        "phases.translated_coverage")
+    protocols = ("openai_chat_completions", "openai_responses", "anthropic_messages")
+    required = {f"{protocol}/{scenario}_two_turn"
+                for protocol in protocols
+                for scenario in ("json", "sse", "workflow")}
+    if set(coverage) != required:
+        raise ValueError("translated run must include all nine protocol/scenario rows")
+    for key, row in coverage.items():
+        path = f"translated_coverage.{key}"
+        row = _mapping(row, path)
+        counts = {name: _count(row.get(name), f"{path}.{name}")
+                  for name in ("started", "completed", "overloaded", "failed")}
+        if counts["completed"] == 0 or counts["failed"] != 0 or row.get("failures") != []:
+            raise ValueError(f"{path} must include completed journeys with zero failures")
+        if counts["started"] != counts["completed"] + counts["overloaded"]:
+            raise ValueError(f"{path} contains unfinished journeys")
 
 
 def _memory(report, config):

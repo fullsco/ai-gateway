@@ -16,6 +16,7 @@ import { gatewayApi as api } from "./gateway-api";
 import { Row, formatCurrencyTotals } from "./gateway-format";
 import { Notice, View, navigation, resources } from "./gateway-resources";
 import { Overview, Metric } from "./overview";
+import { Operations } from "./operations";
 import { Resource } from "./resource-view";
 import ModelRouting from "./model-routing";
 
@@ -23,6 +24,7 @@ export default function ControlPlane() {
   const [view, setView] = useState<View>("overview");
   const [rows, setRows] = useState<Row[]>([]);
   const [overview, setOverview] = useState<Row>({});
+  const [operations, setOperations] = useState<Row>({});
   const [loading, setLoading] = useState(true);
   const [stale, setStale] = useState(false);
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
@@ -53,9 +55,11 @@ export default function ControlPlane() {
     const request = ++sequence.current;
     if (!quiet) setLoading(true);
     try {
-      const result = await api(target === "overview" ? "overview" : resources[target].endpoint);
+      const endpoint = target === "overview" ? "overview" : target === "operations" ? "operations/health" : resources[target].endpoint;
+      const result = await api(endpoint);
       if (request !== sequence.current) return;
       if (target === "overview") setOverview(result);
+      else if (target === "operations") setOperations(result);
       else setRows(target === "analytics" ? [result] : result.data);
       setStale(false);
       setUpdatedAt(new Date());
@@ -73,17 +77,25 @@ export default function ControlPlane() {
 
   useEffect(() => {
     const requested = new URLSearchParams(window.location.search).get("view") as View | null;
-    if (requested === "overview" || (requested && requested in resources)) setView(requested);
+    // Syncing the initial view from the URL is the intended one-shot external→state
+    // sync (deep links, refreshes). It runs once on mount, so there is no cascade.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (requested === "overview" || requested === "operations" || (requested && requested in resources)) setView(requested);
     const onPopState = () => {
       const requested = new URLSearchParams(window.location.search).get("view") as View | null;
-      setView(requested === "overview" || (requested && requested in resources) ? requested : "overview");
+      setView(requested === "overview" || requested === "operations" || (requested && requested in resources) ? requested : "overview");
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
   useEffect(() => {
+    // Changing view clears the previous view's notice and loads the new view's data.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setNotice(null);
     void load(view);
+    // `load` is intentionally omitted: it closes over view/other state and is recreated
+    // each render, so depending on it would re-run this effect in a loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view]);
   const metrics: Metric[] = [
     ["Requests today", Number(overview.requests_today ?? 0).toLocaleString()],
@@ -178,7 +190,7 @@ export default function ControlPlane() {
             </button>
           </div>
         )}
-        {view === "overview" ? <Overview runtime={overview} metrics={metrics} loading={loading} /> : view === "models" ? <ModelRouting onNotice={(message, kind = "success") => setNotice({ message, kind })} /> : <Resource view={view} rows={rows} loading={loading} reload={() => load(view, true)} notify={setNotice} />}
+        {view === "overview" ? <Overview runtime={overview} metrics={metrics} loading={loading} /> : view === "operations" ? <Operations health={operations} loading={loading} /> : view === "models" ? <ModelRouting onNotice={(message, kind = "success") => setNotice({ message, kind })} /> : <Resource view={view} rows={rows} loading={loading} reload={() => load(view, true)} notify={setNotice} />}
       </section>
     </main>
   );

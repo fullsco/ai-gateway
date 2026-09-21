@@ -20,6 +20,7 @@ import { DataTable } from "./data-table";
 import { ResourceEditor } from "./resource-editor";
 import { ConfirmDialog, KeyManager, OneTimeKey } from "./gateway-dialogs";
 import { RequestDetail } from "./request-trace";
+import { WorkflowDetail } from "./workflow-detail";
 import ProviderSetup from "./provider-setup";
 
 export function Resource({ view, rows, loading, reload, notify }: { view: ResourceView; rows: Row[]; loading: boolean; reload: () => Promise<void>; notify: (notice: Notice) => void }) {
@@ -40,6 +41,7 @@ export function Resource({ view, rows, loading, reload, notify }: { view: Resour
   const [publishState, setPublishState] = useState<Row | null>(null);
   const [providerSetup, setProviderSetup] = useState<Row | null | undefined>(null);
   const [requestDetail, setRequestDetail] = useState<Row | null>(null);
+  const [workflowDetail, setWorkflowDetail] = useState<Row | null>(null);
   useEffect(() => {
     if (view === "configuration")
       void api("config/status")
@@ -132,6 +134,16 @@ export function Resource({ view, rows, loading, reload, notify }: { view: Resour
       setBusy("");
     }
   }
+  async function showWorkflow(row: Row) {
+    setBusy("Workflow detail");
+    try {
+      setWorkflowDetail(await api(`workflows/${row.id}`));
+    } catch (reason) {
+      notify({ kind: "error", message: reason instanceof Error ? reason.message : "Unable to load workflow detail" });
+    } finally {
+      setBusy("");
+    }
+  }
   async function rollback() {
     if (!confirm) return;
     const completed = await mutate("Configuration rollback", () => api(`config/versions/${confirm.row.id}/rollback`, { method: "POST" }));
@@ -165,6 +177,7 @@ export function Resource({ view, rows, loading, reload, notify }: { view: Resour
       {view === "configuration" && row.status !== "published" && <button onClick={() => setConfirm({ row, action: "rollback" })}>Rollback</button>}
       {view === "configuration" && <span className="immutable-label">Snapshot immutable</span>}
       {view === "requests" && <button onClick={() => void showRequest(row)} disabled={!!busy}>Trace request</button>}
+      {view === "workflows" && <button onClick={() => void showWorkflow(row)} disabled={!!busy}>Inspect</button>}
     </div>
   );
   const filteredRows = search.trim() ? rows.filter((row) => Object.values(row).some((value) => display(value, "").toLowerCase().includes(search.trim().toLowerCase()))) : rows;
@@ -275,6 +288,7 @@ export function Resource({ view, rows, loading, reload, notify }: { view: Resour
         />
       )}
       {requestDetail && <RequestDetail value={requestDetail} onClose={() => setRequestDetail(null)} />}
+      {workflowDetail && <WorkflowDetail value={workflowDetail} onClose={() => setWorkflowDetail(null)} />}
       {providerSetup !== null && <ProviderSetup provider={providerSetup ?? undefined} onClose={() => setProviderSetup(null)} onSaved={async () => { setProviderSetup(null); await reload(); notify({ kind: "success", message: "Provider configuration reconciled. Review and publish when ready." }); }} />}
     </section>
   );

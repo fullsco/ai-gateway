@@ -196,6 +196,10 @@ export default function ModelRouting({ onNotice }: { onNotice: (message: string,
   }, [onNotice]);
 
   useEffect(() => {
+    // Load the selected model's routing whenever the selection changes. loadRouting
+    // is memoized on onNotice; the leading setLoading(true) is the intended fetch
+    // spinner, not a cascade.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (modelId) void loadRouting(modelId);
   }, [modelId, loadRouting]);
 

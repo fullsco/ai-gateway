@@ -1,14 +1,11 @@
 # Qualification gates — evidence snapshot
 
-**2026-09-17: not release-qualified.** Functional qualification has substantial
-bounded evidence; latency fails at the four-client operating point and operational
-integration, mixed-binary rollback, and real cost evidence remain open.
+**2026-09-18: not release-qualified.** Controlled webhook delivery and installed-wheel
+rollback/recovery pass in staging. Latency, representative soak, operating integration,
+exact original-baseline provenance, real costs and release approval remain open.
 
-This report follows `docs/SCALABILITY_UPGRADE_PLAN.md`, particularly M0–M7 and the
-execution boundary. It records existing evidence and the lead's supplied verified
-results; creating this report did not run tests, load environment files, contact a
-network/database/SSH target, or change application code. Only this file is owned by
-this reporting task. The lead should update statuses as further work is verified.
+This report follows `docs/SCALABILITY_UPGRADE_PLAN.md`, particularly M0–M7 and its
+execution boundary. Dated updates supersede historical results only for their stated scope.
 
 ## Status and provenance rules
 
@@ -38,13 +35,11 @@ be confirmed and would contradict the recorded history.
 production activity has been reported since separation. Current DB qualification
 rejects the known production project. This is not a retrospective production audit.
 The authorized development project is `rnherugormxtrmxlerjj`; committed isolated
-tests use `kpmxgwflgyzjvitwlfvs`. Authorized AWS staging uses a separate
-`gateway_qualification` database and loopback synthetic services, as documented in
-the plan. This report performs no new target verification.
+tests use `kpmxgwflgyzjvitwlfvs`. AWS staging uses `gateway_qualification` and loopback
+synthetic services; the September 18 rollback drill used a fresh disposable staging DB.
 
 **Production migration, canary, deployment and traffic replay: OPEN — excluded,
-not authorized.** They are future approval-dependent work, not failed experiments
-and not actions to perform in order to finish this reporting task.
+not authorized.** Staging drill success does not authorize these actions.
 
 ## Latest bounded attribution evidence
 
@@ -136,6 +131,91 @@ Ruff passed for gateway code and `tests/test_remote_isolation.py`.
 This is bounded single-scope concurrency evidence, not simultaneous policy-update
 contention, multi-scope cold races, or old/new binary locking interoperability.
 Those remain follow-up checks before broader qualification claims.
+
+## Staging concurrency ladder — M1 admission/backlog evidence
+
+All runs: `scripts/staging_qualify.py --seconds 120 --clients N --skip-faults
+--separate-services --direct-db` on the authorized staging host, committed gateway
+`9ebe182`. Evidence files are on staging under `gateway-qualification/evidence/`
+(`ladder-1-120s.json`, `ladder-4-120s.json`, `ladder-8-120s.json`,
+`ladder-64-120s.json`; the two failed runs have `failure.json` plus `ladder-32.log`
+and `ladder-128.log`). The generator always runs in-process even with
+`--separate-services`, so every point is colocated synthetic evidence, not
+independent-generator qualification. Memory is **OPEN** at every 120-second point:
+93–120 one-second samples against the 900-sample minimum. The 960-second translated
+run below closes memory.
+
+| Clients | Qualified | HTTP 200 | HTTP 429 | Workflows | E2E p50/p95/p99 (ms) | Pre-dispatch p95 | ≤100 ms | RSS first/peak (MB) |
+| ---: | --- | ---: | ---: | --- | --- | --- | ---: | --- |
+| 1 | true | 826 | 0 | 223 (202 completed) | 93.8 / 268.3 / 292.9 | (25,50] ms | 99.64% | 361.1 / 379.2 |
+| 4 | true | 2,238 | 0 | 206 (202) | 182.4 / 363.7 / 412.2 | (100,250] ms | 87.80% | 361.1 / 387.8 |
+| 8 | true | 2,371 | 148 | 191 (202) | 383.0 / 591.5 / 663.3 | (250,500] ms | 11.77% | — |
+| 32 | **false (exit 1)** | — | — | drain failed | — | — | — | — |
+| 64 | true | 803 | 16,471 | 54 (202) + 85 (429) | 231.1 / 1,235.0 / 2,030.2 | (1,5] s | 0% | — |
+| 128 | **false (exit 1)** | — | — | drain failed | — | — | — | — |
+
+Both failed runs aborted on `assert pending == 0` at `scripts/staging_qualify.py:240`
+— workflow jobs still in-flight 90 seconds after load ended — and wrote
+`{"error_type": "AssertionError", "message": ""}` to `failure.json` with no ladder
+JSON. At 64 clients the 429 p95 was 647 ms and the surviving 200-response p95 was
+2,409 ms; `route_capacity_admission` recorded 406 errors and `capacity_admission`
+4. At 8 clients `route_capacity_admission` recorded 71 errors and 429 latency was
+p50/p95 101.4/176.9 ms.
+
+Per-stage combined means (ms) for the qualified points:
+
+| Stage | 1 client | 4 clients | 8 clients | 64 clients |
+| --- | ---: | ---: | ---: | ---: |
+| gateway_pre_dispatch | 29.8 | 67.7 | 173.2 | 859.5 |
+| durable_settlement | 8.8 | 21.2 | 56.8 | 224.8 |
+| capacity_admission | 5.1 | 12.4 | 28.8 | 201.7 |
+| durable_reservation | 4.8 | 11.1 | 32.1 | 139.9 |
+| route_capacity_admission | 4.3 | 10.9 | 28.8 | 149.2 |
+| upstream_headers | 46.2 | 49.1 | 53.8 | 81.9 |
+| ownership_verify | 2.8 | 6.5 | 16.0 | 68.1 |
+| durable_dispatch | 2.8 | 6.3 | 15.1 | 69.8 |
+| shared_circuit_allow | 1.8 | 4.1 | 10.7 | 56.3 |
+| db_pool_wait | 0.1 | 0.1 | 1.1 | 24.2 |
+| event_loop_lag | 0.7 | 1.4 | 3.0 | 15.4 |
+
+Findings: admission protects the system above roughly 8 concurrent clients — at 64
+clients 95% of responses were 429s — but every measured latency target degrades
+monotonically with concurrency, and the 100-ms pre-dispatch target is only met near
+idle (99.64% at one client). Workflow drain with a single worker cannot keep up at
+32+ clients; the failure is queue backlog under 429 pressure, not a crash or leaked
+accounting. After the two failed runs, the one job left in `waiting_for_approval`
+(`f35f1b7c-68d6-4f1e-ab46-8a9c4f613d57`, client `8fc303ae…cde5f72521f4`) had
+checkpoint `{"reason": "inference_failed", "http_status": 429}` and no reservations,
+confirming the backlog origin. It was expired manually; the staging DB was then
+verified clean (27 cancelled / 36,576 completed / 3 expired jobs; 381,973 settled /
+22 unknown reservations, the unknowns all pre-existing from September 15).
+
+This reproduces and extends the M1 finding on staging with the current revision. It
+does not close any gate: latency stays FAIL by operator direction, memory stays OPEN
+for insufficient samples at every 120-second point, and separate-generator evidence
+is still required.
+
+### September 21: translated 960-second soak — memory gate closed
+
+`scripts/staging_qualify.py --translated --seconds 960 --clients 4 --skip-faults
+--separate-services --direct-db` on the same host and revision. Evidence:
+`evidence/ladder-4-960s.json` (`run-4-960s-2cc34b6f991b4799a487841295bb2463.json`).
+
+| Gate | Result |
+| --- | --- |
+| Overall | **PASS** (qualified) |
+| Memory (900-sample minimum) | **PASS** — 953 samples; window medians 390.2 → 393.4 MB; growth 3.2 MB (0.83%) |
+| Pre-dispatch ≤100 ms | **PASS** — 13,735 / 14,336 = 95.81% at or below target; p95 (0.05, 0.1] s |
+
+Traffic: 14,336 HTTP responses, all `200`, zero errors. Provider served 14,976
+translated turns with peak active 5 and zero validation failures. 320 workflow
+submissions, all completed. E2E p50/p95/p99 = 299.0 / 493.6 / 529.8 ms. The
+translated-coverage phase exercised all nine two-turn scenarios
+(anthropic_messages / openai_chat_completions / openai_responses × json / sse /
+workflow), 106 started and 106 completed each, 0 overloaded, 0 failed. RSS
+361.1 → 396.5 MB peak. The memory gate for this configuration is now **PASS**;
+it does not retroactively change the 120-second ladder points, and the latency
+FAIL and independent-generator requirements are unaffected.
 
 ## Verified execution ledger
 
@@ -246,12 +326,81 @@ fault-skipping checks do not close independent-generator or representative soak
 qualification. Cleanup verified zero tasks in the staging slices and active
 pre-existing API, dashboard and nginx services. No further soak is scheduled.
 
-External alert delivery remains **OPEN**: current alert code persists,
-deduplicates and resolves database records but has no outbound delivery worker.
-The next implementation needs durable transition delivery, bounded retries and
-mocked transport tests. Real delivery qualification additionally needs an approved
-destination, notification policy and permission to send synthetic notifications;
-no outbound notification was sent during this assessment.
+### Current-revision follow-up: schema 036 and translated journeys
+
+External delivery remains **OPEN**; the operator selected **staging receiver only**.
+The opt-in worker/outbox (`ed01be5`, sequence fix `9ebe182`) passed six dedicated-DB tests.
+`scripts/staging_webhook_check.py` passed with real DB and verified loopback TLS:
+two unique events, seven attempts, real retry backoff and a 31.92-second lease-expiry wait.
+Ack/upserts were suppressed; crash-after-ack duplicate, stale token and dead-letter cases passed.
+Invalid signed input was rejected. Receiver data/secrets were removed; service delivery stays disabled.
+Evidence: `/tmp/opencode/webhook-delivery-drill.json`,
+SHA-256 `45927751b86cc812172f881e5cc2c24279eb26eb3850018391e4b563cd8ea0c7`.
+
+Staging received gateway source `9ebe182` and migrations 035/036. Both journal
+entries, enabled capture/sequence triggers, the outbox table and subscribed sequence
+guard were verified. Operations evidence: `/tmp/opencode/operations-final-post036.json`,
+SHA-256 `cac5b1b05b28ff8db06595087648fdb4e938340683c2356f4a05053bbce2815c`.
+The operations probe exited 0 with `qualified: true`. No production action occurred.
+
+Source-process switches `0bac80e ↔ 9ebe182` passed on the dedicated DB (2 passed, 60 deselected).
+
+**Installed-wheel rollback/recovery: PASS for committed `9ebe182 → 230183e → 9ebe182`.**
+Separate Python 3.12.3 environments verified every installed gateway file and matching dependencies.
+Temporary loopback nginx switched inference with old/new binaries overlapping; active SSE completed.
+New workflows were blocked during rollback; retained current job API/workers drained two accepted jobs.
+The tool workflow dispatched twice, the queued workflow once; settlement replay did not double-charge.
+Forward recovery restored inference and workflow acceptance while retaining prior idempotency keys.
+Seven lifecycle/pool closures passed; 0.33 fixture charges plus the 0.50 unknown hold stayed accounted.
+All 37 migrations through 036 stayed applied with an unchanged journal; disposable DB/ports cleaned up.
+Evidence: `/tmp/opencode/release-rollback-verified.json`,
+SHA-256 `62d1e2e428cbb29878f92c89ad98085eca372e1358dbbe544438c09f06f86dd2`.
+First-attempt failure is retained in `/tmp/opencode/release-rollback-failed-first.json`: the harness
+needed an nginx listener-handoff barrier and shutdown evidence before Uvicorn re-raised SIGTERM.
+Exact original-baseline rollback stays **OPEN**: `230183e`'s unrecorded config-cache changes are excluded.
+The drill uses synthetic runtime/provider configuration; production ingress/configuration is unqualified.
+
+A bounded translated staging check completed with invocation
+`c910896b13304f7480f8ca9ab67433bd`, exit 0. Command:
+`scripts/staging_qualify.py --translated --seconds 120 --clients 4 --skip-faults
+--separate-services --direct-db`. Evidence: `/tmp/opencode/translated-120-output.json`,
+SHA-256 `b19d969aab700fffc9dc6500221c6c4c1dbfcfac74e65e7a4516654119358ccf`.
+The generator ran in `system.slice` at 15% CPU / 300 MiB, services retained
+65% CPU / 1,200 MiB, and the parent was verified unlimited before and after.
+No qualification service units remained afterward.
+
+| Client protocol → Chat upstream | JSON journeys | SSE journeys | Durable workflows |
+| --- | ---: | ---: | ---: |
+| Chat | 150 | 151 | 14 |
+| Responses | 150 | 151 | 14 |
+| Anthropic Messages | 150 | 150 | 14 |
+
+Each journey verifies fixed synthetic reasoning, two tool-call IDs/arguments,
+matching canned results, and a second-turn final answer. Tools are never executed.
+All nine scenarios had zero failed/overloaded journeys: 1,804 HTTP 200 responses,
+42 completed workflows, settled successful reservations, zero provider transcript
+validation failures, and 1,888 translated-profile provider turns. The independent
+report validator rejects missing scenarios, failures and unfinished journeys.
+
+This profile's pre-dispatch p95 was (50,100] ms, with 1,740/1,804 samples (96.45%)
+within 100 ms. Total-response p95 was 492.25 ms. **The existing latency gate stays
+FAIL/open**: different prompt sizes, provider pacing and sequential tool workflows
+make this unsuitable as a matched comparison with the earlier failing native run.
+Memory stays **OPEN** (119 samples versus 900 required). This is bounded synthetic
+translated-journey evidence, not representative production traffic, long reasoning
+streams, an independent generator, real-model quality/cost, or release approval.
+
+Source provenance: unchanged committed gateway `9ebe182` plus reviewed uncommitted
+staging scripts, copied individually and hash-matched before execution:
+
+- `staging_service.py`: `79114c49ee08ba016b37da4d2bdff10def301354d0de10991aaf93edb78aa577`
+- `staging_qualify.py`: `2616a3608e8e3f8763ac19d19b5021b98955aedea1d26a431adfcbd2b5e52418`
+- `staging_translated.py`: `d88d7196f518e2a911168ab0479fcae52911e554f94d90b02f6ff8c0682768fb`
+- `staging_workload.py`: `a199d329f4de5b4c317e09065a8685d7bee88e6beb734af84bf469b92ff0f234`
+- `qualification_report.py`: `4fc6bdc6dff7ca237e3016fb5dcd22040fd0142fe57a80db18b5b0be00d324ba`
+
+September 18 verification: 1,464 offline tests passed, 101 integration tests deselected;
+Ruff, diff checks and wheel/sdist build passed. Qualification changes remain uncommitted.
 
 | Evidence | Result | Proven scope and limits |
 | --- | --- | --- |
@@ -264,9 +413,7 @@ no outbound notification was sent during this assessment.
 | `tests/test_translation_stream_bounds.py` and related streaming regressions | PASS: 94 passed | Lead-verified bounded-streaming batch. Aggregate retained bytes, fragment/call counts, metadata, interleaving and overflow paths; not a deployed long-stream soak. |
 | `tests/test_operating_envelope.py` | PASS: 127 passed | Pure advisory evaluator tests only. Runtime collection, monitoring and scaling integration remain OPEN. |
 
-Counts without an archived execution-log path above are supplied verified results,
-not reruns by the report author. Related-batch command lines and final source hashes
-should be attached by the lead rather than inferred from current test collection.
+Historical counts are separate snapshots, not inferred from current test collection.
 
 Exact DB selection paths in `scripts/dev_db_check.py`:
 
@@ -287,7 +434,7 @@ Exact DB selection paths in `scripts/dev_db_check.py`:
 | Gate | Status | Evidence / exact test paths / remaining scope |
 | --- | --- | --- |
 | Explicit isolated target, synthetic fixtures, inherited DB rejection | PASS | `tests/test_dev_check.py`, `tests/test_dev_db_check.py`; explicit-target runner rejects the known production project and bounds connections. Historical exception remains recorded above. |
-| Deterministic offline baseline | PASS | 989/69/1 execution snapshot above. Current post-network-fix full regression is OPEN. |
+| Deterministic offline baseline | PASS | Historical 989/69/1 snapshot; September 18 guarded offline regression: 1,464 passed, 101 integration cases deselected. |
 | Reproducible deployed functional baseline | PASS | Two-hour JSON paths below; `scripts/staging_qualify.py`, `scripts/qualification_report.py`, `tests/test_qualification_report.py`. Synthetic provider and colocated host only. |
 | Stage metrics and telemetry cardinality/content controls | PASS | `tests/test_observability.py`, `tests/test_metrics.py`; plan records stage histograms and bounded sampled traces. Exact gateway pre-dispatch scope is below. |
 | Complete representative workload/metadata baseline | OPEN | Plan contains ARM64/one-CPU/Python metadata and bounded matrices; latest artifact/dependency provenance, independently driven load, long reasoning/tool-heavy deployed traffic and agreed availability/p99 budgets still need final evidence. |
@@ -300,7 +447,7 @@ Exact DB selection paths in `scripts/dev_db_check.py`:
 | Protocol payload/output/tool limits; no implicit prompt compaction | PASS | `tests/test_input_limits.py`, `tests/test_output_limits.py`, `tests/test_translation_stream_bounds.py`; bounded protocol fixtures. Character estimates are not tokenizer guarantees or unrestricted multimodal qualification. |
 | Full SSE lifetime ownership and cleanup after failures/disconnects | PASS | `tests/test_socket_qualification.py::test_fragmented_sse_over_real_tcp_and_disconnect_capacity_recovery`, `tests/test_transport_double_cancel.py`, `tests/test_request_lifetime_retention.py`; real loopback sockets plus no-cyclic-GC lifetime regression paths. |
 | Small requests and both lanes progress under bounded mixed load | PASS | `tests/test_mixed_workload_remote.py`, `tests/test_lane_fairness_remote.py`; finite two-tenant/capacity-two cases and successful four-client staging soak. |
-| Prompt overload response at the tested high-load ladder | FAIL | Plan's 1/8/32/64/128-client ladder records 429 p95 up to 2,838.63 ms. Functional boundedness does not close prompt-rejection performance. |
+| Prompt overload response at the tested high-load ladder | FAIL | Plan's 1/8/32/64/128-client ladder records 429 p95 up to 2,838.63 ms. The September 21 staging ladder on committed `9ebe182` (section above) reproduces this on staging: 429s begin at 8 clients, 95% of responses are 429 at 64 clients with 429 p95 647 ms, and the 32/128-client points fail workflow-drain assertion outright. Functional boundedness does not close prompt-rejection performance. |
 | Sustained adversarial fairness and full payload/concurrency envelope | OPEN | Accepted-job completion does not prove admission fairness; separate-generator saturation and broader tenant/payload mixes remain unproven. |
 
 ## M2 — routing, runtime lifecycle and HTTP efficiency: FAIL
@@ -363,15 +510,15 @@ Exact DB selection paths in `scripts/dev_db_check.py`:
 | Gate | Status | Evidence / exact test paths / remaining scope |
 | --- | --- | --- |
 | Fresh isolated migration/schema preparation | PASS | Plan records dedicated test DB through migration 033 (34 files, two historical 003 files); `scripts/prepare_dbtest.py`, `tests/test_schema_checks.py`. This is fresh-schema evidence, not production upgrade/rollback compatibility. |
-| Broad regression plus targeted network/DB fixes | PASS | Execution ledger gives exact snapshot scopes. Final combined post-fix suite/lint/build/provenance remains OPEN. |
+| Broad regression plus targeted network/DB fixes | PASS | September 18: `scripts/dev_check.py` 1,464 passed/101 deselected; Ruff excluding the two credential scripts, diff check and wheel/sdist build pass. Remote tests retain their separate execution scopes. |
 | Two-hour healthy mixed-workload completion/accounting | PASS | Both two-hour artifacts below; synthetic providers, four closed-loop clients, separate service slice, direct DB, no fault drills during these soaks. |
 | Baseline two-hour memory gate | FAIL | 125,497 calls, 13,140 completed workflows; post-warmup RSS growth 14.8%. Retained as failed baseline evidence. |
 | Post-cleanup two-hour memory gate | PASS | 126,449 calls, 12,637 completed workflows; post-warmup RSS growth 7.55%, 29,671,424 bytes, within both limits. Not proof of zero leaks or indefinite stability. |
 | Gateway-only pre-dispatch p95 at four clients | FAIL | Latest p95 histogram interval (100,250] ms. Total response p95 and stage means cannot substitute for this target. |
 | Representative deployed translated/tool-heavy soak and saturation | OPEN | Network matrix passes finite wire contracts; a native synthetic soak does not qualify all protocol/payload/failure combinations. Separate-generator measurement still required. |
-| Mixed-binary/schema rollback with accepted work readable/drainable | OPEN | Same-version restart and config rollback tests are insufficient. Need authorized isolated old/new binary overlap and rollback evidence covering accepted jobs, leases, outbox and schema compatibility. |
+| Mixed-binary/schema rollback with accepted work readable/drainable | PASS for pinned wheels; exact baseline OPEN | `scripts/release_rollback.py`: installed `9ebe182 → 230183e → 9ebe182`, nginx overlap/SSE, retained job services, settlement replay and unchanged schema 036 passed. Original unrecorded config-cache changes and actual deployment configuration are excluded. |
 | Monitoring/capacity/cost operating envelope | OPEN | Provisional budget and evaluator exist; integration and real provider/infrastructure prices are missing. |
-| Final immutable release artifacts | OPEN | Plan's successful earlier 0.1.0 wheel/sdist builds predate latest fixes; require final tests, source hashes and matching artifact provenance. |
+| Final immutable release artifacts | OPEN | Pinned baseline/current wheels are hashed and installation-verified in `/tmp/opencode/release-rollback-20260918/manifest.json`; the current gateway is `9ebe182`. Qualification harness changes remain uncommitted and final release approval is pending. |
 | Production migration/canary/release approval | OPEN | Not authorized and excluded from current work. No release approval is implied by this report. |
 
 ## Two-hour artifacts and measurement interpretation
@@ -426,16 +573,12 @@ charges and expected traffic/retention before deriving an operating-cost envelop
 
 ## Highest-priority remaining gates
 
-1. Close the four-client pre-dispatch latency FAIL and high-load rejection latency
-   FAIL with independent-generator profiling and repeated bounded measurements.
-2. Integrate and verify the operating evaluator's live observations, alert delivery,
-   actual role/connection accounting and drain/scaling controls (M3/M6).
-3. Qualify mixed-binary/schema rollback in authorized isolation, preserving accepted
-   jobs and accounting; retain uncertainty/approval semantics (M5/M7).
-4. Run a final combined regression/lint/build snapshot after the network fixes;
-   attach exact commands, xfail rationale, logs and matching source/artifact hashes.
-5. Extend deployed soak to representative translated reasoning/tool-heavy workloads;
-   resolve reconciliation/retention operating policy and obtain real cost inputs.
+1. Keep latency FAIL open per operator direction; independent-generator evidence is still needed.
+2. Integrate live operating observations, role/connection accounting and scaling controls;
+   external webhook delivery requires an approved destination beyond the staging receiver.
+3. Recover the original baseline's unrecorded changes and qualify actual deployment configuration;
+   the pinned-wheel rollback drill now provides bounded accepted-job/accounting evidence.
+4. Freeze the reviewed qualification harness and attach matching final artifact provenance.
+5. Qualify representative long translated reasoning/tool workloads, retention and real costs.
 
-Production migration and canary remain outside this list of authorized execution
-work until explicitly approved. No M0–M7 milestone is declared blanket-complete.
+Production migration/canary remain approval-dependent. No M0–M7 milestone is blanket-complete.

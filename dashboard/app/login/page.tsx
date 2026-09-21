@@ -20,6 +20,9 @@ export default function Login() {
       setBusy(false);
       return;
     }
+    // A hard navigation after sign-in re-runs the server component auth check so the
+    // control plane renders with an established session, rather than a client push.
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination
     window.location.assign("/");
   }
   return <main className="login"><form onSubmit={submit}><div className="mark">AG</div><h1>Operator access</h1><p>Authenticate with the Supabase administrator account.</p><label>Email<input name="email" type="email" autoComplete="email" required /></label><label>Password<input name="password" type="password" autoComplete="current-password" required /></label>{error && <div className="form-error">{error}</div>}<button disabled={busy}>{busy ? "Authenticating..." : "Enter control plane"}</button></form></main>;

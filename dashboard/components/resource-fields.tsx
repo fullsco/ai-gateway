@@ -11,7 +11,7 @@
 
 import { Row } from "./gateway-format";
 import { PROTOCOLS, servedProtocols } from "./gateway-protocols";
-import { ResourceView } from "./gateway-resources";
+import { CONDITION_KINDS, ResourceView } from "./gateway-resources";
 
 export function Field({ name, label, defaultValue, type = "text", required = false, min, max, step, readOnly = false }: { name: string; label: string; defaultValue?: unknown; type?: string; required?: boolean; min?: number; max?: number; step?: string; readOnly?: boolean }) {
   return (
@@ -216,7 +216,25 @@ export function Fields({ view, row = {}, references }: { view: ResourceView; row
     return (
       <>
         <Field name="name" label="Rule name" defaultValue={row.name} required />
-        <Field name="event_type" label="Event type" defaultValue={row.event_type} required />
+        {/* A rule fires from exactly one trigger. The server rejects a rule that
+            carries both an event_type and a condition_kind, so this select decides
+            which of the two fields below is submitted; the other is sent as null. */}
+        <SelectField
+          name="trigger_kind"
+          label="What fires this rule"
+          value={row.condition_kind ? "condition" : "event"}
+          options={[
+            ["condition", "A monitored condition"],
+            ["event", "A request-time event"],
+          ]}
+        />
+        <SelectField
+          name="condition_kind"
+          label="Monitored condition (used when the trigger is a monitored condition)"
+          value={row.condition_kind ?? CONDITION_KINDS[0][0]}
+          options={CONDITION_KINDS}
+        />
+        <Field name="event_type" label="Event type (used when the trigger is a request-time event)" defaultValue={row.event_type} />
         <SelectField
           name="severity"
           label="Severity"
@@ -231,6 +249,11 @@ export function Fields({ view, row = {}, references }: { view: ResourceView; row
         <Field name="scope_id" label="Scope ID" defaultValue={row.scope_id} />
         <Field name="condition" label="Condition JSON" defaultValue={row.condition ? JSON.stringify(row.condition) : "{}"} />
         <Field name="cooldown_seconds" label="Cooldown seconds" type="number" defaultValue={row.cooldown_seconds ?? 300} min={0} />
+        {/* The prose an operator reads when the alert arrives. The server stores these
+            and the alerts table renders them, so a rule with none is harder to act on. */}
+        <Field name="description" label="What it means" defaultValue={row.description} />
+        <Field name="impact" label="Why it matters" defaultValue={row.impact} />
+        <Field name="recommended_action" label="What to do about it" defaultValue={row.recommended_action} />
         {enabled}
       </>
     );
