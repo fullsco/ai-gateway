@@ -400,7 +400,8 @@ staging scripts, copied individually and hash-matched before execution:
 - `qualification_report.py`: `4fc6bdc6dff7ca237e3016fb5dcd22040fd0142fe57a80db18b5b0be00d324ba`
 
 September 18 verification: 1,464 offline tests passed, 101 integration tests deselected;
-Ruff, diff checks and wheel/sdist build passed. Qualification changes remain uncommitted.
+Ruff, diff checks and wheel/sdist build passed. Qualification changes were committed as
+`32ab993` on September 21.
 
 | Evidence | Result | Proven scope and limits |
 | --- | --- | --- |
@@ -518,7 +519,7 @@ Exact DB selection paths in `scripts/dev_db_check.py`:
 | Representative deployed translated/tool-heavy soak and saturation | OPEN | Network matrix passes finite wire contracts; a native synthetic soak does not qualify all protocol/payload/failure combinations. Separate-generator measurement still required. |
 | Mixed-binary/schema rollback with accepted work readable/drainable | PASS for pinned wheels; exact baseline OPEN | `scripts/release_rollback.py`: installed `9ebe182 → 230183e → 9ebe182`, nginx overlap/SSE, retained job services, settlement replay and unchanged schema 036 passed. Original unrecorded config-cache changes and actual deployment configuration are excluded. |
 | Monitoring/capacity/cost operating envelope | OPEN | Provisional budget and evaluator exist; integration and real provider/infrastructure prices are missing. |
-| Final immutable release artifacts | OPEN | Pinned baseline/current wheels are hashed and installation-verified in `/tmp/opencode/release-rollback-20260918/manifest.json`; the current gateway is `9ebe182`. Qualification harness changes remain uncommitted and final release approval is pending. |
+| Final immutable release artifacts | OPEN | Pinned baseline/current wheels are hashed and installation-verified in `/tmp/opencode/release-rollback-20260918/manifest.json`; the current gateway is `9ebe182` with qualification work committed as `32ab993`. Final release approval is pending. |
 | Production migration/canary/release approval | OPEN | Not authorized and excluded from current work. No release approval is implied by this report. |
 
 ## Two-hour artifacts and measurement interpretation
