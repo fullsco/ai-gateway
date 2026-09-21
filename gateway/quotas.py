@@ -182,13 +182,16 @@ async def reserve_budgets(
         # no budgets configured is unaffected. Currency is not part of the match
         # because an unpriced route has no currency to compare.
         try:
+            # scope_id is a text column; callers may pass UUID objects, so coerce to
+            # text to avoid an encode mismatch that would send this guard down the
+            # fail-open path and silently let an exhausted cap be evaded.
             blocking = await pool.fetchval(
                 _EXHAUSTED_BLOCKING_BUDGET_FOR_SCOPE,
-                client_id,
-                provider_id,
-                credential_id,
-                model_id,
-                route_id,
+                str(client_id) if client_id is not None else None,
+                str(provider_id) if provider_id is not None else None,
+                str(credential_id) if credential_id is not None else None,
+                str(model_id) if model_id is not None else None,
+                str(route_id) if route_id is not None else None,
             )
         except Exception:
             # This guard exists to stop a spend cap being evaded by omitted

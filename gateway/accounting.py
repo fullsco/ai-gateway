@@ -108,22 +108,15 @@ class FinancialLedger:
                     str(client_id), str(provider_id), str(credential_id), model_id,
                     str(route_id) if route_id else None, currency,
                 )
-                if estimated_cost is None and client_limit is not None:
-                    raise BudgetExceeded("A client spending limit requires priced requests")
-                if estimated_cost is None or currency is None:
-                    blocking = await connection.fetchval(
-                        "select exists(select 1 from public.gateway_budgets where enabled "
-                        "and enforcement='block' and (scope_type='global' or "
-                        "(scope_type='client' and scope_id=$1) or "
-                        "(scope_type='provider' and scope_id=$2) or "
-                        "(scope_type='credential' and scope_id=$3) or "
-                        "(scope_type='model' and scope_id=$4) or "
-                        "(scope_type='route' and scope_id=$5)))",
-                        str(client_id), str(provider_id), str(credential_id), model_id,
-                        str(route_id) if route_id else None,
-                    )
-                    if blocking:
-                        raise BudgetExceeded("A blocking budget requires a priced route")
+                # Unpriced routes (no derivable cost/currency) are governed solely by
+                # reserve_budgets below, which refuses them only once an applicable
+                # blocking budget is actually exhausted (raising UnpricedRouteBlocked) and
+                # otherwise lets them run while the budget still has headroom. The previous
+                # checks here refused an unpriced route whenever a blocking budget or a
+                # client spending limit merely *existed*, which took every unpriced model
+                # offline the moment a $4,000 global cap was enabled - inconsistent with the
+                # documented, tested contract in quotas.py (reserve_client_spending is a
+                # no-op on unpriced cost; reserve_budgets is the single unpriced arbiter).
                 if estimated_cost is not None:
                     result = await connection.fetchval(
                         "select public.reserve_client_spending($1,$2)", client_id, estimated_cost

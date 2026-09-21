@@ -9,7 +9,7 @@ import pytest
 
 from gateway.accounting import FinancialLedger
 from gateway.configuration import create_pool
-from gateway.quotas import BudgetExceeded, QuotaUnavailable
+from gateway.quotas import BudgetExceeded, QuotaUnavailable, UnpricedRouteBlocked
 from gateway.workflow_context import active_workflow
 from gateway.workflow_store import WorkflowStore
 
@@ -284,3 +284,54 @@ async def test_poisoned_oldest_outbox_entry_is_backed_off_so_later_work_can_prog
         assert await db.fetchval(
             "select attempts from public.settlement_outbox where reservation_id=$1", first,
         ) == 1
+
+
+async def test_unpriced_route_runs_under_a_blocking_budget_with_headroom():
+    """Incident regression: an enabled global block budget with headroom must not
+    take unpriced routes offline.
+
+    The durable path previously refused an unpriced route whenever a blocking
+    budget merely *existed*, which broke every unpriced model the moment a $4,000
+    global cap was enabled. The correct contract (quotas.reserve_budgets) lets it
+    run while the budget still has headroom.
+    """
+    async with fixture() as (ledger, db, client, route):
+        # Fixture client carries spending_limit=10; an unpriced request must still run
+        # (neither the client-limit guard nor the block-budget existence guard may refuse it).
+        await db.execute(
+            "insert into public.gateway_budgets(name,scope_type,scope_id,currency,"
+            "limit_amount,enforcement) values($1,'global',null,'USD',4000,'block')",
+            f"synthetic-{uuid4()}",
+        )
+        reservation = await ledger.reserve(
+            request_id=str(uuid4()), attempt_number=1, client_id=client, route=route,
+            currency=None, estimated_cost=None,
+        )
+        assert await db.fetchval(
+            "select status from public.financial_reservations where id=$1", reservation,
+        ) == "reserved"
+
+
+async def test_unpriced_route_refused_once_a_blocking_budget_is_exhausted():
+    """The cap must still be un-evadable: once the global block budget is at its
+    limit, an unpriced route (which can reserve nothing) is refused with the
+    specific UnpricedRouteBlocked signal so the executor excludes it.
+    """
+    async with fixture() as (ledger, db, client, route):
+        budget = await db.fetchval(
+            "insert into public.gateway_budgets(name,scope_type,scope_id,currency,"
+            "limit_amount,enforcement) values($1,'global',null,'USD',4000,'block') returning id",
+            f"synthetic-{uuid4()}",
+        )
+        await db.execute(
+            "insert into public.budget_usage_windows(budget_id,window_started_at,reserved_cost) "
+            "values($1,date_trunc('month',now()),4000)", budget,
+        )
+        with pytest.raises(UnpricedRouteBlocked):
+            await ledger.reserve(
+                request_id=str(uuid4()), attempt_number=1, client_id=client, route=route,
+                currency=None, estimated_cost=None,
+            )
+        assert await db.fetchval(
+            "select count(*) from public.financial_reservations where client_id=$1", client,
+        ) == 0
