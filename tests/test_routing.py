@@ -421,6 +421,34 @@ def test_a_healthy_credential_is_preferred_over_one_on_trial() -> None:
     assert decision.credential.credential_id == "healthy"
 
 
+def _classifying_adapters() -> tuple:
+    """One adapter per protocol, so every classification assertion covers both.
+
+    AgentRouter answers the same credentials on /v1/messages and /v1/chat/completions,
+    so a rule that holds on one protocol holds on the other. The two adapters used to
+    carry separate copies of this logic and the copies drifted; asserting over both is
+    what keeps them from drifting again.
+    """
+    from gateway.protocols import ClientProtocol
+    from gateway.providers import ProviderConfig
+    from gateway.providers.anthropic import AnthropicCompatibleAdapter
+    from gateway.providers.openai import OpenAICompatibleAdapter
+
+    def config(protocol: ClientProtocol) -> ProviderConfig:
+        return ProviderConfig(
+            id="p",
+            name="P",
+            base_url="https://upstream.example",
+            protocol=protocol,
+            capabilities=frozenset(),
+        )
+
+    return (
+        AnthropicCompatibleAdapter(config(ClientProtocol.ANTHROPIC_MESSAGES)),
+        OpenAICompatibleAdapter(config(ClientProtocol.OPENAI_CHAT_COMPLETIONS)),
+    )
+
+
 def test_a_403_that_says_out_of_quota_is_not_read_as_a_rejected_credential() -> None:
     """Quota and authentication need opposite responses, so they must not collapse.
 
@@ -433,40 +461,165 @@ def test_a_403_that_says_out_of_quota_is_not_read_as_a_rejected_credential() -> 
     """
     import httpx
 
-    from gateway.protocols import ClientProtocol
-    from gateway.providers import ErrorCategory, ProviderConfig
-    from gateway.providers.anthropic import AnthropicCompatibleAdapter
-    from gateway.providers.openai import OpenAICompatibleAdapter
+    from gateway.providers import ErrorCategory
 
-    adapters = (
-        AnthropicCompatibleAdapter(
-            ProviderConfig(
-                id="p", name="P", base_url="https://upstream.example",
-                protocol=ClientProtocol.ANTHROPIC_MESSAGES, capabilities=frozenset(),
-            )
-        ),
-        OpenAICompatibleAdapter(
-            ProviderConfig(
-                id="p", name="P", base_url="https://upstream.example",
-                protocol=ClientProtocol.OPENAI_CHAT_COMPLETIONS, capabilities=frozenset(),
-            )
-        ),
-    )
-    for adapter in adapters:
+    for adapter in _classifying_adapters():
         out_of_quota = httpx.Response(
             403, json={"error": {"message": "user quota is not enough"}}
         )
         assert adapter.normalize_error(out_of_quota).category is ErrorCategory.QUOTA_EXHAUSTED
 
         # A 403 that is genuinely about the credential must still read that way, so
-        # the fix cannot swallow real rejections.
-        rejected = httpx.Response(
-            403, json={"error": {"message": "unauthorized client detected"}}
+        # the fix cannot swallow real rejections. Both wordings below are ones the
+        # credential probe actually recorded (deploy/act_on_credential_probe.py), and
+        # both are properties of the key rather than of the caller: a sibling key may
+        # well be on the allow list, or entitled to the model.
+        for message in (
+            "the caller's IP is not on the token's allow list",
+            "the token may not access claude-opus-5",
+            "invalid api key",
+        ):
+            rejected = httpx.Response(403, json={"error": {"message": message}})
+            assert (
+                adapter.normalize_error(rejected).category
+                is ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR
+            ), message
+
+
+def test_a_refusal_of_the_client_does_not_condemn_the_credential() -> None:
+    """"unauthorized client detected" is a fingerprint check, not a key check.
+
+    Probing eight AgentRouter credentials parked as auth_failed with a minimal header
+    set returned this wording for all eight - the credential then serving every
+    production request among them - while the mapping's real headers got 200 from four
+    of them. Reading it as a rejected credential therefore walks the whole pool into
+    auth_failed one key at a time, and points the operator at rotation when the fix is
+    the request's headers.
+
+    Both statuses are asserted because the two records of this disagree: the probe
+    script logged 403, the relay findings logged 401. The wording is what identifies
+    it, not the status.
+    """
+    import httpx
+
+    from gateway.observability import _passive_health
+    from gateway.providers import ErrorCategory
+    from gateway.providers.base import RetryScope
+
+    for adapter in _classifying_adapters():
+        for status in (401, 403):
+            gated = httpx.Response(
+                status, json={"error": {"message": "unauthorized client detected"}}
+            )
+            error = adapter.normalize_error(gated)
+
+            assert error.category is ErrorCategory.UPSTREAM_WAF_REJECTION, status
+            # The invariant that matters: a valid credential must survive this.
+            assert error.credential_at_fault is False, status
+            assert _passive_health(error.category) != "auth_failed", status
+            # Provider-scoped, so failover does not burn a sibling key on a refusal
+            # that has nothing to do with which key was presented.
+            assert error.retry_scope is RetryScope.PROVIDER, status
+            assert error.retryable is True, status
+
+
+def test_an_empty_distributor_channel_is_not_the_credential_s_quota() -> None:
+    """"No available channel" is the provider's stock-out, not the key's balance.
+
+    AgentRouter's distributor answers 402/403 "no available channel for model X
+    under group default" when it has no upstream channel left to route to, for
+    every key at once. The word "quota" inside "group quota"-adjacent wording is
+    what let these park as quota_exhausted: on 2026-09-06 all twenty-one
+    credentials flipped from 200s to 402/403 within one second at 19:19:43, every
+    one of them parked out-of-quota, several with $450+ of balance. The message
+    names no credential, so it must not condemn one: MODEL_UNAVAILABLE is
+    provider-scoped and not the credential's fault.
+    """
+    import httpx
+
+    from gateway.observability import _passive_health
+    from gateway.providers import ErrorCategory
+    from gateway.providers.base import RetryScope
+
+    for adapter in _classifying_adapters():
+        for status in (402, 403):
+            message = (
+                "No available channel for model claude-opus-5 under group default "
+                "(distributor)"
+            )
+            stock_out = httpx.Response(
+                status, json={"error": {"type": "provider_unavailable", "message": message}}
+            )
+            error = adapter.normalize_error(stock_out)
+
+            assert error.category is ErrorCategory.MODEL_UNAVAILABLE, status
+            # A key with balance must not be parked by a channel outage.
+            assert error.credential_at_fault is False, status
+            assert error.retry_scope is RetryScope.PROVIDER, status
+            assert _passive_health(error.category) != "quota_exhausted", status
+
+        # A 402 that is genuinely about the key's own balance must still park as
+        # quota, so the fix cannot swallow real stock-outs of the key.
+        broke = httpx.Response(
+            402, json={"error": {"message": "insufficient balance, please top up"}}
         )
-        assert (
-            adapter.normalize_error(rejected).category
-            is ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR
+        assert adapter.normalize_error(broke).category is ErrorCategory.QUOTA_EXHAUSTED
+
+
+def test_a_spent_shared_budget_pool_is_not_the_credential_s_quota() -> None:
+    """A rationed family's batch drain is per credential, not the key's balance.
+
+    AgentRouter publishes Claude/GPT capacity as budget pools released in batches
+    (Beijing 07:00/19:00 = 23:00/11:00 UTC). Measured 2026-09-13 18:54 UTC: six keys
+    answered 200 on gpt-6-astra while fourteen answered 402/403 "Budget pool quota
+    has been exhausted" at the same moment - and those same fourteen answered 200
+    on glm-5.3. So the drain is per credential and per family: fail over to a
+    sibling key on this route, never park the key (that strands its healthy routes
+    for every other family), and never read the word "quota" as the key's own
+    balance - which is what parked all 21 keys on 2026-09-12.
+    """
+    import httpx
+
+    from gateway.observability import _passive_health
+    from gateway.providers import ErrorCategory
+    from gateway.providers.base import RetryScope
+
+    for adapter in _classifying_adapters():
+        for status in (402, 403):
+            rationed = httpx.Response(
+                status,
+                json={
+                    "error": {
+                        "type": "bad_response_status_code",
+                        "message": (
+                            "Budget pool quota has been exhausted. Please ask an "
+                            "administrator to increase the limit or select another "
+                            "budget pool. (request id: 20260913063737852509031696j5HT85pwud)"
+                        ),
+                    },
+                    "type": "error",
+                },
+            )
+            error = adapter.normalize_error(rationed)
+
+            assert error.category is ErrorCategory.BUDGET_POOL_STOCKOUT, status
+            # A key with balance must not be parked by a ration: the failure is
+            # scoped to (key, family), not to the key itself.
+            assert error.credential_at_fault is False, status
+            # A sibling key may still have batch allotment, so the next attempt
+            # should try one instead of abandoning the route as provider-wide.
+            assert error.retry_scope is RetryScope.CREDENTIAL, status
+            # The passive label must never condemn the credential overall: the
+            # same keys served glm-5.3 the whole time.
+            assert _passive_health(error.category) != "quota_exhausted", status
+
+        # The key's own balance must still park as quota - the ration cannot become
+        # an amnesty for genuinely drained keys.
+        drained = httpx.Response(
+            403,
+            json={"error": {"type": "new_api_error", "message": "user quota is not enough"}},
         )
+        assert adapter.normalize_error(drained).category is ErrorCategory.QUOTA_EXHAUSTED
 
 
 def test_every_failure_state_earns_a_way_back() -> None:
@@ -496,10 +649,16 @@ def test_every_failure_state_earns_a_way_back() -> None:
         )
 
     # Every health state the gateway can write for a failure must be recoverable.
+    # budget_pool_stockout is exempt: it maps to "degraded" but is not-at-fault, so
+    # _persist never applies a cooldown for it - the credential still serves other
+    # families and must not be parked (the route-scoped memory in live state is
+    # what skips it on the drained route).
+    exempt = {ErrorCategory.BUDGET_POOL_STOCKOUT.value}
     reachable = {
         _passive_health(category.value)
         for category in ErrorCategory
         if _passive_health(category.value) not in (None, "healthy")
+        and category.value not in exempt
     }
     missing = reachable - set(_RECOVERY_COOLDOWN_SECONDS)
     assert not missing, f"these failure states can never be retried: {sorted(missing)}"

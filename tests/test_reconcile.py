@@ -247,6 +247,78 @@ def test_reconcile_repeated_requests_use_idempotent_sql_keys_and_preserve_settin
     assert provider_args[-1] == '{"region": "east", "custom": {"keep": true}}'
 
 
+def test_reconcile_preserves_row_pricing_when_the_save_omits_it() -> None:
+    """A mapping saved without pricing must not wipe the row's existing rate.
+
+    The dashboard guided form only edits token rates; a mapping priced per
+    request or blended arrives with no editable price and the form sends an
+    empty pricing dict. Writing that unconditionally emptied every AgentRouter
+    row on 2026-09-11 and priced usage stopped the same day.
+    """
+    pool = ReconcilePool()
+    payload = reconcile_payload(
+        mappings=[
+            {
+                "model_id": "model-1",
+                "upstream_model_id": "upstream-1",
+                "protocol": "anthropic_messages",
+                "capabilities": ["streaming"],
+            }
+        ]
+    )
+    with TestClient(reconcile_app(pool)) as test_client:
+        response = test_client.put(
+            "/api/admin/v1/providers/reconcile", headers=auth(), json=payload
+        )
+
+    assert response.status_code == 200
+    mapping_query, mapping_args = next(
+        (query, args)
+        for query, args in pool.fetchrow_calls
+        if "insert into public.provider_models" in query
+    )
+    # The conflict path must read the raw $12 param, not excluded.pricing:
+    # excluded.pricing is coalesced to {} in VALUES (for the NOT NULL new-row
+    # case) and would itself wipe the stored rate on update.
+    assert "pricing=coalesce($12::jsonb, public.provider_models.pricing)" in mapping_query
+    # The omitted dict is sent as SQL NULL (None), which coalesce turns into
+    # "keep the row". It must NOT be the JSON string "null" (a json-null value
+    # coalesce would write, wiping the rate).
+    assert mapping_args[-1] is None
+
+
+def test_reconcile_still_replaces_pricing_when_the_save_edits_it() -> None:
+    """An explicit pricing dict is the operator editing the rate: it must land."""
+    pool = ReconcilePool()
+    payload = reconcile_payload(
+        mappings=[
+            {
+                "model_id": "model-1",
+                "upstream_model_id": "upstream-1",
+                "protocol": "anthropic_messages",
+                "capabilities": ["streaming"],
+                "pricing": {
+                    "input_per_million": 3,
+                    "output_per_million": 15,
+                    "currency": "USD",
+                },
+            }
+        ]
+    )
+    with TestClient(reconcile_app(pool)) as test_client:
+        response = test_client.put(
+            "/api/admin/v1/providers/reconcile", headers=auth(), json=payload
+        )
+
+    assert response.status_code == 200
+    _, mapping_args = next(
+        (query, args)
+        for query, args in pool.fetchrow_calls
+        if "insert into public.provider_models" in query
+    )
+    assert '"input_per_million": 3' in mapping_args[-1]
+
+
 def test_reconcile_rejects_existing_alias_owner_without_mutation() -> None:
     pool = ReconcilePool(alias_rows=[{"alias": "LATEST", "model_id": "other-model"}])
     with TestClient(
@@ -428,7 +500,18 @@ def test_absent_credential_access_is_unrestricted_not_selective() -> None:
     ), "selective_pool_membership must first require that some pool member exists"
 
     # The genuinely selective case must still be detectable, so the pair check stays.
-    assert query.count("cross join provider_mappings pm where not exists") == 2
+    assert query.count("cross join provider_mappings pm") == 2
+
+    # Access is judged per credential: one with no rows at all may serve anything, so it
+    # cannot be the evidence that somebody curated the matrix. Membership is not, because
+    # an empty membership set excludes rather than permits.
+    assert (
+        "where exists (select 1 from public.credential_model_access cma "
+        "where cma.credential_id=c.id) and not exists" in access_condition
+    ), "selective_credential_access must ignore credentials that hold no access rows"
+    assert (
+        "cross join provider_mappings pm where not exists" in membership_condition
+    ), "selective_pool_membership must still judge every credential"
 
 
 def test_shared_model_conflict_names_the_field_that_differs() -> None:

@@ -2,7 +2,11 @@ from typing import Any
 
 from pydantic import AnyHttpUrl, BaseModel, Field, field_validator, model_validator
 
-from gateway.admin.control_plane import NormalizedStringLists, ProviderModelInput
+from gateway.admin.control_plane import (
+    NormalizedStringLists,
+    ProviderModelInput,
+    normalize_served_protocols,
+)
 from gateway.protocols import Capability, ClientProtocol
 
 
@@ -47,6 +51,7 @@ class ReconcileMapping(NormalizedStringLists):
     model_id: str
     upstream_model_id: str = Field(min_length=1, max_length=240)
     protocol: ClientProtocol
+    serves_protocols: list[ClientProtocol] = Field(default_factory=list)
     capabilities: list[Capability] = Field(default_factory=list)
     enabled: bool = True
     priority: int = Field(default=100, ge=0)
@@ -59,6 +64,11 @@ class ReconcileMapping(NormalizedStringLists):
     @classmethod
     def validate_pricing(cls, pricing: dict[str, Any]) -> dict[str, Any]:
         return ProviderModelInput.validate_pricing(pricing)
+
+    @model_validator(mode="after")
+    def normalize_served(self) -> "ReconcileMapping":
+        self.serves_protocols = normalize_served_protocols(self.protocol, self.serves_protocols)
+        return self
 
 
 class ReconcileRoute(BaseModel):

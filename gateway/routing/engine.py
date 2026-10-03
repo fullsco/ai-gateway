@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
+from gateway.metrics import measured
 from gateway.models import ModelRegistry, ProviderModel
 from gateway.protocols import NormalizedRequest
 
@@ -130,9 +131,18 @@ class RoutingTrace:
     attempt_number: int = 1
     is_fallback: bool = False
     fallback_reason: str | None = None
+    max_entries: int | None = None
+    candidate_count: int = 0
+    eligible_count: int = 0
+    exclusion_reasons: set[str] = field(default_factory=set)
 
     def add(self, entry: dict[str, Any]) -> None:
-        self.considered.append(entry)
+        self.candidate_count += 1
+        self.eligible_count += int(bool(entry.get("eligible")))
+        if not entry.get("eligible") and entry.get("reason"):
+            self.exclusion_reasons.add(entry["reason"])
+        if self.max_entries is None or len(self.considered) < self.max_entries:
+            self.considered.append(entry)
 
     @property
     def excluded(self) -> list[dict[str, Any]]:
@@ -147,8 +157,9 @@ class RoutingTrace:
             "is_fallback": self.is_fallback,
             "fallback_reason": self.fallback_reason,
             "selected": self.selected,
-            "candidate_count": len(self.considered),
-            "eligible_count": sum(1 for c in self.considered if c.get("eligible")),
+            "candidate_count": self.candidate_count,
+            "eligible_count": self.eligible_count,
+            "exclusion_reasons": sorted(self.exclusion_reasons),
             "considered": self.considered,
         }
 
@@ -173,6 +184,7 @@ class RoutingEngine:
         self.policy = policy or RoutingPolicy()
         self._rng = rng or random.Random()
 
+    @measured("routing")
     def select(
         self,
         request: NormalizedRequest,
@@ -182,11 +194,15 @@ class RoutingEngine:
         now: datetime | None = None,
         excluded_credential_ids: frozenset[str] = frozenset(),
         excluded_provider_model_ids: frozenset[str] = frozenset(),
+        stockout_credential_ids: dict[str, frozenset[str]] | None = None,
         trace: RoutingTrace | None = None,
         diagnostics: dict[str, dict[str, Any]] | None = None,
     ) -> RouteDecision:
         current_time = now or datetime.now(UTC)
         provider_states = {provider.provider_id: provider for provider in providers}
+        credentials_by_provider: dict[str, list[CredentialState]] = {}
+        for credential in credentials:
+            credentials_by_provider.setdefault(credential.provider_id, []).append(credential)
         canonical_model = self.registry.resolve(request.requested_model)
         candidates: list[RouteDecision] = []
 
@@ -220,15 +236,17 @@ class RoutingEngine:
                 continue
 
             assert provider is not None
-            for credential in credentials:
-                if credential.provider_id != provider_model.provider_id:
-                    continue
+            for credential in credentials_by_provider.get(provider_model.provider_id, ()):
+                stockouts = (stockout_credential_ids or {}).get(
+                    provider_model.id, frozenset()
+                )
                 reason = self._credential_exclusion_reason(
                     credential,
                     provider_model,
                     provider,
                     current_time,
                     excluded_credential_ids,
+                    stockout_ids=stockouts,
                 )
                 entry: dict[str, Any] = {
                     "provider_id": provider_model.provider_id,
@@ -382,9 +400,16 @@ class RoutingEngine:
         provider: ProviderState,
         now: datetime,
         excluded_ids: frozenset[str],
+        stockout_ids: frozenset[str] = frozenset(),
     ) -> str | None:
         if credential.credential_id in excluded_ids:
             return "credential_excluded_this_request"
+        if credential.credential_id in stockout_ids:
+            # This credential's batch of this route's rationed family is spent.
+            # Route-scoped by design: the same credential stays eligible on every
+            # other route (measured 2026-09-13, drained keys answered 200 on
+            # glm-5.3), and sibling credentials stay eligible on this one.
+            return "credential_budget_pool_stockout"
         if not credential.enabled:
             return "credential_disabled"
         if credential.provider_id != provider_model.provider_id:

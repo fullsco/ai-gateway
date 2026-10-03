@@ -371,3 +371,29 @@ def test_probe_rejects_a_non_api_200_response() -> None:
 
     streaming = httpx.Response(200, headers={"content-type": "text/event-stream"})
     assert _looks_like_api_response(streaming) is True
+
+
+def test_probe_accepts_a_json_body_under_text_plain() -> None:
+    """AgentRouter answers a successful /v1/messages probe with JSON labelled
+    text/plain (measured 2026-09-13). Misreading that as an edge page kept
+    every anthropic-route probe "failing", so quota_exhausted labels written
+    by the budget-pool stock-out never healed.
+    """
+    from gateway.health.probes import _looks_like_api_response
+
+    plain_json = httpx.Response(
+        200,
+        headers={"content-type": "text/plain; charset=utf-8"},
+        content=b'{"content":[],"type":"message","usage":{"input_tokens":8}}',
+    )
+    assert _looks_like_api_response(plain_json) is True
+
+    empty = httpx.Response(200, headers={"content-type": "text/plain"}, content=b"")
+    assert _looks_like_api_response(empty) is False
+
+    interstitial = httpx.Response(
+        200,
+        headers={"content-type": "text/plain; charset=utf-8"},
+        content=b"<!DOCTYPE html><html>challenge page</html>",
+    )
+    assert _looks_like_api_response(interstitial) is False

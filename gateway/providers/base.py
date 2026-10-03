@@ -20,6 +20,47 @@ from gateway.protocols import Capability, ClientProtocol, NormalizedRequest
 # reporting no spend figure at all.
 DEFAULT_USER_AGENT = "ai-gateway/0.1"
 
+# Wordings that decide what a 401 or 403 actually means. They live here, for the same
+# reason DEFAULT_USER_AGENT does: both adapters classify the same providers -
+# AgentRouter answers the same credentials over /v1/messages and /v1/chat/completions -
+# so a rule that holds on one protocol holds on the other. They were previously two
+# diverging copies. The Anthropic tuple knew "insufficient balance" and "billing
+# limit", the OpenAI one knew "insufficient_quota" and "billing", and neither knew the
+# other's, so one reseller's quota 403 read as exhausted quota on one protocol and as
+# a rejected credential on the other. The shorter substrings below subsume both sets.
+QUOTA_MARKERS = ("quota", "credit balance", "insufficient balance", "billing")
+
+# A distributor in front of the upstream has no channel left to route the model to.
+# AgentRouter answers this on HTTP 402/403 for every key at once, balance included -
+# measured 2026-09-06: every credential flipped from 200s to 402/403 in one second at
+# 19:19:43, all 21 keys parked quota_exhausted, several with $450+ of balance. The
+# word "quota" inside the message is what misled the marker into parking them.
+NO_CHANNEL_MARKERS = ("no available channel", "no channel available", "no channel")
+
+# A provider that rations a model family by shared daily batch answers with this
+# wording when the batch runs out, whatever the key's own balance. AgentRouter
+# publishes the Claude/GPT ration as budget pools released at Beijing 07:00/19:00
+# (23:00/11:00 UTC). Measured 2026-09-13 18:54 UTC, per key and per family: six keys
+# answered 200 on gpt-6-astra while fourteen answered 402 "Budget pool quota has been
+# exhausted" on astra/claude-opus-5/gpt-5.6-sol at the same moment - and those same
+# fourteen answered 200 on glm-5.3. The drain is therefore per credential, not
+# provider-wide: a sibling key may still serve, and the same key still serves other
+# families. Both scopes matter, which is why this gets its own category rather than
+# borrowing MODEL_UNAVAILABLE (provider-scoped) or QUOTA_EXHAUSTED (the key's own
+# balance, all models).
+BUDGET_POOL_MARKERS = ("budget pool",)
+
+# A provider that gates on client identity answers 401/403 with this wording for
+# *every* key presented, working ones included. Measured on AgentRouter while probing
+# eight credentials parked as auth_failed: with a minimal header set all eight returned
+# 403 "unauthorized client detected" - the credential then serving all production
+# traffic among them - while with the mapping's real headers four returned 200, two
+# were out of quota, one was outside its token's IP allow list and one lacked model
+# entitlement (deploy/act_on_credential_probe.py). Reading this wording as a credential
+# rejection therefore condemns every healthy key on the provider in turn, and the
+# remedy is the request's headers, not key rotation.
+CLIENT_GATING_MARKERS = ("unauthorized client",)
+
 
 class ErrorCategory(StrEnum):
     AUTHENTICATION_ERROR = "authentication_error"
@@ -30,11 +71,19 @@ class ErrorCategory(StrEnum):
     UPSTREAM_WAF_REJECTION = "upstream_waf_rejection"
     RATE_LIMIT = "rate_limit"
     QUOTA_EXHAUSTED = "quota_exhausted"
+    # The credential's allotment of a rationed model family is spent until the
+    # provider releases the next batch, but the credential still works for other
+    # families and sibling credentials may still have allotment on this one. Both
+    # scopes at once, so neither QUOTA_EXHAUSTED (the key's own balance, every
+    # model) nor MODEL_UNAVAILABLE (the provider does not serve the model) says
+    # the truth.
+    BUDGET_POOL_STOCKOUT = "budget_pool_stockout"
     MODEL_UNAVAILABLE = "model_unavailable"
     # The model is configured, but every route or credential that could serve it
     # was ineligible at this moment: unhealthy, cooling down, out of quota, at its
-    # concurrency limit, or behind an open circuit. Distinct from
-    # MODEL_UNAVAILABLE, which means the provider does not serve the model at all.
+    # concurrency limit, behind an open circuit, or stock-out of a rationed
+    # family's batch. Distinct from MODEL_UNAVAILABLE, which means the provider
+    # does not serve the model at all.
     NO_ELIGIBLE_ROUTE = "no_eligible_route"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
     TIMEOUT = "timeout"
@@ -116,6 +165,13 @@ _RETRY_SEMANTICS: dict[ErrorCategory, tuple[bool, RetryScope, bool]] = {
     ErrorCategory.RATE_LIMIT: (True, RetryScope.CREDENTIAL, True),
     # This key is out of quota; a sibling key may still have budget.
     ErrorCategory.QUOTA_EXHAUSTED: (True, RetryScope.CREDENTIAL, True),
+    # This key's batch of the rationed family is spent, but only for that family -
+    # measured 2026-09-13: drained keys still answered 200 on glm-5.3, and sibling
+    # keys still answered 200 on the rationed model. Fail over to a sibling key, but
+    # the credential is not at fault *as a credential*: nothing here may condemn or
+    # park it, or the drain strands its healthy routes for every other family. The
+    # per-(credential, route) stock-out memory in live state is what remembers it.
+    ErrorCategory.BUDGET_POOL_STOCKOUT: (True, RetryScope.CREDENTIAL, False),
     # This provider does not serve the model; another provider might.
     ErrorCategory.MODEL_UNAVAILABLE: (True, RetryScope.PROVIDER, False),
     # Nothing was contacted, because nothing was eligible. Retrying inside this
@@ -135,9 +191,19 @@ def build_provider_error(
     *,
     upstream_status: int | None = None,
     retry_after_seconds: float | None = None,
+    credential_at_fault: bool | None = None,
 ) -> ProviderError:
-    """Create a ProviderError with the retry semantics for its category."""
+    """Create a ProviderError with the retry semantics for its category.
+
+    `credential_at_fault` defaults to the category's semantics, which describe
+    real traffic. A synthetic probe may override it toward "we cannot tell" - the
+    one direction a weaker source of evidence is allowed to move the verdict,
+    because a probe that cannot distinguish a WAF challenge from a key rejection
+    must neither condemn an innocent key nor vouch for a dead one.
+    """
     retryable, scope, at_fault = _RETRY_SEMANTICS[category]
+    if credential_at_fault is not None:
+        at_fault = credential_at_fault
     return ProviderError(
         category=category,
         message=message,
@@ -147,6 +213,89 @@ def build_provider_error(
         retry_scope=scope,
         credential_at_fault=at_fault,
     )
+
+
+def classify_upstream_status(
+    status_code: int,
+    searchable: str,
+    *,
+    waf_rejection: bool = False,
+) -> ErrorCategory:
+    """Read an upstream failure's status and wording into a category.
+
+    Shared by every adapter. The classification is deliberately protocol-independent:
+    the providers behind it are resellers reached over whichever protocol a mapping
+    happens to declare, and the same host answers the same credentials on both. When
+    this logic lived once per adapter the copies drifted, and a quota 403 was read as
+    a rejected credential on one protocol while reading correctly on the other.
+
+    `searchable` is the error type, code and message lowercased into one string, so a
+    marker matches wherever the provider chose to put the wording. `waf_rejection`
+    says the 403 body was not an API error object at all.
+    """
+    if status_code == 403 and waf_rejection:
+        # An edge or bot-protection layer answering 403 with a challenge page is not a
+        # credential rejection. Without this a Cloudflare 403 parked every working key
+        # on the provider in turn.
+        return ErrorCategory.UPSTREAM_WAF_REJECTION
+    if status_code in {402, 403} and _matches(searchable, NO_CHANNEL_MARKERS):
+        # The distributor has no channel for the model, which no credential can fix:
+        # not this key's fault, not its balance. AgentRouter pairs the wording with
+        # 402/403, so the QUOTA_MARKERS match on "channel quota"-style messages must
+        # not get here first. Provider-scoped: a sibling key hits the same empty
+        # channel, so fail over at provider level.
+        return ErrorCategory.MODEL_UNAVAILABLE
+    if status_code in {402, 403} and _matches(searchable, BUDGET_POOL_MARKERS):
+        # This credential's batch of the rationed family is spent. Same trap as the
+        # empty channel above: "quota" in the wording parked keys whose balance was
+        # fine - measured 2026-09-12, 21 of 21 AgentRouter credentials parked by a
+        # Claude/GPT ration. But measured again 2026-09-13 the drain is per
+        # credential, not per provider: six keys served the rationed model while
+        # fourteen got this 402, so a sibling key is worth the next attempt and
+        # MODEL_UNAVAILABLE's provider scope would strand the whole route.
+        return ErrorCategory.BUDGET_POOL_STOCKOUT
+    if status_code == 403 and _matches(searchable, QUOTA_MARKERS):
+        # Some resellers answer 403 rather than 402 or 429 when a key is out of quota.
+        # Reading that as a rejected credential parked working keys as auth_failed,
+        # which is both wrong and unrecoverable: quota comes back, a bad secret does
+        # not. Two AgentRouter credentials sat like that while the provider was
+        # plainly saying "user quota is not enough".
+        return ErrorCategory.QUOTA_EXHAUSTED
+    if status_code in {401, 403} and _matches(searchable, CLIENT_GATING_MARKERS):
+        # The provider refused the *client's* identity, not this credential, and says
+        # so for every key including the ones that work. Condemning the credential
+        # burns the whole pool one key at a time and points the operator at rotation
+        # when the fix is the request's headers. Provider-scoped and not the
+        # credential's fault, so a sibling key is not tried for the same refusal.
+        return ErrorCategory.UPSTREAM_WAF_REJECTION
+    if status_code in {401, 403}:
+        # The upstream rejected *this credential*, not the client's gateway key. This
+        # also covers a key outside its token's IP allow list or without entitlement
+        # to the model: both are specific to the credential, so a sibling may work.
+        return ErrorCategory.UPSTREAM_AUTHENTICATION_ERROR
+    if status_code in {402, 429} and _matches(searchable, QUOTA_MARKERS):
+        return ErrorCategory.QUOTA_EXHAUSTED
+    if status_code == 402:
+        # Payment Required is a billing condition even when the wording matches no
+        # marker. Classifying it as an invalid request made it non-retryable and
+        # returned 400 to the client, the opposite of the intended failover to a
+        # credential that still has balance.
+        return ErrorCategory.QUOTA_EXHAUSTED
+    if status_code == 429:
+        return ErrorCategory.RATE_LIMIT
+    if status_code in {408, 504}:
+        return ErrorCategory.TIMEOUT
+    if status_code >= 500:
+        return ErrorCategory.PROVIDER_UNAVAILABLE
+    if status_code == 404 and "model" in searchable:
+        return ErrorCategory.MODEL_UNAVAILABLE
+    if 400 <= status_code < 500:
+        return ErrorCategory.INVALID_REQUEST
+    return ErrorCategory.INTERNAL_ERROR
+
+
+def _matches(searchable: str, markers: tuple[str, ...]) -> bool:
+    return any(marker in searchable for marker in markers)
 
 
 class ProviderAdapter(ABC):

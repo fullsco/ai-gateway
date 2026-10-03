@@ -2,20 +2,33 @@ import asyncio
 import functools
 import json
 import logging
+import random
 from collections.abc import AsyncIterator, Mapping
 from copy import deepcopy
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from time import perf_counter
+from uuid import uuid4
 
 import httpx
 from fastapi.responses import Response, StreamingResponse
 from starlette.background import BackgroundTask
 
+from gateway.accounting import FinancialLedger, SettlementUnavailable
 from gateway.alerts import AlertEvent, evaluate_alert_rules
 from gateway.api.errors import client_error, gateway_error
 from gateway.config import Settings
 from gateway.context import get_request_id
+from gateway.distributed_capacity import (
+    CapacityFull,
+    CapacityUnavailable,
+    owned_work,
+    reserve_route_capacity,
+    verify_route_ownership,
+)
 from gateway.logging import log_event
+from gateway.metrics import metrics, request_started, timed
 from gateway.observability import (
     PassiveHealthEvent,
     PassiveHealthRecorder,
@@ -24,7 +37,16 @@ from gateway.observability import (
     UsageAttribution,
     estimate_cost,
 )
-from gateway.protocols import ClientProtocol, NormalizedRequest
+from gateway.protocols import Capability, ClientProtocol, NormalizedRequest
+from gateway.protocols.event_buffer import EventTooLarge
+from gateway.protocols.output_limits import with_output_limit
+from gateway.protocols.stream_completion import StreamCompletion
+from gateway.protocols.translate import (
+    ProtocolTranslator,
+    StreamTranslator,
+    TranslationContext,
+    get_translator,
+)
 from gateway.providers import ErrorCategory, ProviderError, build_provider_error
 from gateway.providers.base import RetryScope
 from gateway.quotas import (
@@ -47,6 +69,8 @@ from gateway.routing.controls import ConcurrencyLease
 from gateway.routing.engine import NoRouteAvailable, RoutingTrace
 from gateway.routing.live_state import LiveOperationalState
 from gateway.runtime import GatewayRuntime
+from gateway.shared_circuit import SharedRouteControls, trial_owners
+from gateway.workflow_context import active_workflow
 
 logger = logging.getLogger("gateway.executor")
 
@@ -59,6 +83,8 @@ async def _settle_reservation(
     currency: str | None,
     reserved,
     actual,
+    ledger=None,
+    reservation_id=None,
 ) -> None:
     """Correct the pre-flight reservation to what the request actually cost.
 
@@ -68,6 +94,12 @@ async def _settle_reservation(
     measured at 1.88x on live traffic, which would have made a $4,000 budget start
     refusing requests at about $2,124.
     """
+    if ledger is not None and reservation_id is not None:
+        try:
+            await ledger.settle(reservation_id, actual=actual)
+        except Exception as exc:
+            raise SettlementUnavailable("Settlement intent could not be persisted") from exc
+        return
     if reserved is None or currency is None:
         return
     delta = (actual or Decimal(0)) - reserved
@@ -99,8 +131,33 @@ async def execute_request(
     live_state: LiveOperationalState | None = None,
 ) -> Response:
     started_at = datetime.now(UTC)
+    if normalized.payload.get("background") not in (None, False):
+        return client_error(ErrorCategory.INVALID_REQUEST,
+                            "Use gateway workflows instead of provider background execution.", 400)
+    if type(normalized.payload.get("n", 1)) is not int or normalized.payload.get("n", 1) != 1:
+        return client_error(ErrorCategory.INVALID_REQUEST, "Only one completion is supported.", 400)
+    try:
+        payload, canonical_output_limit = with_output_limit(
+            normalized.protocol, normalized.payload, settings.max_output_tokens,
+        )
+    except ValueError as exc:
+        return client_error(ErrorCategory.INVALID_REQUEST, str(exc), 400)
+    normalized = normalized.model_copy(update={"payload": payload})
+    if settings.distributed_admission_enabled:
+        trial_owners.set({})
+        runtime = replace(runtime,
+                          route_controls=SharedRouteControls(db_pool, runtime.route_controls))
     deadline = started_at + timedelta(seconds=settings.request_timeout_seconds)
-    recorder = RequestRecorder(db_pool, get_request_id() or "unknown")
+    execution_id = (
+        str(uuid4()) if settings.durable_accounting_enabled else get_request_id() or "unknown"
+    )
+    recorder = RequestRecorder(db_pool, execution_id)
+    estimated_input_tokens = estimate_tokens(normalized.payload)
+    ledger = FinancialLedger(db_pool) if settings.durable_accounting_enabled else None
+    financial_request_id = str(uuid4())
+    if ledger is not None and db_pool is None:
+        return client_error(ErrorCategory.PROVIDER_UNAVAILABLE,
+                            "Durable accounting requires a database.", 503)
     await recorder.start_request(
         client_id=client_id,
         key_id=key_id,
@@ -117,7 +174,7 @@ async def execute_request(
                 QuotaRequest(
                     requests_per_minute=client.requests_per_minute,
                     tokens_per_minute=client.tokens_per_minute,
-                    estimated_tokens=estimate_tokens(normalized.payload),
+                    estimated_tokens=estimated_input_tokens,
                 ),
             )
     except QuotaExceeded as exc:
@@ -143,12 +200,10 @@ async def execute_request(
         requested_canonical = runtime.model_registry.resolve(normalized.requested_model).id
     except LookupError:
         requested_canonical = None
-    candidate_models = [
-        model
-        for model in runtime.model_registry.list_provider_models()
-        if requested_canonical is not None
-        and model.canonical_model_id == requested_canonical
-    ] or runtime.model_registry.list_provider_models()
+    candidate_models = (
+        runtime.model_registry.provider_models_for(requested_canonical)
+        if requested_canonical else ()
+    ) or runtime.model_registry.list_provider_models()
     max_attempts = max(
         (
             int((model.routing_policy or {}).get("max_attempts", 3))
@@ -157,7 +212,6 @@ async def execute_request(
         default=3,
     )
     coordinator = AttemptCoordinator(AttemptPolicy(max_attempts=max_attempts))
-    estimated_input_tokens = estimate_tokens(normalized.payload)
     attempts = 0
     fallback_count = 0
     previous_provider_id: str | None = None
@@ -179,12 +233,23 @@ async def execute_request(
             provider_states = list(runtime.provider_states)
             credential_states = list(runtime.credential_states)
             diagnostics = {}
-        trace = RoutingTrace(attempt_number=attempts + 1)
+        trace = RoutingTrace(attempt_number=attempts + 1,
+                             max_entries=256 if random.random() < settings.trace_sample_rate else 0)
         if attempts:
             trace.is_fallback = True
             trace.fallback_reason = (
                 last_error.category.value if last_error is not None else "retry"
             )
+        # Route-scoped budget-pool stock-outs, keyed provider_model_id -> the
+        # credentials currently skipped on it. Per key and per family, so a
+        # drained credential must not be offered this route again while its
+        # sibling keys are still serving it - but must stay eligible everywhere
+        # else. Expiry is inside the map's source (live state), not here.
+        stockout_ids: dict[str, frozenset[str]] = {}
+        if live_state is not None:
+            for cred_id, model_id in live_state.stockout_keys:
+                stockout_ids.setdefault(model_id, set()).add(cred_id)
+            stockout_ids = {k: frozenset(v) for k, v in stockout_ids.items()}
         try:
             route = runtime.routing_engine.select(
                 normalized,
@@ -192,6 +257,7 @@ async def execute_request(
                 credential_states,
                 excluded_credential_ids=excluded,
                 excluded_provider_model_ids=excluded_routes,
+                stockout_credential_ids=stockout_ids,
                 trace=trace,
                 diagnostics=diagnostics,
             )
@@ -203,7 +269,7 @@ async def execute_request(
             # matches the request at all, for example the model is not exposed over
             # the requested protocol. Candidates considered and all excluded means
             # the model is servable but everything was temporarily ineligible.
-            no_candidates = not trace.considered
+            no_candidates = trace.candidate_count == 0
             traces.append(trace.as_dict())
             break
         traces.append(trace.as_dict())
@@ -213,18 +279,36 @@ async def execute_request(
                 for candidate in runtime.model_registry.eligible_provider_models(normalized)
                 if candidate.id != route.provider_model.id
             }
-        if not await runtime.route_controls.allow(route.provider_model.id):
+        try:
+            with timed("shared_circuit_allow"):
+                route_allowed = await runtime.route_controls.allow(route.provider_model.id)
+        except CapacityUnavailable:
+            return client_error(ErrorCategory.PROVIDER_UNAVAILABLE,
+                                "Shared route coordination is unavailable.", 503)
+        if not route_allowed:
             excluded_routes = excluded_routes | {route.provider_model.id}
             continue
-        adapter = runtime.provider_model_adapters[route.provider_model.id]
+        adapter = runtime.adapter_for(route.provider_model.id, normalized.protocol)
+        # Three jobs below read a protocol, and on a translated route they do not all
+        # read the same one. Usage extraction, cost and foreign-stream detection look at
+        # the *upstream* body; keepalive and terminal-error frames are written for the
+        # *client*. Conflating them is how streamed requests silently recorded zero
+        # tokens once already.
+        upstream_protocol = route.provider_model.protocol
+        translator = get_translator(normalized.protocol, upstream_protocol)
         credential = runtime.credentials[route.credential.credential_id]
-        lease = await runtime.route_controls.acquire(
-            route.provider_model.id,
-            timeout_seconds=min(
-                settings.concurrency_acquire_timeout_seconds,
-                max(0, (deadline - datetime.now(UTC)).total_seconds()),
-            ),
-        )
+        try:
+            with timed("route_concurrency_acquire"):
+                lease = await runtime.route_controls.acquire(
+                    route.provider_model.id,
+                    timeout_seconds=min(
+                        settings.concurrency_acquire_timeout_seconds,
+                        max(0, (deadline - datetime.now(UTC)).total_seconds()),
+                    ),
+                )
+        except BaseException:
+            await runtime.route_controls.abandon(route.provider_model.id)
+            raise
         if lease is None:
             await runtime.route_controls.abandon(route.provider_model.id)
             last_error = build_provider_error(
@@ -235,21 +319,23 @@ async def execute_request(
             if not settings.failover_enabled or datetime.now(UTC) >= deadline:
                 break
             continue
-        estimated_output_tokens = normalized.payload.get(
-            "max_tokens", normalized.payload.get("max_output_tokens")
-        )
-        output_tokens = (
-            estimated_output_tokens
-            if isinstance(estimated_output_tokens, int) and estimated_output_tokens >= 0
-            else 0
-        )
+        output_tokens = canonical_output_limit
         # Pre-flight reservation: nothing is known about caching yet, so both
         # cached dimensions are unreported and the whole input is priced fresh.
         estimated_cost, currency = estimate_cost(
             (estimated_input_tokens, output_tokens, None, None),
             dict(route.provider_model.pricing or {}),
         )
+        reservation_id = None
         try:
+            if settings.distributed_admission_enabled:
+                try:
+                    with timed("route_capacity_admission"):
+                        await reserve_route_capacity(db_pool, route, settings)
+                except CapacityFull:
+                    raise
+                except CapacityUnavailable as exc:
+                    raise QuotaUnavailable(str(exc)) from exc
             await reserve_provider_quota(
                 db_pool,
                 route.credential.credential_id,
@@ -259,19 +345,44 @@ async def execute_request(
                     estimated_input_tokens + output_tokens,
                 ),
             )
-            await reserve_client_spending(db_pool, client_id, estimated_cost)
-            await reserve_budgets(
-                db_pool,
-                client_id=client_id,
-                provider_id=route.provider_model.provider_id,
-                credential_id=route.credential.credential_id,
-                model_id=route.canonical_model_id,
-                route_id=route.provider_model.route_id,
-                currency=currency,
-                estimated_cost=estimated_cost,
+            if ledger is not None:
+                reservation_id = await ledger.reserve(
+                    request_id=financial_request_id, attempt_number=attempts + 1,
+                    client_id=client_id, route=route, currency=currency,
+                    estimated_cost=estimated_cost,
+                    estimated_tokens=estimated_input_tokens + output_tokens,
+                    telemetry_request_id=recorder.request_id,
+                )
+            else:
+                await reserve_client_spending(db_pool, client_id, estimated_cost)
+                await reserve_budgets(
+                    db_pool,
+                    client_id=client_id,
+                    provider_id=route.provider_model.provider_id,
+                    credential_id=route.credential.credential_id,
+                    model_id=route.canonical_model_id,
+                    route_id=route.provider_model.route_id,
+                    currency=currency,
+                    estimated_cost=estimated_cost,
+                )
+        except CapacityFull as exc:
+            lease.release()
+            await runtime.route_controls.abandon(route.provider_model.id)
+            ended_at = datetime.now(UTC)
+            await recorder.finish_request(
+                status="failed", resolved_model=None, ended_at=ended_at,
+                latency_ms=_latency_ms(started_at, ended_at),
+                retry_count=max(0, attempts - 1), fallback_count=fallback_count,
+                error_category=ErrorCategory.QUOTA_EXHAUSTED.value,
             )
+            response = client_error(ErrorCategory.QUOTA_EXHAUSTED, str(exc), 429)
+            response.headers["Retry-After"] = "1"
+            # Internal-only proof: a worker may retry only if no upstream was attempted.
+            response._gateway_capacity_deferred = attempts == 0
+            return response
         except (ProviderQuotaExceeded, BudgetExceeded) as exc:
             lease.release()
+            await runtime.route_controls.abandon(route.provider_model.id)
             if isinstance(exc, ClientSpendingLimitExceeded):
                 event_type = "client_spending_limit"
             elif isinstance(exc, BudgetExceeded):
@@ -301,6 +412,7 @@ async def execute_request(
             continue
         except QuotaUnavailable as exc:
             lease.release()
+            await runtime.route_controls.abandon(route.provider_model.id)
             ended_at = datetime.now(UTC)
             await recorder.finish_request(
                 status="failed",
@@ -312,6 +424,10 @@ async def execute_request(
                 error_category=ErrorCategory.PROVIDER_UNAVAILABLE.value,
             )
             return client_error(ErrorCategory.PROVIDER_UNAVAILABLE, str(exc), 503)
+        except BaseException:
+            lease.release()
+            await runtime.route_controls.abandon(route.provider_model.id)
+            raise
         try:
             upstream = adapter.create_request(
                 _map_upstream_model(normalized, route.provider_model.upstream_model_id),
@@ -326,11 +442,14 @@ async def execute_request(
                 headers=upstream.headers,
                 json=upstream.json_body,
                 timeout=_clamp_timeout_to_deadline(
-                    upstream.timeout, deadline, stream=normalized.stream
+                    upstream.timeout, deadline, stream=normalized.stream, settings=settings
                 ),
             )
         except Exception as exc:
             lease.release()
+            await runtime.route_controls.abandon(route.provider_model.id)
+            if ledger is not None and reservation_id is not None:
+                await ledger.settle(reservation_id, actual=Decimal(0))
             ended_at = datetime.now(UTC)
             log_event(
                 logger,
@@ -374,21 +493,45 @@ async def execute_request(
             protocol=route.provider_model.protocol,
             pricing=pricing_snapshot,
         )
-        attempt_id = await recorder.start_attempt(
-            number=attempts,
-            provider_id=route.provider_model.provider_id,
-            credential_id=route.credential.credential_id,
-            provider_model_id=route.provider_model.id,
-            started_at=attempt_started_at,
-        )
         try:
+            attempt_id = await recorder.start_attempt(
+                number=attempts,
+                provider_id=route.provider_model.provider_id,
+                credential_id=route.credential.credential_id,
+                provider_model_id=route.provider_model.id,
+                started_at=attempt_started_at,
+            )
+        except BaseException:
+            lease.release()
+            await runtime.route_controls.abandon(route.provider_model.id)
+            # A reserved but undispatched hold is reclaimed by durable recovery.
+            raise
+        try:
+            if settings.distributed_admission_enabled:
+                with timed("ownership_verify"):
+                    await verify_route_ownership()
+            if ledger is not None:
+                try:
+                    with timed("durable_dispatch"):
+                        await ledger.dispatch(reservation_id)
+                except QuotaUnavailable:
+                    await ledger.settle(reservation_id, actual=Decimal(0))
+                    lease.release()
+                    await runtime.route_controls.abandon(route.provider_model.id)
+                    return client_error(ErrorCategory.PROVIDER_UNAVAILABLE,
+                                        "Execution ownership changed before dispatch.", 503)
+            header_started = perf_counter()
+            ingress_started = request_started.get()
+            if attempts == 1 and ingress_started is not None:
+                metrics.observe("gateway_pre_dispatch", header_started - ingress_started)
             response = await runtime.http_client.send(built, stream=True)
+            metrics.observe("upstream_headers", perf_counter() - header_started)
             if response.status_code >= 400:
                 await response.aread()
                 last_error = adapter.normalize_error(response)
                 actual_cost = await recorder.record_usage(
                     attempt_id,
-                    normalized.protocol,
+                    upstream_protocol,
                     response.content,
                     attribution,
                     attempt_status="failed",
@@ -398,6 +541,7 @@ async def execute_request(
                 await _settle_reservation(
                     db_pool, client_id=client_id, route=route, currency=currency,
                     reserved=estimated_cost, actual=actual_cost,
+                    ledger=ledger, reservation_id=reservation_id,
                 )
                 await response.aclose()
                 response = None
@@ -423,7 +567,7 @@ async def execute_request(
                         last_error = _unexpected_upstream_response(response.status_code)
                         await _close_response(response)
                         response = None
-                    elif _stream_is_foreign_protocol(normalized.protocol, first_chunk):
+                    elif _stream_is_foreign_protocol(upstream_protocol, first_chunk):
                         last_error = build_provider_error(
                             ErrorCategory.MODEL_UNAVAILABLE,
                             "The provider answered in a different protocol than this route "
@@ -436,7 +580,7 @@ async def execute_request(
                             "upstream_stream_protocol_mismatch",
                             provider_id=route.provider_model.provider_id,
                             provider_model_id=route.provider_model.id,
-                            expected_protocol=normalized.protocol.value,
+                            expected_protocol=upstream_protocol.value,
                         )
                         await _close_response(response)
                         response = None
@@ -445,7 +589,8 @@ async def execute_request(
                             recorder,
                             response=response,
                             attempt_id=attempt_id,
-                            protocol=normalized.protocol,
+                            client_protocol=normalized.protocol,
+                            upstream_protocol=upstream_protocol,
                             resolved_model=route.canonical_model_id,
                             started_at=started_at,
                             attempt_started_at=attempt_started_at,
@@ -467,6 +612,7 @@ async def execute_request(
                                 route=route,
                                 currency=currency,
                                 reserved=estimated_cost,
+                                ledger=ledger, reservation_id=reservation_id,
                             ),
                         )
                         if live_state is not None:
@@ -477,6 +623,7 @@ async def execute_request(
                                 latency_ms=_latency_ms(
                                     attempt_started_at, datetime.now(UTC)
                                 ),
+                                provider_model_id=route.provider_model.id,
                             )
                         return StreamingResponse(
                             _stream_response(
@@ -484,6 +631,11 @@ async def execute_request(
                                 iterator,
                                 finalizer,
                                 keepalive_seconds=settings.stream_keepalive_seconds,
+                                translator=(
+                                    translator.stream(_translation_context(normalized))
+                                    if translator is not None
+                                    else None
+                                ),
                             ),
                             status_code=200,
                             media_type="text/event-stream",
@@ -491,7 +643,15 @@ async def execute_request(
                         )
             else:
                 content = await response.aread()
+                # Translated before anything is committed, so a body that cannot be
+                # restated in the client's protocol still fails over to another route
+                # instead of reaching the client unparseable.
+                client_content: bytes | None = content
                 if not _valid_upstream_json(content):
+                    client_content = None
+                elif translator is not None:
+                    client_content = _translated_body(translator, content, normalized)
+                if client_content is None:
                     last_error = _unexpected_upstream_response(response.status_code)
                     await response.aclose()
                     response = None
@@ -509,6 +669,7 @@ async def execute_request(
                             credential_id=route.credential.credential_id,
                             succeeded=True,
                             latency_ms=latency_ms,
+                            provider_model_id=route.provider_model.id,
                         )
                     _submit_health(
                         health_recorder,
@@ -530,7 +691,7 @@ async def execute_request(
                     )
                     actual_cost = await recorder.record_usage(
                         attempt_id,
-                        normalized.protocol,
+                        upstream_protocol,
                         content,
                         attribution,
                         attempt_status="succeeded",
@@ -538,6 +699,7 @@ async def execute_request(
                     await _settle_reservation(
                         db_pool, client_id=client_id, route=route, currency=currency,
                         reserved=estimated_cost, actual=actual_cost,
+                        ledger=ledger, reservation_id=reservation_id,
                     )
                     await recorder.finish_request(
                         status="succeeded",
@@ -548,7 +710,14 @@ async def execute_request(
                         fallback_count=fallback_count,
                     )
                     await recorder.record_routing_trace(traces)
-                    return Response(content, status_code=status_code, headers=headers)
+                    return Response(client_content, status_code=status_code, headers=headers)
+        except SettlementUnavailable:
+            try:
+                await _close_response(response)
+            finally:
+                lease.release()
+            return client_error(ErrorCategory.PROVIDER_UNAVAILABLE,
+                                "Usage settlement is awaiting reconciliation.", 503)
         except (TimeoutError, httpx.TransportError) as exc:
             last_error = _transport_error(exc)
             log_event(
@@ -564,9 +733,15 @@ async def execute_request(
                     type(exc.__cause__).__name__ if exc.__cause__ is not None else None
                 ),
             )
-            await _close_response(response)
+            try:
+                await _close_response(response)
+            finally:
+                lease.release()
         except asyncio.CancelledError:
-            await _close_response(response)
+            try:
+                await _close_response(response)
+            finally:
+                lease.release()
             await runtime.route_controls.abandon(route.provider_model.id)
             ended_at = datetime.now(UTC)
             lease.release()
@@ -596,9 +771,22 @@ async def execute_request(
                 attempt_number=attempts,
                 error_type=type(exc).__name__,
             )
-            await _close_response(response)
+            try:
+                await _close_response(response)
+            finally:
+                lease.release()
 
+        # The upstream has closed; release local concurrency before awaited failure
+        # bookkeeping so cancellation cannot strand the slot.
+        lease.release()
         if last_error is not None:
+            if ledger is not None and reservation_id is not None:
+                try:
+                    await ledger.settle(reservation_id, actual=None)
+                except Exception:
+                    lease.release()
+                    return client_error(ErrorCategory.PROVIDER_UNAVAILABLE,
+                                        "Usage settlement is awaiting reconciliation.", 503)
             ended_at = datetime.now(UTC)
             await recorder.finish_attempt(
                 attempt_id,
@@ -637,6 +825,7 @@ async def execute_request(
                 latency_ms=_latency_ms(attempt_started_at, datetime.now(UTC)),
                 retry_after_seconds=last_error.retry_after_seconds if last_error else None,
                 credential_at_fault=last_error.credential_at_fault if last_error else True,
+                provider_model_id=route.provider_model.id,
             )
 
         # Always retire the credential that just failed for this request.
@@ -670,6 +859,7 @@ async def execute_request(
                 excluded_routes = excluded_routes | sibling_routes
         if (
             not settings.failover_enabled
+            or active_workflow.get() is not None
             or last_error is None
             or not coordinator.should_retry(
             error=last_error,
@@ -680,6 +870,12 @@ async def execute_request(
             )
         ):
             break
+
+        delay = random.uniform(0, min(settings.retry_backoff_max_seconds,
+                                      settings.retry_backoff_seconds * 2 ** min(attempts - 1, 8)))
+        if delay >= max(0, (deadline - datetime.now(UTC)).total_seconds()):
+            break
+        await asyncio.sleep(delay)
 
     if last_error is not None:
         ended_at = datetime.now(UTC)
@@ -718,6 +914,28 @@ async def execute_request(
     # The model is configured; nothing that could serve it was eligible right now.
     # Reporting this as model_unavailable told the operator the model was missing,
     # which sent them to look at mappings instead of at health, quota and cooldown.
+    # When the routing trace shows every exclusion was a budget-pool stock-out, say
+    # that instead: the batch is spent on those credentials, and the request
+    # deliberately spent zero attempts re-proving it (the memory expires and one
+    # re-test follows - the batch itself re-arms roughly every 12 hours).
+    excluded_reasons = {
+        reason
+        for trace in traces
+        for reason in trace.get("exclusion_reasons", [
+            entry.get("reason") for entry in trace.get("considered", [])
+            if not entry.get("eligible")
+        ])
+    }
+    if excluded_reasons == {"credential_budget_pool_stockout"} and traces:
+        return client_error(
+            ErrorCategory.BUDGET_POOL_STOCKOUT,
+            "Every credential that serves this model has spent its budget-pool "
+            "allotment for the current batch. The provider releases the next batch "
+            "periodically; requests fail fast until then instead of spending "
+            "attempts on it. Other model families on the same credentials are "
+            "unaffected.",
+            503,
+        )
     return client_error(
         category,
         "No provider route for this model is currently eligible. The routing trace "
@@ -800,8 +1018,60 @@ def _map_upstream_model(request: NormalizedRequest, upstream_model: str) -> Norm
     return request.model_copy(update={"payload": payload})
 
 
+def _translation_context(request: NormalizedRequest) -> TranslationContext:
+    """What a translator needs to know about the client's request.
+
+    The model is echoed back as the client named it rather than as the upstream id it
+    was mapped to, and reasoning is only rendered as client-visible blocks when the
+    client asked to see thinking: a client that did not ask must not be handed a block
+    type it does not model.
+    """
+    return TranslationContext(
+        requested_model=request.requested_model,
+        reasoning_requested=Capability.REASONING in request.required_capabilities,
+    )
+
+
+def _translated_body(
+    translator: ProtocolTranslator,
+    content: bytes,
+    request: NormalizedRequest,
+) -> bytes | None:
+    """The upstream JSON body restated in the protocol the client asked for.
+
+    None when it cannot be, so the caller fails over to another route rather than
+    answering 200 with a body the client cannot parse.
+    """
+    try:
+        payload = json.loads(content)
+        if not isinstance(payload, dict):
+            return None
+        translated = translator.translate_response(payload, _translation_context(request))
+        return json.dumps(translated).encode()
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "upstream_body_translation_failed",
+            client_protocol=translator.client_protocol.value,
+            upstream_protocol=translator.upstream_protocol.value,
+            error_type=type(exc).__name__,
+        )
+        return None
+
+
+def _emit(translator: StreamTranslator | None, chunk: bytes) -> bytes:
+    """The bytes this upstream chunk becomes for the client.
+
+    The chunk itself on a native route, so the relay stays verbatim; otherwise whatever
+    complete client-protocol events the translator can frame from what it has seen,
+    which may be nothing yet.
+    """
+    return chunk if translator is None else translator.feed(chunk)
+
+
 def _clamp_timeout_to_deadline(
-    timeout: httpx.Timeout, deadline: datetime, *, stream: bool
+    timeout: httpx.Timeout, deadline: datetime, *, stream: bool, settings: Settings | None = None
 ) -> httpx.Timeout:
     """Hold an attempt to whatever is left of the request's budget.
 
@@ -823,10 +1093,13 @@ def _clamp_timeout_to_deadline(
     """
     remaining = max(0.0, (deadline - datetime.now(UTC)).total_seconds())
     return httpx.Timeout(
-        connect=_min_optional(timeout.connect, remaining),
+        connect=_min_optional(timeout.connect, min(remaining, settings.http_connect_timeout_seconds)
+                              if settings else remaining),
         read=timeout.read if stream else _min_optional(timeout.read, remaining),
-        write=_min_optional(timeout.write, remaining),
-        pool=timeout.pool,
+        write=_min_optional(timeout.write, min(remaining, settings.http_write_timeout_seconds)
+                            if settings else remaining),
+        pool=_min_optional(timeout.pool, min(remaining, settings.http_pool_timeout_seconds)
+                           if settings else remaining),
     )
 
 
@@ -901,14 +1174,25 @@ async def _stream_response(
     iterator: AsyncIterator[bytes],
     finalizer: "_StreamFinalizer",
     keepalive_seconds: float = 0,
+    translator: StreamTranslator | None = None,
 ) -> AsyncIterator[bytes]:
     completed = False
     error: ProviderError | None = None
     pending: asyncio.Task[object] | None = None
+    at_boundary = True
+    work = owned_work.get()
+    stream_task = asyncio.current_task()
+    if work is not None:
+        work.append(stream_task)
     try:
         finalizer.usage.feed(first_chunk)
-        yield first_chunk
-        at_boundary = _ends_on_event_boundary(first_chunk)
+        finalizer.completion.feed(first_chunk)
+        # Metering always reads the upstream bytes; the client is sent whatever protocol
+        # it asked for. With no translator these are the same bytes and the relay is
+        # verbatim, exactly as it was before translation existed.
+        if emitted := _emit(translator, first_chunk):
+            yield emitted
+            at_boundary = _ends_on_event_boundary(emitted)
         while True:
             if pending is None:
                 pending = asyncio.ensure_future(_next_stream_chunk(iterator))
@@ -919,19 +1203,32 @@ async def _stream_response(
                     # cancelled and reissued, so a chunk that arrives during a keepalive
                     # tick is never dropped and the upstream read is never restarted.
                     if at_boundary:
-                        yield _stream_keepalive_frame(finalizer.protocol)
+                        yield _stream_keepalive_frame(finalizer.client_protocol)
                     continue
-            chunk = await pending
+            chunk = await asyncio.shield(pending)
             pending = None
             if chunk is _STREAM_EXHAUSTED:
-                completed = True
+                completed = finalizer.completion.successful
+                if not completed:
+                    error = build_provider_error(
+                        ErrorCategory.PROVIDER_UNAVAILABLE,
+                        "Provider stream ended without successful completion.",
+                    )
+                    yield _terminal_stream_error(finalizer.client_protocol, error.message)
                 break
             # Only real upstream bytes are metered. Keepalives are never fed to the
             # usage parser, so token accounting and cost are bit-for-bit unchanged.
             finalizer.usage.feed(chunk)
-            yield chunk
-            at_boundary = _ends_on_event_boundary(chunk)
-    except (httpx.StreamError, httpx.HTTPError) as exc:
+            finalizer.completion.feed(chunk)
+            if emitted := _emit(translator, chunk):
+                yield emitted
+                at_boundary = _ends_on_event_boundary(emitted)
+        # A translated stream may owe the client a close: the events that end a message
+        # in one protocol have no one-to-one trigger in another, so the translator emits
+        # them once the upstream is done rather than in response to a chunk.
+        if translator is not None and (tail := translator.finish()):
+            yield tail
+    except (httpx.StreamError, httpx.HTTPError, EventTooLarge) as exc:
         # The upstream stopped mid-body. This used to escape the generator and reach
         # uvicorn as an unhandled ASGI exception, which logged a traceback implying a
         # fault here, recorded the attempt as merely "cancelled", and told the health
@@ -950,15 +1247,28 @@ async def _stream_response(
             attempt_number=finalizer.attempt_number,
             error_type=type(exc).__name__,
         )
-        yield _terminal_stream_error(finalizer.protocol, error.message)
+        yield _terminal_stream_error(finalizer.client_protocol, error.message)
     finally:
+        if work is not None and stream_task in work:
+            work.remove(stream_task)
         # A client that disconnects mid-stream throws in at a yield, leaving the
         # upstream read outstanding. Without this it survives as an orphaned task
         # holding the connection and is reported as "Task was destroyed but it is
         # pending" long after the request is gone.
-        if pending is not None and not pending.done():
-            pending.cancel()
-        await finalizer.finish(completed, error=error)
+        async def cleanup():
+            if pending is not None and not pending.done():
+                pending.cancel()
+            try:
+                if pending is not None:
+                    await asyncio.gather(pending, return_exceptions=True)
+            finally:
+                await finalizer.finish(completed, error=error)
+
+        # Keep transport reader cleanup outside both ASGI cancellation domains.
+        # Re-cancelling HTTPcore's aclose can set its closed flag before the socket closes.
+        cleanup_task = asyncio.create_task(cleanup())
+        finalizer._cleanup_task = cleanup_task
+        await asyncio.shield(cleanup_task)
 
 
 class _StreamFinalizer:
@@ -968,7 +1278,8 @@ class _StreamFinalizer:
         *,
         response: httpx.Response,
         attempt_id: int | None,
-        protocol: ClientProtocol,
+        client_protocol: ClientProtocol,
+        upstream_protocol: ClientProtocol,
         resolved_model: str,
         started_at: datetime,
         attempt_started_at: datetime,
@@ -1002,11 +1313,16 @@ class _StreamFinalizer:
         self.provider_model_id = provider_model_id
         self.attempt_number = attempt_number
         self.attribution = attribution
-        self.protocol = protocol
+        # Client-facing frames (keepalive, terminal error) are written in the protocol
+        # the client asked for; usage is parsed out of the protocol the upstream
+        # answered in. On a translated route those differ, and reading the wrong one
+        # here records a request that cost nothing.
+        self.client_protocol = client_protocol
         # Called with the actual cost once the stream ends, so the pre-flight
         # reservation can be corrected. A stream only knows its usage at the end.
         self.settle = settle
-        self.usage = StreamUsageAccumulator(protocol)
+        self.usage = StreamUsageAccumulator(upstream_protocol)
+        self.completion = StreamCompletion(upstream_protocol)
         self._task: asyncio.Task[None] | None = None
 
     async def finish(self, completed: bool, *, error: ProviderError | None = None) -> None:
@@ -1039,7 +1355,16 @@ class _StreamFinalizer:
                     settle=self.settle,
                 )
             )
-        await asyncio.shield(self._task)
+        if completed:
+            await asyncio.shield(self._task)
+        else:
+            try:
+                await asyncio.wait_for(asyncio.shield(self._task), timeout=5)
+            except TimeoutError:
+                # An interrupted stream cannot wait indefinitely for an unreachable DB.
+                # Durable dispatched holds remain recoverable without inventing zero usage.
+                self._task.cancel()
+                await asyncio.gather(self._task, return_exceptions=True)
 
 
 async def _finalize_stream(
@@ -1177,7 +1502,26 @@ async def _finish_cancelled_request(
 
 
 def _affects_circuit(error: ProviderError) -> bool:
-    return error.category in {ErrorCategory.PROVIDER_UNAVAILABLE, ErrorCategory.TIMEOUT}
+    # MODEL_UNAVAILABLE joins the two transport categories because a "no channel"
+    # stock-out is route-scoped exactly like an outage: the distributor has nothing
+    # left to route the model to, for any credential. It must not fire on a
+    # *credential* failure, which is why the classifier's verdict (provider-scoped,
+    # not the credential's fault) is what gates this, not the status code alone.
+    #
+    # BUDGET_POOL_STOCKOUT deliberately stays out. Measured 2026-09-13 18:54 UTC:
+    # the ration drain is per credential, not per route - six AgentRouter keys
+    # answered 200 on gpt-6-astra while fourteen answered 402 at the same moment.
+    # A circuit here would open the route for all twenty keys after three of the
+    # fourteen drained ones happened to be tried first, refusing service from the
+    # six that were still serving (measured again at 17:33: three 402s opened the
+    # route circuit and four requests failed in ~200ms as no_eligible_route). The
+    # per-(credential, route) stock-out memory in live state is the mechanism that
+    # skips drained keys instead, one credential at a time.
+    return error.category in {
+        ErrorCategory.PROVIDER_UNAVAILABLE,
+        ErrorCategory.TIMEOUT,
+        ErrorCategory.MODEL_UNAVAILABLE,
+    }
 
 
 def _submit_health(

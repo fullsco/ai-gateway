@@ -9,7 +9,9 @@ from typing import Any
 
 from gateway.alerts import AlertEvent, evaluate_alert_rules
 from gateway.logging import log_event
+from gateway.metrics import measured
 from gateway.protocols import ClientProtocol
+from gateway.protocols.event_buffer import EventBuffer
 
 # input total (inclusive of both cached dimensions), output, cache read, cache write
 Usage = tuple[int | None, int | None, int | None, int | None]
@@ -53,6 +55,8 @@ class PassiveHealthRecorder:
         self._pool = pool
         self._queue: asyncio.Queue[PassiveHealthEvent | None] = asyncio.Queue(max_queue_size)
         self._task: asyncio.Task[None] | None = None
+        self.dropped_events = 0
+        self.write_failures = 0
 
     def start(self) -> None:
         if self._task is None:
@@ -62,6 +66,7 @@ class PassiveHealthRecorder:
         try:
             self._queue.put_nowait(event)
         except asyncio.QueueFull:
+            self.dropped_events += 1
             log_event(logger, logging.WARNING, "passive_health_event_dropped")
 
     async def close(self) -> None:
@@ -76,6 +81,7 @@ class PassiveHealthRecorder:
             try:
                 await self._persist(event)
             except Exception as exc:
+                self.write_failures += 1
                 log_event(
                     logger,
                     logging.WARNING,
@@ -89,6 +95,19 @@ class PassiveHealthRecorder:
     async def _persist(self, event: PassiveHealthEvent) -> None:
         health = _passive_health(event.error_category)
         if event.source != "passive":
+            # A synthetic probe never condemns a credential (its evidence is weaker
+            # than real traffic), and only a stock-out observation may demote: a
+            # probe answered model_unavailable or budget_pool_stockout when the
+            # route it probed is rationed out for every key, which directly
+            # contradicts a per-key quota_exhausted/auth_failed label. Any other
+            # probe failure - a WAF challenge page, a 503, a timeout, an ambiguous
+            # 403 - says nothing about the credential either way, so it must leave
+            # the label alone. Without this, an idle mislabeled key never
+            # self-corrects: the router does not select it (healthy siblings win),
+            # so passive traffic never re-labels it, and the probe was its only
+            # witness.
+            if event.error_category in ("model_unavailable", "budget_pool_stockout"):
+                await self._demote_wrong_condemnation(event, health)
             await self._pool.execute(
                 """
                 insert into public.health_checks(
@@ -174,6 +193,10 @@ class PassiveHealthRecorder:
                 event.observed_at,
                 event.source,
             )
+            # The observation cannot condemn the credential, but it is still fresh
+            # evidence about what is wrong - and the credential may be sitting under a
+            # label that this evidence proves wrong (see _demote_wrong_condemnation).
+            await self._demote_wrong_condemnation(event, health)
             if event.error_category is not None:
                 await self._alert(event)
             return
@@ -226,6 +249,63 @@ class PassiveHealthRecorder:
         if event.error_category is not None:
             await self._alert(event)
 
+    async def _demote_wrong_condemnation(
+        self, event: PassiveHealthEvent, health: str | None
+    ) -> None:
+        """Replace a condemn-level label that fresh evidence proves wrong.
+
+        A not-at-fault failure cannot condemn a credential, but it is still fresh
+        evidence about what is actually wrong - and the credential may be sitting
+        under a label that this evidence contradicts. Measured 2026-09-12:
+        AgentRouter's shared Claude/GPT budget pool ran out, the "quota" marker
+        parked all 21 keys quota_exhausted, the misclassification was fixed - and
+        the labels stayed, because the not-at-fault branch was the only writer such
+        a failure reaches, and it never touched the label. The keys kept failing
+        their recovery trials on the stock-out, writing degraded check rows, while
+        the dashboard kept saying quota_exhausted and the router kept burning an
+        attempt per request re-trying them.
+
+        The rewrite only ever demotes, and only from the two condemn states: it
+        never promotes (restoring health stays success-only), never touches a label
+        it agrees with, never reaches healthy/degraded/unavailable/rate_limited
+        labels, and leaves the cooldown alone - so a genuinely drained key keeps
+        its existing cooldown and merely reads as the provider's problem until a
+        success or a key-at-fault failure re-labels it. The transition is written
+        to provider_events like every other health change.
+        """
+        if health is None or health == "healthy":
+            return
+        await self._pool.execute(
+            """
+            with previous as (
+              select health::text as old_health
+                from public.provider_credentials where id=$1
+            ), updated as (
+              update public.provider_credentials
+                 set health=$2::public.gateway_health_state, updated_at=now()
+               where id=$1
+                 and health::text in ('quota_exhausted','auth_failed')
+                 and health::text <> $2::text
+              returning health::text as new_health
+            )
+            insert into public.provider_events(
+              provider_id,credential_id,event_type,metadata
+            )
+            select $3,$1,'health_transition',jsonb_build_object(
+              'old_health',previous.old_health,'new_health',updated.new_health,
+              'error_category',$4::text,'upstream_status',$5::integer,
+              'source',$6::text,'recovered_by','not_at_fault_observation'
+            ) from previous,updated
+            where previous.old_health is distinct from updated.new_health
+            """,
+            event.credential_id,
+            health,
+            event.provider_id,
+            event.error_category,
+            event.upstream_status,
+            event.source,
+        )
+
     async def _alert(self, event: PassiveHealthEvent) -> None:
         await evaluate_alert_rules(
             self._pool,
@@ -265,6 +345,12 @@ _RECOVERY_COOLDOWN_SECONDS = {
     "quota_exhausted": 900,
     "auth_failed": 3600,
 }
+# "degraded" appears for several categories; the stock-out is excluded from that
+# cooldown table on purpose: a 402 on the rationed family must not park the
+# credential at all, since it still serves every other family (measured
+# 2026-09-13: the same keys answered 200 on glm-5.3). test_every_failure_state_
+# earns_a_way_back permits an entry here to be absent when the not-at-fault
+# branch never applies a cooldown for it.
 
 
 def _recovery_cooldown(health: str | None, event: PassiveHealthEvent) -> datetime | None:
@@ -295,6 +381,13 @@ def _passive_health(error_category: str | None) -> str | None:
         # Returning None here suppressed even the health_checks row, so the single
         # largest failure category was invisible in the Health view.
         "model_unavailable": "degraded",
+        # A rationed-family stock-out is neither the key's balance nor a route-wide
+        # outage - measured 2026-09-13, drained keys answered 200 on glm-5.3. The
+        # event is not at fault (see _RETRY_SEMANTICS), so this label can never
+        # condemn the credential or set a cooldown; "degraded" merely keeps the
+        # observation visible in the Health view while the per-(credential, route)
+        # stock-out memory in live state does the actual skipping.
+        "budget_pool_stockout": "degraded",
     }.get(error_category)
 
 
@@ -303,6 +396,7 @@ class RequestRecorder:
         self._pool = pool
         self.request_id = request_id
 
+    @measured("request_persistence")
     async def start_request(
         self,
         *,
@@ -326,6 +420,7 @@ class RequestRecorder:
             started_at,
         )
 
+    @measured("attempt_persistence")
     async def start_attempt(
         self,
         *,
@@ -351,6 +446,7 @@ class RequestRecorder:
             started_at,
         )
 
+    @measured("attempt_persistence")
     async def finish_attempt(
         self,
         attempt_id: int | None,
@@ -380,6 +476,7 @@ class RequestRecorder:
             latency_ms,
         )
 
+    @measured("request_persistence")
     async def finish_request(
         self,
         *,
@@ -418,6 +515,7 @@ class RequestRecorder:
             json.dumps(traces, default=str),
         )
 
+    @measured("usage_persistence")
     async def record_usage(
         self,
         attempt_id: int | None,
@@ -538,6 +636,18 @@ def extract_usage(
     except (json.JSONDecodeError, UnicodeDecodeError):
         return None
     usage = payload.get("usage") if isinstance(payload, dict) else None
+    # The Responses API streams usage only inside the terminal response object
+    # (response.completed / response.incomplete / response.failed), nested at
+    # response.usage rather than top level. Reading only the top level meant
+    # 97% of streamed Responses traffic recorded no tokens at all.
+    if not isinstance(usage, dict) and isinstance(payload, dict):
+        response = payload.get("response")
+        if isinstance(response, dict) and isinstance(response.get("usage"), dict):
+            usage = response["usage"]
+        if protocol is ClientProtocol.ANTHROPIC_MESSAGES:
+            message = payload.get("message")
+            if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+                usage = message["usage"]
     if not isinstance(usage, dict):
         return None
     if protocol is ClientProtocol.ANTHROPIC_MESSAGES:
@@ -564,12 +674,16 @@ def extract_usage(
     else:
         input_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
         cached = input_details.get("cached_tokens") if isinstance(input_details, dict) else None
+        cache_write = None
+        if isinstance(input_details, dict):
+            # Responses reports cache writes that Chat Completions never does;
+            # a write is billed above the base rate, so it must not fold into reads.
+            cache_write = input_details.get("cache_write_tokens")
         raw_values = (
             usage.get("prompt_tokens", usage.get("input_tokens")),
             usage.get("completion_tokens", usage.get("output_tokens")),
             cached,
-            # Chat Completions does not report a cache write dimension.
-            None,
+            cache_write,
         )
     if any(value is not None and _integer(value) is None for value in raw_values):
         return None
@@ -669,18 +783,13 @@ class StreamUsageAccumulator:
 
     def __init__(self, protocol: ClientProtocol) -> None:
         self._protocol = protocol
-        self._buffer = bytearray()
+        self._frames = EventBuffer(self.MAX_EVENT_BYTES, discard_oversize=True)
+        self._buffer = self._frames.buffer
         self._usage: Usage | None = None
 
     def feed(self, chunk: bytes) -> None:
-        self._buffer.extend(chunk)
-        while separator := self._separator():
-            index, length = separator
-            event = bytes(self._buffer[:index])
-            del self._buffer[: index + length]
+        for event in self._frames.feed(chunk):
             self._consume_event(event)
-        if len(self._buffer) > self.MAX_EVENT_BYTES:
-            self._buffer.clear()
 
     @property
     def usage(self) -> Usage | None:

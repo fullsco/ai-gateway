@@ -1,7 +1,8 @@
+import base64
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,10 +22,18 @@ class Settings(BaseSettings):
     request_id_header: str = "x-request-id"
     trust_incoming_request_id: bool = False
     database_url: str | None = None
-    config_refresh_seconds: float = Field(default=5, gt=0)
+    config_refresh_seconds: float = Field(default=60, gt=0)
     # How often live operational state (health, cooldown, quota) is re-read from the
     # database. In-process attempt outcomes apply immediately regardless of this.
-    live_state_refresh_seconds: float = Field(default=3, gt=0)
+    live_state_refresh_seconds: float = Field(default=30, gt=0)
+    alert_delivery_enabled: bool = False
+    alert_delivery_url: SecretStr | None = Field(default=None, repr=False)
+    alert_delivery_secret: SecretStr | None = Field(default=None, repr=False)
+    alert_delivery_destination: str = Field(default="default", pattern=r"^[a-zA-Z0-9_-]{1,64}$")
+    alert_delivery_timeout_seconds: float = Field(default=10, ge=1, le=30, allow_inf_nan=False)
+    alert_delivery_poll_seconds: float = Field(default=5, ge=1, le=60, allow_inf_nan=False)
+    alert_delivery_max_attempts: int = Field(default=8, ge=1, le=20)
+    alert_delivery_max_age_seconds: int = Field(default=86400, ge=60, le=604800)
     alert_monitor_enabled: bool = True
     alert_monitor_interval_seconds: float = Field(default=60, gt=0)
     credential_usage_poll_enabled: bool = False
@@ -32,6 +41,51 @@ class Settings(BaseSettings):
     quota_soft_threshold: float = Field(default=0.15, ge=0, le=1)
     quota_hard_threshold: float = Field(default=0.02, ge=0, le=1)
     request_timeout_seconds: float = Field(default=600, gt=0)
+    # Per-process admission. Global provider/tenant limits need distributed coordination.
+    max_in_flight_requests: int = Field(default=32, ge=1)
+    max_request_body_bytes: int = Field(default=8 * 1024 * 1024, ge=1)
+    # Input-byte accounting held through response completion; parsed JSON uses more RAM.
+    max_in_flight_body_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
+    request_body_timeout_seconds: float = Field(default=30, gt=0, allow_inf_nan=False)
+    overload_retry_after_seconds: int = Field(default=1, ge=1)
+    trace_sample_rate: float = Field(default=.01, ge=0, le=1, allow_inf_nan=False)
+    max_in_flight_per_client: int = Field(default=8, ge=1)
+    max_in_flight_streams: int = Field(default=24, ge=1)
+    max_output_tokens: int = Field(default=32768, ge=1)
+    max_tools: int = Field(default=128, ge=1)
+    max_tool_payload_bytes: int = Field(default=1024 * 1024, ge=1)
+    max_multimodal_bytes: int = Field(default=4 * 1024 * 1024, ge=1)
+    http_max_connections: int = Field(default=64, ge=1)
+    http_max_keepalive_connections: int = Field(default=32, ge=0)
+    http_keepalive_expiry_seconds: float = Field(default=30, gt=0, allow_inf_nan=False)
+    http_connect_timeout_seconds: float = Field(default=10, gt=0, allow_inf_nan=False)
+    http_pool_timeout_seconds: float = Field(default=1, gt=0, allow_inf_nan=False)
+    http_write_timeout_seconds: float = Field(default=30, gt=0, allow_inf_nan=False)
+    durable_accounting_enabled: bool = False
+    # Opt-in telemetry pruning alongside accounting; artifact expiry is always on.
+    maintenance_enabled: bool = False
+    # Telemetry cadence; artifacts retain the accounting worker's five-second cadence.
+    maintenance_interval_seconds: float = Field(
+        default=3600, ge=60, le=86400, allow_inf_nan=False,
+    )
+    # Separate deadline for artifact GC and telemetry pruning.
+    maintenance_timeout_seconds: float = Field(
+        default=5, ge=0.1, le=60, allow_inf_nan=False,
+    )
+    telemetry_retention_days: int = Field(default=30, ge=7, le=365)
+    workflows_enabled: bool = False
+    workflow_global_capacity: int = Field(default=4, ge=1, le=32)
+    workflow_per_client_capacity: int = Field(default=1, ge=1, le=8)
+    workflow_max_pending_per_client: int = Field(default=32, ge=1, le=1000)
+    artifact_encryption_key: str | None = Field(default=None, repr=False)
+    distributed_admission_enabled: bool = False
+    distributed_max_requests: int = Field(default=64, ge=1)
+    distributed_max_per_client: int = Field(default=16, ge=1)
+    distributed_max_streams: int = Field(default=48, ge=1)
+    distributed_provider_capacity: int = Field(default=32, ge=1)
+    distributed_credential_capacity: int = Field(default=8, ge=1)
+    service_role: Literal["combined", "api", "workflow", "maintenance"] = "combined"
+    shutdown_timeout_seconds: float = Field(default=30, gt=0, allow_inf_nan=False)
     first_event_timeout_seconds: float = Field(default=60, gt=0)
     # How long a committed stream may go silent before a no-op event is sent to keep
     # the client connection warm. A CDN in front of the gateway measures its read
@@ -49,6 +103,8 @@ class Settings(BaseSettings):
     upstream_proxy_verify_tls: bool = True
     concurrency_acquire_timeout_seconds: float = Field(default=1, gt=0)
     failover_enabled: bool = True
+    retry_backoff_seconds: float = Field(default=.05, ge=0, le=5, allow_inf_nan=False)
+    retry_backoff_max_seconds: float = Field(default=1, ge=0, le=30, allow_inf_nan=False)
     health_probe_enabled: bool = True
     health_probe_interval_seconds: float = Field(default=60, gt=0)
     health_probe_daily_limit: int = Field(default=10, ge=1, le=100)
@@ -64,6 +120,19 @@ class Settings(BaseSettings):
     supabase_jwt_audience: str = "authenticated"
     admin_role: str = "admin"
 
+    @model_validator(mode="after")
+    def validate_alert_delivery(self):
+        from gateway.alert_delivery import validate_destination
+
+        if self.alert_delivery_url is not None:
+            validate_destination(self.alert_delivery_url.get_secret_value())
+        if self.alert_delivery_enabled:
+            if self.alert_delivery_url is None or self.alert_delivery_secret is None:
+                raise ValueError("Alert delivery requires a destination URL and signing secret")
+            if len(self.alert_delivery_secret.get_secret_value().encode()) < 32:
+                raise ValueError("Alert delivery signing secret must contain at least 32 bytes")
+        return self
+
     @field_validator("request_id_header")
     @classmethod
     def validate_request_id_header(cls, value: str) -> str:
@@ -71,6 +140,13 @@ class Settings(BaseSettings):
         if not normalized or any(char.isspace() for char in normalized):
             raise ValueError("request_id_header must be a valid single HTTP header name")
         return normalized
+
+    @field_validator("artifact_encryption_key")
+    @classmethod
+    def validate_artifact_key(cls, value):
+        if value is not None and len(base64.b64decode(value, validate=True)) != 32:
+            raise ValueError("Artifact key must decode to 32 bytes")
+        return value
 
     @field_validator("upstream_proxy_url")
     @classmethod

@@ -1,3 +1,4 @@
+import contextlib
 import json
 from typing import Any
 
@@ -293,7 +294,8 @@ async def provider_models(request: Request) -> JSONResponse:
         request,
         """
         select pm.id, pm.provider_id, p.name as provider_name, pm.model_id,
-                pm.upstream_model_id, pm.protocol, pm.capabilities, pm.priority,
+                pm.upstream_model_id, pm.protocol, pm.serves_protocols,
+                 pm.capabilities, pm.priority,
                  pm.weight, pm.max_concurrency, pm.enabled, pm.pricing,
                  pm.settings,
                 pm.created_at, pm.updated_at
@@ -758,6 +760,46 @@ async def _attempt_attribution(
     return [dict(row) for row in rows]
 
 
+# Columns the list endpoints select that Postgres stores as jsonb. asyncpg has no
+# jsonb codec configured, so it returns each of these as the raw JSON *string*, and
+# the JSON response nests a quoted string where the dashboard expects an object.
+# That is not a display problem: the provider setup form hydrates its header,
+# endpoint-parameter and auth fields from `settings`, reads `{}` from the string, and
+# the reconcile save then returns the empty dict over a provider whose real settings
+# said otherwise - which took AgentRouter's client-identity headers off every
+# upstream call and got every key 401 "unauthorized client detected" in turn.
+# routing_policies decoded its own column this way already; the same treatment
+# belongs wherever the value crosses this boundary.
+JSONB_COLUMNS = ("settings", "pricing", "policy", "metadata", "condition", "pricing_context")
+
+# Of those, the ones whose documented empty state is {} rather than null, and whose
+# rows have actually been observed holding the jsonb value null. Reading those as
+# {} keeps a save from turning "not set" into null, which then fails snapshot
+# validation as pricing=None and blocks publishing. `settings` is deliberately not
+# here: no row holds it as null, and mapping it to {} on a read whose save path
+# writes settings unconditionally would only widen the blast radius.
+NULLABLE_OBJECT_COLUMNS = frozenset({"pricing"})
+
+
+def _decode_jsonb_columns(row: dict[str, Any]) -> dict[str, Any]:
+    for column in JSONB_COLUMNS:
+        value = row.get(column)
+        if isinstance(value, str):
+            # Leave the string as it is rather than failing the whole listing: a
+            # value that is not valid JSON is a data problem to see, not one to
+            # hide behind a 500 on the providers page.
+            with contextlib.suppress(ValueError):
+                value = json.loads(value)
+            # A jsonb column holding the *value* null decodes to None. For pricing
+            # that is the "no rate configured" state, and the guided form reads it
+            # back and re-sends, so surfacing null there is what let an unpriced row
+            # be written as null. {} is the same meaning, and what the form expects.
+            if value is None and column in NULLABLE_OBJECT_COLUMNS:
+                value = {}
+            row[column] = value
+    return row
+
+
 async def _list_query(request: Request, query: str, *args: Any) -> JSONResponse:
     claims = await _authorize(request)
     if isinstance(claims, JSONResponse):
@@ -766,4 +808,6 @@ async def _list_query(request: Request, query: str, *args: Any) -> JSONResponse:
     if pool is None:
         return JSONResponse({"error": "control_plane_unavailable"}, status_code=503)
     rows = await pool.fetch(query, *args)
-    return JSONResponse(jsonable_encoder({"data": [dict(row) for row in rows]}))
+    return JSONResponse(
+        jsonable_encoder({"data": [_decode_jsonb_columns(dict(row)) for row in rows]})
+    )

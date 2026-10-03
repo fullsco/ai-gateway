@@ -73,3 +73,34 @@ def test_the_clients_view_reports_effective_access_not_just_configuration() -> N
     assert "config_versions" in source and "status = 'published'" in source
     # The dangerous direction must be called out explicitly, not merely implied.
     assert "STILL SERVING until you publish" in source
+
+
+def test_list_endpoints_decode_jsonb_columns() -> None:
+    """A jsonb column must cross the admin API as an object, not a JSON string.
+
+    The Postgres pool has no jsonb codec, so asyncpg returns settings and pricing as
+    raw JSON strings. The provider setup form hydrates its header, endpoint-parameter
+    and auth fields from `settings`; handed a string it read `{}`, submitted an empty
+    settings object back, and the reconcile save erased headers the operator never
+    touched - which is how AgentRouter lost the client-identity headers its edge
+    demands and every credential started coming back 401 "unauthorized client
+    detected". Decoding here makes the read side tell the truth the write side needs.
+    """
+    from gateway.admin.api import _decode_jsonb_columns
+
+    row = {
+        "id": "provider-1",
+        "settings": '{"auth_scheme": "default", "default_headers": {"user-agent": "codex_cli_rs"}}',
+        "pricing": "{}",
+    }
+    decoded = _decode_jsonb_columns(row)
+    assert decoded["settings"] == {
+        "auth_scheme": "default",
+        "default_headers": {"user-agent": "codex_cli_rs"},
+    }
+    assert decoded["pricing"] == {}
+    # Already-decoded values (a codec could return objects) pass through untouched,
+    # and a string that is not JSON stays a string rather than breaking the listing.
+    assert _decode_jsonb_columns({"settings": {"a": 1}})["settings"] == {"a": 1}
+    assert _decode_jsonb_columns({"settings": "not json"})["settings"] == "not json"
+    assert _decode_jsonb_columns({"name": "AgentRouter"})["name"] == "AgentRouter"

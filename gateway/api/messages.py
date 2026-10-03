@@ -3,7 +3,9 @@ from fastapi.responses import Response
 
 from gateway.api.errors import client_error, denial_error
 from gateway.api.executor import execute_request
+from gateway.api.input_limits import admit_authenticated
 from gateway.auth import AuthDenial, authenticate_request
+from gateway.metrics import read_json
 from gateway.protocols import ClientProtocol, normalize_request
 from gateway.providers import ErrorCategory
 from gateway.runtime import GatewayRuntime
@@ -21,7 +23,7 @@ async def messages(request: Request) -> Response:
             503,
         )
     try:
-        payload = await request.json()
+        payload = await read_json(request)
         if not isinstance(payload, dict):
             raise ValueError("Request body must be a JSON object")
         normalized = normalize_request(ClientProtocol.ANTHROPIC_MESSAGES, payload)
@@ -37,6 +39,8 @@ async def messages(request: Request) -> Response:
     )
     if isinstance(authenticated, AuthDenial):
         return denial_error(authenticated)
+    if response := await admit_authenticated(request, normalized, runtime, authenticated):
+        return response
     return await execute_request(
         normalized,
         request.headers,

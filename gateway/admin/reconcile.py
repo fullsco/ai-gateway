@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from gateway.admin import reconcile_guards
 from gateway.admin.api import _authorize
 from gateway.admin.control_plane import _masked_hint
+from gateway.admin.model_serviceability import mapped_model_ids, sync_model_serviceability
 from gateway.admin.reconcile_models import (
     ProviderReconcileInput,
     ReconcileCredential,
@@ -214,38 +215,48 @@ async def reconcile_provider(request: Request, body: ProviderReconcileInput) -> 
     # mappings and routes below are applied, each one is synced to whether a live
     # route actually exists - a model left enabled with none is exactly what the
     # publish guard calls stranded.
-    previously_mapped = {
-        row["model_id"]
-        for row in await connection.fetch(
-            "select distinct model_id from public.provider_models where provider_id=$1",
-            provider_id,
-        )
-    }
+    previously_mapped = set(await mapped_model_ids(connection, provider_id))
     affected_models = previously_mapped | {item.model_id for item in body.mappings}
 
     mapping_ids: dict[tuple[str, str, ClientProtocol], str] = {}
     mapping_weights: dict[str, float] = {}
     for item in body.mappings:
+        # Same rule as update_provider_model: an omitted pricing dict preserves
+        # whatever the row already holds. The dashboard guided form only edits
+        # token rates and sends {} for every mapping it cannot price - without
+        # this guard each save wiped per-request and blended rates it never
+        # even displayed, which is how every AgentRouter row emptied on
+        # 2026-09-11 and priced usage stopped.
+        #
+        # "not sent" is SQL NULL (None), never the JSON string "null" (which is a
+        # json-null value coalesce would keep). On insert, coalesce($12,'{}') gives
+        # a new row {} to satisfy NOT NULL; on conflict, the update clause reads the
+        # raw $12 param (NULL when omitted) rather than excluded.pricing, because
+        # excluded.pricing is already coalesced to {} in VALUES and would itself
+        # wipe the stored rate.
+        pricing_json = json.dumps(item.pricing) if item.pricing else None
         mapping = await connection.fetchrow(
             """insert into public.provider_models(provider_id,model_id,upstream_model_id,protocol,
-                 capabilities,enabled,priority,weight,max_concurrency,settings,pricing)
-               values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb)
+                 serves_protocols,capabilities,enabled,priority,weight,max_concurrency,settings,pricing)
+               values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,coalesce($12::jsonb,'{}'::jsonb))
                on conflict(provider_id,model_id,upstream_model_id,protocol) do update set
+                 serves_protocols=excluded.serves_protocols,
                  capabilities=excluded.capabilities,enabled=excluded.enabled,priority=excluded.priority,
                  weight=excluded.weight,max_concurrency=excluded.max_concurrency,settings=excluded.settings,
-                 pricing=excluded.pricing,updated_at=now()
+                 pricing=coalesce($12::jsonb, public.provider_models.pricing),updated_at=now()
                returning id""",
             provider_id,
             item.model_id,
             item.upstream_model_id,
             item.protocol.value,
+            [_enum_value(protocol) for protocol in item.serves_protocols],
             [_enum_value(capability) for capability in item.capabilities],
             item.enabled,
             item.priority,
             item.weight,
             item.max_concurrency,
             json.dumps(item.settings),
-            json.dumps(item.pricing),
+            pricing_json,
         )
         mapping_ids[(item.model_id, item.upstream_model_id, item.protocol)] = str(mapping["id"])
         mapping_weights[str(mapping["id"])] = item.weight
@@ -396,38 +407,9 @@ async def reconcile_provider(request: Request, body: ProviderReconcileInput) -> 
         desired_route_mapping_ids,
     )
 
-    # A catalogue model is serviceable exactly when some enabled provider still
-    # reaches it through an enabled route on an enabled provider. Syncing both
-    # ways keeps a save from doing either half: leaving an orphan enabled would
-    # block every later publish as stranded, and re-declaring a route for a
-    # model stranded by an earlier save would store a route that can never
-    # resolve. Models this save never touched are not judged here.
-    live_route = """
-        select 1 from public.model_routes r
-        join public.provider_models pm on pm.id = r.provider_model_id
-        join public.providers p on p.id = pm.provider_id
-        where r.model_id = m.id and r.enabled and pm.enabled and p.enabled
-    """
-    disabled_models = [
-        row["id"]
-        for row in await connection.fetch(
-            f"""update public.models m set enabled=false,updated_at=now()
-                where m.enabled and m.id = any($1::text[])
-                  and not exists ({live_route})
-                returning id""",
-            sorted(affected_models),
-        )
-    ]
-    enabled_models = [
-        row["id"]
-        for row in await connection.fetch(
-            f"""update public.models m set enabled=true,updated_at=now()
-                where not m.enabled and m.id = any($1::text[])
-                  and exists ({live_route})
-                returning id""",
-            sorted(affected_models),
-        )
-    ]
+    disabled_models, enabled_models = await sync_model_serviceability(
+        connection, affected_models
+    )
 
     await connection.execute(
         """insert into public.audit_logs(actor_id,action,resource_type,resource_id,metadata)

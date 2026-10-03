@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 
 from gateway.admin.api import _authorize
 from gateway.admin.auth import AdminClaims
+from gateway.admin.model_serviceability import mapped_model_ids, sync_model_serviceability
 from gateway.configuration import (
     configuration_checksum,
     configuration_projection,
@@ -21,9 +22,31 @@ from gateway.configuration import (
 )
 from gateway.configuration.runtime_builder import RuntimeSnapshot
 from gateway.protocols import ClientProtocol
+from gateway.protocols.translate import can_translate
 from gateway.security import CredentialCipher, GatewayKeyHasher
 
 router = APIRouter(prefix="/api/admin/v1", tags=["admin-control"])
+
+
+def normalize_served_protocols(
+    upstream: ClientProtocol, served: list[ClientProtocol]
+) -> list[ClientProtocol]:
+    """The client protocols a mapping answers, always including its own upstream one.
+
+    A route speaks its upstream protocol for free, by relaying bytes, so serving that
+    protocol is not a setting an operator can switch off - an empty list means "no
+    extra translation", not "unreachable". Everything else must be a pair the gateway
+    can actually translate, checked here rather than discovered as a 404 later.
+    """
+    unsupported = sorted(
+        protocol.value for protocol in served if not can_translate(protocol, upstream)
+    )
+    if unsupported:
+        raise ValueError(
+            f"cannot serve {', '.join(unsupported)} from an {upstream.value} route: "
+            "no translation exists for that pair"
+        )
+    return sorted({upstream, *served}, key=lambda protocol: protocol.value)
 
 
 class NormalizedStringLists(BaseModel):
@@ -153,6 +176,7 @@ class ProviderModelInput(NormalizedStringLists):
     model_id: str
     upstream_model_id: str
     protocol: ClientProtocol
+    serves_protocols: list[ClientProtocol] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
     priority: int = Field(default=100, ge=0)
     weight: float = Field(default=1, gt=0)
@@ -160,6 +184,11 @@ class ProviderModelInput(NormalizedStringLists):
     max_concurrency: int = Field(default=8, gt=0)
     settings: dict[str, Any] = Field(default_factory=dict)
     pricing: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def normalize_served_protocols(self) -> "ProviderModelInput":
+        self.serves_protocols = normalize_served_protocols(self.protocol, self.serves_protocols)
+        return self
 
     @field_validator("pricing")
     @classmethod
@@ -466,8 +495,29 @@ async def update_provider(
     )
     if row is None:
         return _not_found("provider")
-    await _audit(pool, claims, "provider_updated", "provider", provider_id, _audit_fields(body))
-    return JSONResponse(jsonable_encoder(dict(row)))
+    # Flipping `enabled` here changes whether this provider's models are reachable at
+    # all, so the catalogue has to be resynced the same way the setup wizard does it.
+    # Without this, saving a provider disabled stranded its models and re-enabling it
+    # left them switched off, with nothing in the response saying so - the operator was
+    # sent hunting through routes for a flag they never touched.
+    models_disabled, models_enabled = await sync_model_serviceability(
+        pool, await mapped_model_ids(pool, provider_id)
+    )
+    await _audit(
+        pool,
+        claims,
+        "provider_updated",
+        "provider",
+        provider_id,
+        _audit_fields(body)
+        | {"models_disabled": models_disabled, "models_enabled": models_enabled},
+    )
+    return JSONResponse(
+        jsonable_encoder(
+            dict(row)
+            | {"models_disabled": models_disabled, "models_enabled": models_enabled}
+        )
+    )
 
 
 # Models that would be left with no enabled route once $1 is deleted.
@@ -574,6 +624,61 @@ async def delete_provider(
     return JSONResponse({"deleted": True, "stranded_models": stranded})
 
 
+def _affected(status: Any) -> int:
+    """Row count from an asyncpg command tag like 'INSERT 0 5'."""
+    try:
+        return int(str(status).rsplit(" ", 1)[-1])
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _inherit_provider_topology(
+    pool: Any, provider_id: str, credential_id: str, priority: int
+) -> dict[str, int]:
+    """Give a new credential the same access and pool placements its siblings hold.
+
+    A credential created here used to get neither, which left it in two broken states at
+    once. The router builds allowed_credential_ids from pool membership, so a credential
+    in no pool is refused every route with credential_not_in_route_pool - it is added,
+    looks healthy in the dashboard, and silently carries nothing. And the partial matrix
+    it leaves behind reads to the topology guard as a deliberately curated one, so the
+    provider's setup form then refuses every save, with a message about restrictions
+    nobody set and no UI anywhere to clear them.
+
+    Access rows are written only for a provider that already keeps them: writing them for
+    a provider with none would invent a restriction where the router currently sees none.
+    Pool rows mirror the (pool, mapping) placements the siblings already occupy, so a
+    provider with no pool gains nothing here either. Both are idempotent.
+    """
+    access = await pool.execute(
+        """insert into public.credential_model_access(credential_id, provider_model_id)
+           select $1::uuid, pm.id from public.provider_models pm
+           where pm.provider_id=$2
+             and exists (select 1 from public.credential_model_access a
+                         join public.provider_credentials c on c.id=a.credential_id
+                         where c.provider_id=$2)
+           on conflict do nothing""",
+        credential_id,
+        provider_id,
+    )
+    members = await pool.execute(
+        """insert into public.provider_pool_members(
+             pool_id, provider_model_id, credential_id, priority, weight)
+           select distinct ppm.pool_id, pm.id, $1::uuid, $3::int, pm.weight
+           from public.provider_pool_members ppm
+           join public.provider_models pm on pm.id=ppm.provider_model_id
+           where pm.provider_id=$2
+           on conflict(pool_id,provider_model_id,credential_id) do nothing""",
+        credential_id,
+        provider_id,
+        priority,
+    )
+    return {
+        "model_access_rows": _affected(access),
+        "pool_placements": _affected(members),
+    }
+
+
 @router.post("/credentials")
 async def create_credential(request: Request, body: CredentialInput) -> JSONResponse:
     context = await _context(request)
@@ -611,11 +716,14 @@ async def create_credential(request: Request, body: CredentialInput) -> JSONResp
         body.requests_per_minute,
         body.tokens_per_minute,
     )
+    inherited = await _inherit_provider_topology(
+        pool, body.provider_id, credential_id, body.priority
+    )
     await _audit(
         pool, claims, "credential_created", "credential", credential_id,
-        {"changed_fields": sorted(body.model_fields_set - {"secret"})},
+        {"changed_fields": sorted(body.model_fields_set - {"secret"})} | inherited,
     )
-    return JSONResponse(jsonable_encoder(dict(row)), status_code=201)
+    return JSONResponse(jsonable_encoder(dict(row) | inherited), status_code=201)
 
 
 @router.post("/credentials/{credential_id}/rotate")
@@ -1100,16 +1208,17 @@ async def create_provider_model(
     row = await pool.fetchrow(
         """
         insert into public.provider_models(
-          provider_id,model_id,upstream_model_id,protocol,
+          provider_id,model_id,upstream_model_id,protocol,serves_protocols,
           capabilities,priority,weight,enabled,max_concurrency,settings,pricing
-        ) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb)
-        returning id,provider_id,model_id,upstream_model_id,protocol,
+        ) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb)
+        returning id,provider_id,model_id,upstream_model_id,protocol,serves_protocols,
                   capabilities,priority,weight,enabled,max_concurrency,settings,pricing
         """,
         body.provider_id,
         body.model_id,
         body.upstream_model_id,
         body.protocol,
+        [protocol.value for protocol in body.serves_protocols],
         body.capabilities,
         body.priority,
         body.weight,
@@ -1139,15 +1248,32 @@ async def update_provider_model(
     )
     if provider is None:
         return _not_found("provider")
+    # A save that omits pricing must not wipe it. pricing defaults to {} in the
+    # input model, and "field absent" and "deliberately blanked" are the same dict
+    # once parsed, so the only safe reading of an empty dict is "not sent" - an
+    # operator clearing a rate explicitly edits the field to nothing and the
+    # dashboard never sends {} for a mapping it loaded with prices. This is the
+    # exact path that emptied every AgentRouter row on 2026-09-11 and left all
+    # usage since unpriced.
+    #
+    # "not sent" MUST cross the wire as SQL NULL (Python None), never the JSON
+    # string "null": 'null'::jsonb is a valid json-null value, not SQL NULL, so
+    # coalesce('null'::jsonb, pricing) returns json-null and overwrites the row
+    # (which then fails snapshot validation as pricing=None). None -> NULL, and
+    # coalesce($13::jsonb, pricing) with $13 NULL correctly keeps the stored rate.
+    pricing_json = json.dumps(body.pricing) if body.pricing else None
     row = await pool.fetchrow(
         """update public.provider_models set provider_id=$2,model_id=$3,upstream_model_id=$4,
-                   protocol=$5,capabilities=$6,priority=$7,weight=$8,enabled=$9,
-                   max_concurrency=$10,settings=$11::jsonb,pricing=$12::jsonb,updated_at=now()
+                   protocol=$5,serves_protocols=$6,capabilities=$7,priority=$8,weight=$9,
+                   enabled=$10,max_concurrency=$11,settings=$12::jsonb,
+                   pricing=coalesce($13::jsonb, pricing), updated_at=now()
            where id=$1 returning id,provider_id,model_id,upstream_model_id,protocol,
-                                  capabilities,priority,weight,enabled,max_concurrency,settings,pricing""",
+                                  serves_protocols,capabilities,priority,weight,enabled,
+                                  max_concurrency,settings,pricing""",
         provider_model_id, body.provider_id, body.model_id, body.upstream_model_id,
-        body.protocol, body.capabilities, body.priority, body.weight, body.enabled,
-          body.max_concurrency, json.dumps(body.settings), json.dumps(body.pricing),
+        body.protocol, [protocol.value for protocol in body.serves_protocols],
+        body.capabilities, body.priority, body.weight, body.enabled,
+          body.max_concurrency, json.dumps(body.settings), pricing_json,
     )
     if row is None:
         return _not_found("provider_model")
@@ -1251,6 +1377,7 @@ async def model_routing(model_id: str, request: Request) -> JSONResponse:
         select p.id::text as provider_id, p.name as provider, p.health as provider_health,
                p.enabled as provider_enabled,
                pm.id::text as provider_model_id, pm.upstream_model_id, pm.protocol,
+               pm.serves_protocols,
                pm.capabilities, pm.enabled as mapping_enabled, r.priority,
                r.enabled as route_enabled,
                -- Effective routing: a route through a disabled provider or mapping
@@ -1617,7 +1744,8 @@ async def _snapshot_payload(pool: Any) -> dict[str, Any]:
         pool,
         """select pm.id::text,r.id::text as route_id,
                    pm.model_id as canonical_model_id,pm.provider_id::text,
-                   pm.upstream_model_id,pm.protocol,pm.capabilities,r.priority,pm.weight,
+                   pm.upstream_model_id,pm.protocol,pm.serves_protocols,
+                   pm.capabilities,r.priority,pm.weight,
                      pm.max_concurrency,
                      case when pm.settings ? 'default_headers'
                           then pm.settings->'default_headers' end as default_headers,
@@ -1630,7 +1758,13 @@ async def _snapshot_payload(pool: Any) -> dict[str, Any]:
                      case when pm.settings ? 'timeout_seconds'
                           then (pm.settings->>'timeout_seconds')::numeric end
                           as timeout_seconds,
-                    pm.pricing,r.allow_model_fallback,r.pool_id::text as pool_id,
+                     -- Not coalesce(): 'null'::jsonb is a jsonb *value*, not SQL
+                     -- NULL, so coalesce(pricing,'{}') returns it unchanged. An
+                     -- unpriced route reads as {} whichever of the two spellings
+                     -- the row holds.
+                     case when pm.pricing is null or jsonb_typeof(pm.pricing)='null'
+                          then '{}'::jsonb else pm.pricing end as pricing,
+                     r.allow_model_fallback,r.pool_id::text as pool_id,
                      coalesce(pp.enabled,false) as pool_enabled,
                      case when r.pool_id is null then null else array(
                        select ppm.credential_id::text
@@ -1692,6 +1826,11 @@ async def _snapshot_payload(pool: Any) -> dict[str, Any]:
             row["routing_policy"] = json.loads(row["routing_policy"])
         if isinstance(row.get("pricing"), str):
             row["pricing"] = json.loads(row["pricing"])
+        # An unpriced route is {}. json.loads maps the jsonb value null to None,
+        # and the publish validator rejects a None pricing outright, so one row
+        # that never had a rate could 422 the entire configuration.
+        if row.get("pricing") is None:
+            row["pricing"] = {}
     return {
         "clients": clients,
         "gateway_keys": keys,

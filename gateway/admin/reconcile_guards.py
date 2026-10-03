@@ -215,12 +215,26 @@ select case
  -- unmanageable: adding a model or a credential to hcnsec, GoRouter, TabiAi or
  -- AgentRouter returned provider_topology_not_supported forever, because a complete
  -- matrix is only ever written when a provider is first created.
+ --
+ -- That reasoning is per credential, not per provider. `restrictions and ...` in
+ -- routing/engine.py reads one credential's rows, so a credential with none may serve
+ -- anything, exactly like a provider with none. Judging it by the provider's total
+ -- reproduced the same dead end one credential down: a single unrestricted credential
+ -- among restricted siblings made the whole matrix look partial, and adding a model to
+ -- AgentRouter was refused as selective when nothing had been selected.
  when exists (select 1 from public.credential_model_access cma
               join provider_credentials c on c.id=cma.credential_id)
-  and exists (select 1 from provider_credentials c cross join provider_mappings pm where not exists
+  and exists (select 1 from provider_credentials c cross join provider_mappings pm
+              where exists (select 1 from public.credential_model_access cma
+                            where cma.credential_id=c.id) and not exists
               (select 1 from public.credential_model_access cma where cma.credential_id=c.id
                and cma.provider_model_id=pm.id)) then 'selective_credential_access'
- -- Same reasoning for pool membership: no members means no curated pool to preserve.
+ -- Pool membership stays whole-provider on purpose: an empty membership set is not
+ -- permission to serve anything, it is the opposite. allowed_credential_ids is built
+ -- from these rows, so a credential in no pool is refused with
+ -- credential_not_in_route_pool - reconciling it in would start real traffic on a key
+ -- that has never carried any, which is a change the operator should confirm.
+ -- No members at all still means no curated pool to preserve.
  when exists (select 1 from public.provider_pool_members ppm join managed_pool mp
               on mp.id=ppm.pool_id)
   and exists (select 1 from provider_credentials c cross join provider_mappings pm where not exists

@@ -4,6 +4,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from gateway.metrics import measured
+
 
 class ClientProtocol(StrEnum):
     ANTHROPIC_MESSAGES = "anthropic_messages"
@@ -30,6 +32,7 @@ class NormalizedRequest(BaseModel):
     payload: dict[str, Any]
 
 
+@measured("normalize")
 def normalize_request(
     protocol: ClientProtocol,
     payload: dict[str, Any],
@@ -47,6 +50,15 @@ def normalize_request(
         capabilities.add(Capability.REASONING)
     if payload.get("response_format"):
         capabilities.add(Capability.STRUCTURED_OUTPUT)
+    pending = [payload]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            if value.get("type") in ("image", "image_url", "input_image"):
+                capabilities.add(Capability.VISION)
+            pending.extend(child for child in value.values() if isinstance(child, (dict, list)))
+        elif isinstance(value, list):
+            pending.extend(child for child in value if isinstance(child, (dict, list)))
 
     return NormalizedRequest(
         protocol=protocol,

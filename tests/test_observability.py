@@ -186,6 +186,89 @@ def test_stream_usage_accumulator_tracks_cumulative_growth() -> None:
     assert accumulator.usage == (120, 31, None, None)
 
 
+def test_extracts_usage_nested_in_a_responses_terminal_event() -> None:
+    """The Responses API streams usage only inside the terminal response object.
+
+    Captured verbatim from AgentRouter on a streamed /v1/responses request: the
+    response.completed event carries usage at response.usage, never top level,
+    so reading only the top level recorded no tokens for 97% of streamed
+    Responses traffic (gpt-6-astra: 401 attempts, 8 usage rows).
+    """
+    usage = extract_usage(
+        ClientProtocol.OPENAI_RESPONSES,
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_probe",
+                    "usage": {
+                        "input_tokens": 12,
+                        "input_tokens_details": {
+                            "cached_tokens": 0,
+                            "cache_write_tokens": 0,
+                        },
+                        "output_tokens": 5,
+                        "output_tokens_details": {"reasoning_tokens": 0},
+                        "total_tokens": 17,
+                    },
+                },
+            }
+        ).encode(),
+    )
+
+    assert usage == (12, 5, 0, 0)
+
+
+def test_responses_stream_accumulator_reads_terminal_event() -> None:
+    """A Responses SSE stream only reports usage on the terminal event.
+
+    The accumulator sees every event of the stream, so the fix must hold when
+    frames are fed whole and when the terminal event straddles a chunk
+    boundary; and the trailing zeros on non-terminal frames must not win.
+    """
+    accumulator = StreamUsageAccumulator(ClientProtocol.OPENAI_RESPONSES)
+
+    accumulator.feed(
+        b'event: response.created\ndata: {"type":"response.created","response":{}}\n\n'
+    )
+    accumulator.feed(
+        b'event: output_text.delta\ndata: {"type":"output_text.delta","delta":"ok"}\n\n'
+    )
+    accumulator.feed(
+        b'event: response.completed\ndata: {"type":"response.completed",'
+        b'"response":{"usage":{"input_tokens":12,'
+    )
+    accumulator.feed(
+        b'"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},'
+        b'"output_tokens":5,"total_tokens":17}}}\n\n'
+    )
+
+    assert accumulator.usage == (12, 5, 0, 0)
+
+
+def test_responses_cache_write_is_carried_as_its_own_dimension() -> None:
+    """Responses reports cache writes Chat Completions never does; keep them separate."""
+    usage = extract_usage(
+        ClientProtocol.OPENAI_RESPONSES,
+        json.dumps(
+            {
+                "response": {
+                    "usage": {
+                        "input_tokens": 100,
+                        "input_tokens_details": {
+                            "cached_tokens": 20,
+                            "cache_write_tokens": 80,
+                        },
+                        "output_tokens": 9,
+                    }
+                }
+            }
+        ).encode(),
+    )
+
+    assert usage == (100, 9, 20, 80)
+
+
 
 @pytest.mark.parametrize(
     ("category", "health"),
@@ -265,6 +348,47 @@ async def test_synthetic_health_observation_does_not_update_credential_state() -
     assert "insert into public.health_checks" in query
     assert "update public.provider_credentials" not in query
     assert args[-1] == "automatic"
+
+
+@pytest.mark.asyncio
+async def test_a_probe_stock_out_observation_demotes_a_wrong_condemnation() -> None:
+    """An idle mislabeled key's only witness is the probe, so stock-outs demote there.
+
+    A credential wrongly parked quota_exhausted by a stock-out misclassification is
+    never selected while healthy siblings exist, so passive traffic never
+    re-labels it. The probe is its only witness - and when the probe's own route
+    answers model_unavailable (the rationed model family), that observation
+    contradicts the per-key label exactly as a real not-at-fault request would.
+    Any other probe failure says nothing about the key and must not demote; the
+    previous test pins that for provider_unavailable.
+    """
+    pool = TelemetryPool()
+    recorder = PassiveHealthRecorder(pool)
+    observed = datetime.now(UTC)
+
+    await recorder._persist(
+        PassiveHealthEvent(
+            provider_id="provider",
+            credential_id="credential",
+            provider_model_id="provider-model",
+            request_id="health-probe",
+            attempt_number=0,
+            observed_at=observed,
+            latency_ms=10,
+            error_category="model_unavailable",
+            upstream_status=402,
+            source="automatic",
+            credential_at_fault=False,
+        )
+    )
+
+    assert len(pool.execute_calls) == 2
+    demote_query, _ = pool.execute_calls[0]
+    assert "update public.provider_credentials" in demote_query
+    assert "health::text in ('quota_exhausted','auth_failed')" in demote_query
+    assert "recovered_by','not_at_fault_observation'" in demote_query
+    check_query, _ = pool.execute_calls[1]
+    assert "insert into public.health_checks" in check_query
 
 
 def test_passive_health_queue_saturation_drops_without_raising() -> None:
@@ -445,6 +569,7 @@ def test_completed_stream_persists_committed_attempt_and_usage() -> None:
     stream = [
         b'event: message_start\ndata: {"usage":{"input_tokens":7}}\n\n',
         b'event: message_delta\ndata: {"usage":{"output_tokens":4}}\n\n',
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
     ]
     runtime, key = make_runtime(
         lambda _: httpx.Response(
@@ -578,7 +703,8 @@ async def test_cancelled_stream_finishes_committed_telemetry() -> None:
         recorder,
         response=response,
         attempt_id=41,
-        protocol=ClientProtocol.OPENAI_RESPONSES,
+        client_protocol=ClientProtocol.OPENAI_RESPONSES,
+        upstream_protocol=ClientProtocol.OPENAI_RESPONSES,
         resolved_model="model-x",
         started_at=now,
         attempt_started_at=now,
@@ -655,7 +781,63 @@ def test_provider_level_failure_does_not_mark_the_credential_unhealthy() -> None
 
     joined = " ".join(pool.statements)
     assert "insert into public.health_checks" in joined
-    assert "update public.provider_credentials" not in joined
+    # The observation is recorded, and a *milder* observed state replaces a
+    # condemn-level label (quota_exhausted / auth_failed) that it proves wrong - the
+    # split-brain where the check rows said degraded while the label said
+    # quota_exhausted is what stranded 21 AgentRouter keys after the 2026-09-12
+    # stock-out. But it must never update a healthy or already-agreeing label.
+    assert "update public.provider_credentials" in joined
+    assert "health::text in ('quota_exhausted','auth_failed')" in joined
+    assert "set health='healthy'" not in joined
+
+
+def test_a_not_at_fault_observation_never_relabels_a_healthy_credential() -> None:
+    """The demotion path must be unreachable for healthy credentials.
+
+    The update is guarded to ('quota_exhausted','auth_failed') in SQL, but the guard
+    is what keeps a provider blip from rewriting labels it has no evidence against.
+    Asserting the WHERE shape directly is the contract; the previous test covers the
+    positive direction.
+    """
+    import asyncio
+
+    from gateway.observability import PassiveHealthEvent, PassiveHealthRecorder
+
+    class RecordingPool:
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+
+        async def execute(self, query, *args):
+            self.statements.append(" ".join(query.split()))
+
+    pool = RecordingPool()
+
+    async def run() -> None:
+        recorder = PassiveHealthRecorder(pool)
+        await recorder._persist(  # noqa: SLF001 - exercising the persistence branch
+            PassiveHealthEvent(
+                provider_id="p1",
+                credential_id="c1",
+                provider_model_id="pm1",
+                request_id="req-2",
+                attempt_number=1,
+                observed_at=datetime.now(UTC),
+                latency_ms=12.0,
+                error_category="model_unavailable",
+                upstream_status=402,
+                credential_at_fault=False,
+            )
+        )
+
+    asyncio.run(run())
+
+    joined = " ".join(pool.statements)
+    # The stock-out observation lands in health_checks ...
+    assert "insert into public.health_checks" in joined
+    # ... and the label rewrite can only ever target the two condemn states, never
+    # healthy, degraded or unavailable - those are observations it must not touch.
+    assert "and health::text in ('quota_exhausted','auth_failed')" in joined
+    assert "and health::text <> $2::text" in joined
 
 
 def test_measured_blended_rate_prices_total_tokens() -> None:

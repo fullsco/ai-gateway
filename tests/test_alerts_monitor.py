@@ -166,6 +166,10 @@ async def test_monitor_survives_an_unavailable_database() -> None:
 def test_every_declared_condition_kind_has_a_query() -> None:
     """A rule whose kind has no query would silently never fire."""
     allowed = {
+        "workflow_queue_age",
+        "settlement_backlog",
+        "unknown_usage",
+        "workflow_approval_backlog",
         "budget_utilization",
         "credential_quota_low",
         "credential_balance_low",
@@ -180,6 +184,56 @@ def test_every_declared_condition_kind_has_a_query() -> None:
     }
 
     assert set(_CONDITIONS) == allowed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [
+    "workflow_queue_age", "settlement_backlog", "unknown_usage", "workflow_approval_backlog",
+])
+async def test_workflow_operational_alert_breach_and_recovery(kind):
+    from gateway.admin.operations import AlertRuleInput
+
+    AlertRuleInput(name="Operations", condition_kind=kind, condition={"at_least": 1})
+    pool = MonitorPool([rule(condition_kind=kind, condition={"at_least": 1})],
+                       [{"scope_id": "client-a", "label": "Synthetic backlog", "pending": 2}])
+    assert (await evaluate_monitored_rules(pool)).raised == 1
+    assert pool.raised[0][1][1] == "rule-1:client:client-a"
+    pool.breaches = []
+    pool.open_alerts = ["rule-1:client:client-a"]
+    assert (await evaluate_monitored_rules(pool)).resolved == 1
+
+
+@pytest.mark.asyncio
+async def test_operational_query_failure_does_not_resolve_existing_alert():
+    class UnavailableWorkflowPool(MonitorPool):
+        async def fetch(self, query, *args):
+            if "from public.workflow_jobs" in query:
+                raise RuntimeError("Synthetic unavailable table")
+            return await super().fetch(query, *args)
+
+    pool = UnavailableWorkflowPool([rule(condition_kind="workflow_queue_age")], [],
+                                   ["rule-1:client:client-a"])
+    assert await evaluate_monitored_rules(pool) == MonitorResult()
+    assert not pool.resolved
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", [
+    "{", "[]", [], False, {"window_minutes": "bad"}, {"window_minutes": 0},
+    {"window_minutes": 10081}, {"window_minutes": True}, {"min_requests": -1},
+    {"min_samples": 1.5}, {"min_samples": 1000001}, {"at_least": "NaN"},
+    {"at_least": "Infinity"}, {"at_least": True}, {"at_least": []},
+])
+async def test_bad_rule_does_not_abort_other_rules_or_resolve_unknown_state(invalid):
+    pool = MonitorPool(
+        [rule(condition=invalid), rule(id="rule-2")],
+        [{"scope_id": "provider-a", "label": "A", "failure_rate": .9}],
+    )
+    result = await evaluate_monitored_rules(pool)
+    assert result == MonitorResult(evaluated=1, raised=1, resolved=0)
+    assert len(pool.raised) == 1
+    assert pool.raised[0][1][1] == "rule-2:provider:provider-a"
+    assert not pool.resolved
 
 
 def test_the_credential_pool_query_matches_the_router_definition_of_routable() -> None:

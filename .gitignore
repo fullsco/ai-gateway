@@ -21,3 +21,4 @@ build/
 node_modules/
 .next/
 supabase/.temp/
+.claude-flow/

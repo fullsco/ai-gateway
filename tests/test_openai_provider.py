@@ -82,7 +82,7 @@ def test_openai_quota_error_is_normalized() -> None:
         402,
         json={
             "error": {
-                "message": "Budget pool quota has been exhausted.",
+                "message": "insufficient_quota: this key is out of budget",
                 "type": "insufficient_quota",
                 "code": "insufficient_quota",
             }
@@ -96,6 +96,37 @@ def test_openai_quota_error_is_normalized() -> None:
     # fails over to another credential rather than failing outright.
     assert error.retryable is True
     assert error.retry_scope is RetryScope.CREDENTIAL
+
+
+def test_openai_shared_budget_pool_stockout_is_not_the_key_s_quota() -> None:
+    """AgentRouter rations the Claude/GPT family as budget pools released in
+    batches (Beijing 07:00/19:00). When a key's batch runs out it answers 402
+    "Budget pool quota has been exhausted", whatever the key's balance. Measured
+    2026-09-13 18:54 UTC the drain is per credential, not per provider: six keys
+    answered 200 on the rationed model while fourteen answered this 402 at the
+    same moment, and the same fourteen answered 200 on glm-5.3. So the verdict is
+    BUDGET_POOL_STOCKOUT: fail over to a sibling key (credential scope), but not
+    the key's fault - parking it would strand its healthy routes for other
+    families.
+    """
+    response = httpx.Response(
+        402,
+        json={
+            "error": {
+                "message": "Budget pool quota has been exhausted. Please ask an "
+                "administrator to increase the limit or select another budget pool.",
+                "type": "bad_response_status_code",
+                "code": "bad_response_status_code",
+            }
+        },
+    )
+
+    error = make_adapter().normalize_error(response)
+
+    assert error.category is ErrorCategory.BUDGET_POOL_STOCKOUT
+    assert error.retryable is True
+    assert error.retry_scope is RetryScope.CREDENTIAL
+    assert error.credential_at_fault is False
 
 
 def test_openai_upstream_authentication_error_is_distinct_from_client_auth() -> None:

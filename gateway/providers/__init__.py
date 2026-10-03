@@ -9,6 +9,7 @@ from gateway.providers.base import (
     UpstreamRequest,
     build_provider_error,
 )
+from gateway.providers.translating import TranslatingAdapter
 
 __all__ = [
     "DEFAULT_USER_AGENT",
@@ -18,6 +19,7 @@ __all__ = [
     "ProviderConfig",
     "ProviderError",
     "RetryScope",
+    "TranslatingAdapter",
     "UpstreamRequest",
     "build_provider_error",
 ]

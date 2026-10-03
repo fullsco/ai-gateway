@@ -137,6 +137,12 @@ def test_probe_requires_an_upstream_model() -> None:
         (
             402,
             {"error": {"message": "Budget pool quota has been exhausted."}},
+            ErrorCategory.BUDGET_POOL_STOCKOUT,
+            True,
+        ),
+        (
+            402,
+            {"error": {"message": "insufficient balance, please top up"}},
             ErrorCategory.QUOTA_EXHAUSTED,
             True,
         ),

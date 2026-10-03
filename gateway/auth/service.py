@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Protocol
 
+from gateway.metrics import measured
 from gateway.protocols import ClientProtocol
 from gateway.security.gateway_keys import GatewayKey, GatewayKeyHasher
 
@@ -107,6 +108,7 @@ def extract_gateway_key(headers: Mapping[str, str]) -> str | None:
     return None
 
 
+@measured("authentication")
 def authenticate_request(
     headers: Mapping[str, str],
     protocol: ClientProtocol,
