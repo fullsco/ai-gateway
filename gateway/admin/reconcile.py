@@ -227,7 +227,14 @@ async def reconcile_provider(request: Request, body: ProviderReconcileInput) -> 
         # this guard each save wiped per-request and blended rates it never
         # even displayed, which is how every AgentRouter row emptied on
         # 2026-09-11 and priced usage stopped.
-        pricing_json = json.dumps(item.pricing) if item.pricing else "null"
+        #
+        # "not sent" is SQL NULL (None), never the JSON string "null" (which is a
+        # json-null value coalesce would keep). On insert, coalesce($12,'{}') gives
+        # a new row {} to satisfy NOT NULL; on conflict, the update clause reads the
+        # raw $12 param (NULL when omitted) rather than excluded.pricing, because
+        # excluded.pricing is already coalesced to {} in VALUES and would itself
+        # wipe the stored rate.
+        pricing_json = json.dumps(item.pricing) if item.pricing else None
         mapping = await connection.fetchrow(
             """insert into public.provider_models(provider_id,model_id,upstream_model_id,protocol,
                  serves_protocols,capabilities,enabled,priority,weight,max_concurrency,settings,pricing)
@@ -236,7 +243,7 @@ async def reconcile_provider(request: Request, body: ProviderReconcileInput) -> 
                  serves_protocols=excluded.serves_protocols,
                  capabilities=excluded.capabilities,enabled=excluded.enabled,priority=excluded.priority,
                  weight=excluded.weight,max_concurrency=excluded.max_concurrency,settings=excluded.settings,
-                 pricing=coalesce(excluded.pricing, public.provider_models.pricing),updated_at=now()
+                 pricing=coalesce($12::jsonb, public.provider_models.pricing),updated_at=now()
                returning id""",
             provider_id,
             item.model_id,

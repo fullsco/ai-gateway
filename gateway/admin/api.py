@@ -772,6 +772,14 @@ async def _attempt_attribution(
 # belongs wherever the value crosses this boundary.
 JSONB_COLUMNS = ("settings", "pricing", "policy", "metadata", "condition", "pricing_context")
 
+# Of those, the ones whose documented empty state is {} rather than null, and whose
+# rows have actually been observed holding the jsonb value null. Reading those as
+# {} keeps a save from turning "not set" into null, which then fails snapshot
+# validation as pricing=None and blocks publishing. `settings` is deliberately not
+# here: no row holds it as null, and mapping it to {} on a read whose save path
+# writes settings unconditionally would only widen the blast radius.
+NULLABLE_OBJECT_COLUMNS = frozenset({"pricing"})
+
 
 def _decode_jsonb_columns(row: dict[str, Any]) -> dict[str, Any]:
     for column in JSONB_COLUMNS:
@@ -781,7 +789,14 @@ def _decode_jsonb_columns(row: dict[str, Any]) -> dict[str, Any]:
             # value that is not valid JSON is a data problem to see, not one to
             # hide behind a 500 on the providers page.
             with contextlib.suppress(ValueError):
-                row[column] = json.loads(value)
+                value = json.loads(value)
+            # A jsonb column holding the *value* null decodes to None. For pricing
+            # that is the "no rate configured" state, and the guided form reads it
+            # back and re-sends, so surfacing null there is what let an unpriced row
+            # be written as null. {} is the same meaning, and what the form expects.
+            if value is None and column in NULLABLE_OBJECT_COLUMNS:
+                value = {}
+            row[column] = value
     return row
 
 

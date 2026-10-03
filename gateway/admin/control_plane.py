@@ -1255,7 +1255,13 @@ async def update_provider_model(
     # dashboard never sends {} for a mapping it loaded with prices. This is the
     # exact path that emptied every AgentRouter row on 2026-09-11 and left all
     # usage since unpriced.
-    pricing_json = json.dumps(body.pricing) if body.pricing else "null"
+    #
+    # "not sent" MUST cross the wire as SQL NULL (Python None), never the JSON
+    # string "null": 'null'::jsonb is a valid json-null value, not SQL NULL, so
+    # coalesce('null'::jsonb, pricing) returns json-null and overwrites the row
+    # (which then fails snapshot validation as pricing=None). None -> NULL, and
+    # coalesce($13::jsonb, pricing) with $13 NULL correctly keeps the stored rate.
+    pricing_json = json.dumps(body.pricing) if body.pricing else None
     row = await pool.fetchrow(
         """update public.provider_models set provider_id=$2,model_id=$3,upstream_model_id=$4,
                    protocol=$5,serves_protocols=$6,capabilities=$7,priority=$8,weight=$9,
@@ -1752,7 +1758,13 @@ async def _snapshot_payload(pool: Any) -> dict[str, Any]:
                      case when pm.settings ? 'timeout_seconds'
                           then (pm.settings->>'timeout_seconds')::numeric end
                           as timeout_seconds,
-                    pm.pricing,r.allow_model_fallback,r.pool_id::text as pool_id,
+                     -- Not coalesce(): 'null'::jsonb is a jsonb *value*, not SQL
+                     -- NULL, so coalesce(pricing,'{}') returns it unchanged. An
+                     -- unpriced route reads as {} whichever of the two spellings
+                     -- the row holds.
+                     case when pm.pricing is null or jsonb_typeof(pm.pricing)='null'
+                          then '{}'::jsonb else pm.pricing end as pricing,
+                     r.allow_model_fallback,r.pool_id::text as pool_id,
                      coalesce(pp.enabled,false) as pool_enabled,
                      case when r.pool_id is null then null else array(
                        select ppm.credential_id::text
@@ -1814,6 +1826,11 @@ async def _snapshot_payload(pool: Any) -> dict[str, Any]:
             row["routing_policy"] = json.loads(row["routing_policy"])
         if isinstance(row.get("pricing"), str):
             row["pricing"] = json.loads(row["pricing"])
+        # An unpriced route is {}. json.loads maps the jsonb value null to None,
+        # and the publish validator rejects a None pricing outright, so one row
+        # that never had a rate could 422 the entire configuration.
+        if row.get("pricing") is None:
+            row["pricing"] = {}
     return {
         "clients": clients,
         "gateway_keys": keys,

@@ -24,6 +24,7 @@ from gateway.configuration import (
     RuntimeBuilder,
     RuntimeManager,
 )
+from gateway.configuration.runtime_builder import SnapshotProviderModel
 from gateway.security import CredentialCipher, EncryptedCredential, GatewayKeyHasher
 
 
@@ -280,8 +281,10 @@ def test_update_preserves_row_pricing_when_the_save_omits_it() -> None:
     assert response.status_code == 200
     update_query, update_args = pool.fetchrow_calls[-1]
     assert "pricing=coalesce($13::jsonb, pricing)" in update_query
-    # The omitted dict crosses the wire as null, which coalesce turns into "keep".
-    assert update_args[-1] == "null"
+    # The omitted dict crosses the wire as SQL NULL (None), which coalesce turns
+    # into "keep the stored rate". It must NOT be the JSON string "null":
+    # 'null'::jsonb is a json-null value coalesce would write, wiping the row.
+    assert update_args[-1] is None
 
 
 def test_update_still_replaces_pricing_when_the_save_edits_it() -> None:
@@ -352,6 +355,53 @@ async def test_snapshot_decodes_provider_model_pricing_json() -> None:
     provider_model_query = pool.fetch_queries[-1]
     assert "ppm.enabled and not ppm.draining" in provider_model_query
     assert "left join public.provider_pools" in provider_model_query
+
+
+@pytest.mark.asyncio
+async def test_snapshot_reads_a_json_null_pricing_row_as_unpriced() -> None:
+    """A row holding the jsonb value null must not fail snapshot validation.
+
+    'null'::jsonb is a jsonb value, not SQL NULL, so json.loads maps the column
+    text to None and the old strict dict field rejected it with "provider_models.
+    N.pricing: Input should be a valid dictionary", 422-ing publish for the whole
+    configuration. The read normalises it, and the SQL must not reintroduce it:
+    coalesce(pricing,'{}') is the trap, because coalesce returns 'null'::jsonb
+    unchanged and only jsonb_typeof distinguishes the two.
+    """
+    pool = SnapshotPool()
+    pool.fetch_results = [
+        [], [], [], [], [], [],
+        [{
+            "id": "mapping-1",
+            "route_id": None,
+            "canonical_model_id": "model-1",
+            "provider_id": "provider-1",
+            "upstream_model_id": "upstream-1",
+            "protocol": "anthropic_messages",
+            "capabilities": [],
+            "priority": 1,
+            "weight": 1,
+            "max_concurrency": 8,
+            "pricing": "null",
+            "allow_model_fallback": True,
+            "pool_id": None,
+            "pool_enabled": False,
+            "active_pool_credential_ids": None,
+            "active_pool_members": None,
+            "pool_strategy": None,
+            "enabled": True,
+            "routing_policy": None,
+        }],
+    ]
+
+    payload = await _snapshot_payload(pool)
+
+    assert payload["provider_models"][0]["pricing"] == {}
+    query = pool.fetch_queries[-1]
+    assert "jsonb_typeof(pm.pricing)='null'" in query
+    assert "coalesce(pm.pricing" not in query
+    # The published snapshot must accept it, which is the whole point.
+    assert SnapshotProviderModel(**payload["provider_models"][0]).pricing == {}
 
 
 @pytest.mark.asyncio

@@ -277,9 +277,14 @@ def test_reconcile_preserves_row_pricing_when_the_save_omits_it() -> None:
         for query, args in pool.fetchrow_calls
         if "insert into public.provider_models" in query
     )
-    assert "pricing=coalesce(excluded.pricing, public.provider_models.pricing)" in mapping_query
-    # The omitted dict is sent as null, which the SQL turns into "keep the row".
-    assert mapping_args[-1] == "null"
+    # The conflict path must read the raw $12 param, not excluded.pricing:
+    # excluded.pricing is coalesced to {} in VALUES (for the NOT NULL new-row
+    # case) and would itself wipe the stored rate on update.
+    assert "pricing=coalesce($12::jsonb, public.provider_models.pricing)" in mapping_query
+    # The omitted dict is sent as SQL NULL (None), which coalesce turns into
+    # "keep the row". It must NOT be the JSON string "null" (a json-null value
+    # coalesce would write, wiping the rate).
+    assert mapping_args[-1] is None
 
 
 def test_reconcile_still_replaces_pricing_when_the_save_edits_it() -> None:

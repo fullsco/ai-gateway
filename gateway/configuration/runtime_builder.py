@@ -1,5 +1,6 @@
 import base64
 import binascii
+import json
 import logging
 from datetime import datetime
 from typing import Any, Literal
@@ -162,6 +163,12 @@ class SnapshotProviderModel(BaseModel):
     # without slowing the rest. hcnsec answers in anywhere from 6 to 600 seconds, and
     # at 600 a stalled attempt holds a slot and the client for ten minutes.
     timeout_seconds: float | None = Field(default=None, gt=0)
+    # An unpriced route is {}, never null. Older rows hold the jsonb *value* null
+    # (not SQL NULL), which json.loads turns into None, and a save that omitted
+    # pricing wrote that value back for every mapping the guided form would not
+    # show a rate for. A strict dict here turned one poisoned row into a 422 that
+    # blocked publishing the entire configuration. Read it as unpriced instead:
+    # {} is already the documented meaning, and the writer now stores NULL.
     pricing: dict[str, Any] = Field(default_factory=dict)
     route_id: str | None = None
     allowed_credential_ids: frozenset[str] | None = None
@@ -169,6 +176,29 @@ class SnapshotProviderModel(BaseModel):
     pool_strategy: str | None = None
     # Snapshots published before route fallback was compiled retain historical behavior.
     allow_model_fallback: bool = True
+
+    @field_validator("pricing", mode="before")
+    @classmethod
+    def read_unpriced_as_empty(cls, pricing: Any) -> Any:
+        """Treat a jsonb ``null`` legacy value as an unpriced ({}) mapping.
+
+        ``pricing`` is a NOT NULL jsonb column whose "no rate configured" state has
+        two spellings in the wild: SQL NULL, and the jsonb *value* ``null`` written
+        before the save path distinguished the two. The pool registers no jsonb
+        codec, so both arrive as the *string* ``'null'`` and ``json.loads`` maps them
+        to Python None. Rejecting that turned one unpriced row into a 422 that
+        blocked publishing the entire configuration, so a form which never displayed
+        a rate could take the configuration offline.
+        """
+        if pricing is None:
+            return {}
+        if isinstance(pricing, str):
+            try:
+                decoded = json.loads(pricing)
+            except ValueError:
+                return pricing
+            return {} if decoded is None else decoded
+        return pricing
 
     @field_validator("default_headers")
     @classmethod
